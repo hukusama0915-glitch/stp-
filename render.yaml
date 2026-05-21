@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: stp-time-tool
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: waitress-serve --listen=0.0.0.0:$PORT app:app
+    envVars:
+      - key: UPLOAD_RETENTION_DAYS
+        value: "1"

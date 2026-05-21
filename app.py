@@ -1,0 +1,1405 @@
+from __future__ import annotations
+
+import csv
+import io
+import json
+import math
+import os
+import re
+import sqlite3
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+from flask import Flask, Response, jsonify, render_template, request
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "stp_time_tool.sqlite3"
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
+
+
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+UPLOAD_RETENTION_DAYS = max(0, env_int("UPLOAD_RETENTION_DAYS", 7))
+
+
+def cleanup_old_uploads(retention_days: int = UPLOAD_RETENTION_DAYS) -> dict[str, int]:
+    if retention_days <= 0:
+        return {"deleted": 0, "skipped": 0}
+
+    cutoff = time.time() - retention_days * 24 * 60 * 60
+    deleted = 0
+    skipped = 0
+    for path in UPLOAD_DIR.iterdir():
+        try:
+            if not path.is_file() or path.suffix.lower() not in UPLOAD_CLEANUP_EXTENSIONS:
+                continue
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                deleted += 1
+        except OSError:
+            skipped += 1
+    return {"deleted": deleted, "skipped": skipped}
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+    return [dict(row) for row in rows]
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS tools (
+                tool_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name TEXT NOT NULL,
+                tool_type TEXT NOT NULL,
+                diameter_mm REAL NOT NULL,
+                flute_count INTEGER NOT NULL,
+                max_depth_mm REAL NOT NULL,
+                material TEXT NOT NULL,
+                roughing INTEGER NOT NULL DEFAULT 1,
+                finishing INTEGER NOT NULL DEFAULT 1,
+                memo TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS cutting_conditions (
+                condition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_id INTEGER NOT NULL,
+                material_type TEXT NOT NULL,
+                process_type TEXT NOT NULL,
+                spindle_rpm INTEGER NOT NULL,
+                feed_rate_mm_min REAL NOT NULL,
+                depth_of_cut_mm REAL NOT NULL,
+                width_of_cut_mm REAL NOT NULL,
+                tool_change_sec INTEGER NOT NULL,
+                FOREIGN KEY(tool_id) REFERENCES tools(tool_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS machines (
+                machine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                machine_name TEXT NOT NULL,
+                axis_count INTEGER NOT NULL,
+                rapid_feed_mm_min REAL NOT NULL,
+                atc_time_sec INTEGER NOT NULL,
+                max_spindle_rpm INTEGER NOT NULL,
+                setup_time_min INTEGER NOT NULL,
+                memo TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS histories (
+                history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                material_type TEXT NOT NULL,
+                blank_allowance_mm REAL NOT NULL,
+                machine_name TEXT NOT NULL,
+                total_sec REAL NOT NULL,
+                confidence REAL NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS manufacturer_catalogs (
+                catalog_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                manufacturer TEXT NOT NULL,
+                product_name TEXT NOT NULL,
+                tool_type TEXT NOT NULL,
+                flute_info TEXT,
+                coating TEXT,
+                material_hint TEXT,
+                series_codes TEXT,
+                catalog_url TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                memo TEXT,
+                UNIQUE(manufacturer, product_name, catalog_url)
+            );
+
+            CREATE TABLE IF NOT EXISTS manufacturer_cutting_conditions (
+                condition_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                manufacturer TEXT NOT NULL,
+                series_code TEXT NOT NULL,
+                product_name TEXT NOT NULL,
+                tool_type TEXT NOT NULL,
+                model_family TEXT NOT NULL,
+                outside_diameter_mm REAL NOT NULL,
+                corner_radius_label TEXT NOT NULL,
+                effective_length_mm REAL NOT NULL,
+                work_material TEXT NOT NULL,
+                hardness TEXT,
+                material_group TEXT,
+                spindle_rpm INTEGER NOT NULL,
+                feed_rate_mm_min REAL NOT NULL,
+                axial_depth_mm REAL NOT NULL,
+                radial_depth_mm REAL NOT NULL,
+                source_url TEXT NOT NULL,
+                source_page INTEGER,
+                memo TEXT,
+                UNIQUE(
+                    manufacturer, series_code, model_family, outside_diameter_mm,
+                    corner_radius_label, effective_length_mm, work_material, hardness
+                )
+            );
+            """
+        )
+        if conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0] == 0:
+            seed_master(conn)
+        seed_union_tool_catalogs(conn)
+        seed_osg_catalogs(conn)
+        seed_union_tool_cutting_conditions(conn)
+    cleanup_old_uploads()
+
+
+def seed_master(conn: sqlite3.Connection) -> None:
+    tools = [
+        ("φ50 フェイスミル", "FACE", 50, 6, 3, "アルミ/鉄/SUS", 1, 1, "上面・広い平面"),
+        ("φ16 フラットEM", "EM", 16, 4, 40, "アルミ/鉄/SUS", 1, 1, "側面・ポケット荒"),
+        ("φ10 フラットEM", "EM", 10, 4, 30, "アルミ/鉄/SUS", 1, 1, "汎用ポケット"),
+        ("φ6 ドリル", "DRILL", 6, 2, 45, "アルミ/鉄/SUS", 1, 0, "小径穴"),
+        ("M6 タップ", "TAP", 6, 3, 25, "アルミ/鉄/SUS", 0, 1, "ねじ穴概算"),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO tools
+        (tool_name, tool_type, diameter_mm, flute_count, max_depth_mm, material, roughing, finishing, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        tools,
+    )
+
+    machines = [
+        ("標準 3軸MC", 3, 15000, 8, 12000, 30, "概算用デフォルト"),
+        ("高速 5軸MC", 5, 30000, 5, 20000, 45, "5軸案件の概算"),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO machines
+        (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec, max_spindle_rpm, setup_time_min, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        machines,
+    )
+
+    condition_rows = []
+    material_factor = {"アルミ": 1.8, "鉄": 1.0, "SUS": 0.55}
+    for tool_id, tool_name, tool_type, diameter, *_ in conn.execute(
+        "SELECT tool_id, tool_name, tool_type, diameter_mm FROM tools"
+    ).fetchall():
+        for material, factor in material_factor.items():
+            if tool_type == "FACE":
+                base_feed = 1200
+                process = "平面"
+                ap = 1.5
+                ae = diameter * 0.55
+            elif tool_type == "DRILL":
+                base_feed = 180
+                process = "穴"
+                ap = diameter
+                ae = diameter
+            elif tool_type == "TAP":
+                base_feed = 120
+                process = "タップ"
+                ap = diameter
+                ae = diameter
+            else:
+                base_feed = 650
+                process = "ポケット"
+                ap = min(4.0, diameter * 0.35)
+                ae = diameter * 0.4
+            rpm = min(12000, max(800, int((1000 * 90 * factor) / (math.pi * diameter))))
+            condition_rows.append(
+                (tool_id, material, process, rpm, round(base_feed * factor, 1), ap, round(ae, 2), 8)
+            )
+    conn.executemany(
+        """
+        INSERT INTO cutting_conditions
+        (tool_id, material_type, process_type, spindle_rpm, feed_rate_mm_min,
+         depth_of_cut_mm, width_of_cut_mm, tool_change_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        condition_rows,
+    )
+
+
+UNION_TOOL_SOURCE_URL = "https://www.uniontool.co.jp/catalog/endmill.html"
+OSG_SOURCE_URL = "https://www.osg.co.jp/media_dl/flier/endmill.html"
+
+UNION_TOOL_CATALOG_ITEMS = [
+    ("超硬エンドミル総合カタログ vol.22", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vol22_jp.pdf"),
+    ("鉄鋼用ドリルシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_tungsten.pdf"),
+    ("エコノミーシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_economy.pdf"),
+    ("Φ3シャンクVシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vseriescatalog.pdf"),
+    ("Φ3シャンクVシリーズ 4枚刃 高硬度用ロングネックラジアスエンドミル VHGLRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vseries_vhglrs.pdf"),
+    ("UTCOAT 2枚刃 ロングネックラジアスエンドミル CLRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_clrs.pdf"),
+    ("DLCCOAT 2枚刃/4枚刃 銅電極加工用スクエアエンドミル DLCES2000/4000", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_dlces2000-4000.pdf"),
+    ("HMGCOAT 6枚刃 高硬度材加工用スクエアエンドミル HGS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hgs.pdf"),
+    ("2枚刃ボールエンドミル HWB/HWB-S/CWB", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hwb_hwb-s_cwb.pdf"),
+    ("2枚刃 ロングネックボール HGLB/HWLB/HWLB-S/CWLB", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hwlb_hwlb-s_cwlb_hglb.pdf"),
+    ("UDC 2枚刃 高靭性超硬合金加工用ボール・ロングネックボール UDCSB/UDCSLB", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_udcsb_udcslb.pdf"),
+    ("4枚刃 ロングネックボールエンドミル CBN-LBF4000", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cbn-lbf4000.pdf"),
+    ("DLCCOAT 3枚刃 アルミ加工用チップブレーカ付スクエアエンドミル DLC-ALES", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_dlc-ales.pdf"),
+    ("部品加工用総合リーフレット", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_processing.pdf"),
+    ("UTCOAT 4枚刃高能率スクエアエンドミル CEHS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cehs.pdf"),
+    ("6枚刃/10枚刃超硬合金・硬脆材加工用荒加工専用ロングネックラジアスエンドミル UDCRRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_udcrrs.pdf"),
+    ("UDC 超硬合金・硬脆材用シリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/UDC catalog_vol.13_jp.pdf"),
+    ("CBN 4枚刃 ハイグレードロングネックラジアスエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cbn-lrf4000.pdf"),
+    ("DLCCOAT銅電極用シリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_dlclb_202304.pdf"),
+    ("HMGCOAT 高硬度用4枚刃ロングネックラジアス", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hglrs_2023_04.pdf"),
+    ("HMGCOAT 5枚刃/6枚刃 高硬度材加工用高能率ロングネックラジアスエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_em_hgrrs_2023_04.pdf"),
+    ("CBNシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cbn_vol9_2111.pdf"),
+    ("UTCOAT 高能率仕上げ加工用 バレルエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/em_barrel_vol2.pdf"),
+    ("HARDMAX 2・3枚刃テーパネックボール", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_htnb_hftnb_01.pdf"),
+    ("HMGCOAT 高硬度用ボール・ロングネックボール", "https://www.uniontool.co.jp/assets/pdf/catalog/catalog_em-hgb_vol6.pdf"),
+    ("HARDMAX 4枚刃テーパネックラジアス", "https://www.uniontool.co.jp/assets/pdf/catalog/em-htnrs_vol3.pdf"),
+    ("HARDMAX 4・6枚刃ラジアス", "https://www.uniontool.co.jp/assets/pdf/catalog/em-hmers.pdf"),
+    ("HARDMAX 3枚刃テーパネックボール", "https://www.uniontool.co.jp/assets/pdf/catalog/em-hftnb.pdf"),
+    ("DLCコート 1枚刃 アルミサッシ用 スクエアエンドミル DLCAL35Y", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlcal35y.pdf"),
+    ("UTコート 3枚刃 球形状ボールエンドミル C-CQBLY", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-cqbly.pdf"),
+    ("UTコート 2枚刃平面仕上げ加工用スクエアエンドミル C-CSMY", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-csmy.pdf"),
+    ("5枚刃面取り加工用エンドミル CSVY・HSVY・DLCSVY", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-csvy_hsvy_dlcsvy.pdf"),
+    ("UTコート 2枚刃 球形状ボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-cqby_jp.pdf"),
+    ("DLCコート 1枚刃 スクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlccps22y_jp.pdf"),
+    ("DLCコート 2枚刃 ロングネックラジアスエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlclrsy_jp.pdf"),
+    ("UTコート 3枚刃 ボールエンドミル/ロングシャンクボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_cfby_jp.pdf"),
+    ("UTコート 2枚刃スレッドミル/DLCコート 2枚刃 スレッドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_ctmy_jp.pdf"),
+    ("DLCコート 3枚刃 ボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlccfby_jp.pdf"),
+    ("DLCコート 2枚刃 フラットドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlcdfy_jp.pdf"),
+    ("UDCコート2枚刃 ドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_udcmxy_jp.pdf"),
+    ("HARDMAX 2枚刃 ロングネックボール/ショートシャンクロングネックボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_hlb_hlb-s_jp.pdf"),
+    ("DLCコート 2枚刃 スクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/022681-01_d-d_a4.pdf"),
+    ("DLCコート 3枚刃 アルミ加工用ロングネックスクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/022683-01_d-a_a4.pdf"),
+    ("UTコート 2枚刃 2段角センタードリル", "https://www.uniontool.co.jp/assets/pdf/catalog/022682-01_c_a4.pdf"),
+    ("ダイヤモンドコート 多刃 ダイヤ目工具・2/4枚刃スクエア", "https://www.uniontool.co.jp/assets/pdf/catalog/DCDRSY_DCESY2000_DCESY4000_jp.pdf"),
+    ("UTコート・DLCコート4枚刃 小径ねじ切り工具", "https://www.uniontool.co.jp/assets/pdf/catalog/CTMY_DLC-CTMY_jp.pdf"),
+    ("HARDMAXコート 6枚刃 逆段 スクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/HMSY_jp.pdf"),
+    ("DLCコート超硬ドリル/ノンコート超硬ドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_umd_ty_jp.pdf"),
+    ("UDCコート 2枚刃 ロング溝長ドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_udclxy_jp.pdf"),
+    ("UTコート2枚刃 フラットドリルφ3シャンク", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_utdf-ty_jp.pdf"),
+    ("DLCコート 4枚刃 高能率縦横送り スクエアエンドミル（部品加工用）", "https://www.uniontool.co.jp/assets/pdf/catalog/DLCZS-TY.jp.pdf"),
+]
+
+
+UNION_TOOL_CATALOG_ITEMS_OFFICIAL = [
+    ("超硬エンドミル総合カタログ vol.22", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vol22_jp.pdf"),
+    ("鉄鋼用ドリルシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_tungsten.pdf"),
+    ("エコノミーシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_economy.pdf"),
+    ("Φ3シャンクVシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vseriescatalog.pdf"),
+    ("Φ3シャンクVシリーズ 4枚刃 高硬度用ロングネックラジアスエンドミル VHGLRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vseries_vhglrs.pdf"),
+    ("UTCOAT 2枚刃 ロングネックラジアスエンドミル CLRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_clrs.pdf"),
+    ("DLCCOAT 2枚刃/4枚刃 銅電極加工用スクエアエンドミル DLCES2000/4000", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_dlces2000-4000.pdf"),
+    ("HMGCOAT 6枚刃 高硬度材加工用スクエアエンドミル HGS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hgs.pdf"),
+    ("2枚刃ボールエンドミル HWB/HWB-S/CWB", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hwb_hwb-s_cwb.pdf"),
+    ("2枚刃 ロングネックボール HGLB/HWLB/HWLB-S/CWLB", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hwlb_hwlb-s_cwlb_hglb.pdf"),
+    ("UDC 2枚刃 高靭性超硬合金加工用ボール・ロングネックボール UDCSB/UDCSLB", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_udcsb_udcslb.pdf"),
+    ("4枚刃 ロングネックボールエンドミル CBN-LBF4000", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cbn-lbf4000.pdf"),
+    ("DLCCOAT 3枚刃 アルミ加工用チップブレーカ付スクエアエンドミル DLC-ALES", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_dlc-ales.pdf"),
+    ("部品加工用総合リーフレット", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_processing.pdf"),
+    ("UTCOAT 4枚刃高能率スクエアエンドミル CEHS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cehs.pdf"),
+    ("6枚刃/10枚刃超硬合金・硬脆材加工用荒加工専用ロングネックラジアスエンドミル UDCRRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_udcrrs.pdf"),
+    ("UDC 超硬合金・硬脆材用シリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/UDC catalog_vol.13_jp.pdf"),
+    ("CBN 4枚刃 ハイグレードロングネックラジアスエンドミル CBN-LRF4000", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cbn-lrf4000.pdf"),
+    ("DLCCOAT銅電極用シリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_dlclb_202304.pdf"),
+    ("HMGCOAT 高硬度用4枚刃ロングネックラジアスエンドミル HGLRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_hglrs_2023_04.pdf"),
+    ("HMGCOAT 5枚刃/6枚刃 高硬度材加工用高能率ロングネックラジアスエンドミル HGRRS", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_em_hgrrs_2023_04.pdf"),
+    ("CBNシリーズ", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_cbn_vol9_2111.pdf"),
+    ("UTCOAT 高能率仕上げ加工用 バレルエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/em_barrel_vol2.pdf"),
+    ("HARDMAX 2・3枚刃テーパネックボール", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_htnb_hftnb_01.pdf"),
+    ("HMGCOAT 高硬度用ボール・ロングネックボール", "https://www.uniontool.co.jp/assets/pdf/catalog/catalog_em-hgb_vol6.pdf"),
+    ("HARDMAX 4枚刃テーパネックラジアス", "https://www.uniontool.co.jp/assets/pdf/catalog/em-htnrs_vol3.pdf"),
+    ("HARDMAX 4・6枚刃ラジアス", "https://www.uniontool.co.jp/assets/pdf/catalog/em-hmers.pdf"),
+    ("HARDMAX 3枚刃テーパネックボール", "https://www.uniontool.co.jp/assets/pdf/catalog/em-hftnb.pdf"),
+    ("DLCコート 1枚刃 アルミサッシ用 スクエアエンドミル DLCAL35Y", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlcal35y.pdf"),
+    ("UTコート 3枚刃 球形状ボールエンドミル C-CQBLY", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-cqbly.pdf"),
+    ("UTコート 2枚刃平面仕上げ加工用スクエアエンドミル C-CSMY", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-csmy.pdf"),
+    ("5枚刃面取り加工用エンドミル CSVY・HSVY・DLCSVY", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-csvy_hsvy_dlcsvy.pdf"),
+    ("UTコート 2枚刃 球形状ボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_c-cqby_jp.pdf"),
+    ("DLCコート 1枚刃 スクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlccps22y_jp.pdf"),
+    ("DLCコート 2枚刃 ロングネックラジアスエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlclrsy_jp.pdf"),
+    ("UTコート 3枚刃 ボールエンドミル/ロングシャンクボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_cfby_jp.pdf"),
+    ("UTコート 2枚刃スレッドミル/DLCコート 2枚刃 スレッドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_ctmy_jp.pdf"),
+    ("DLCコート 3枚刃 ボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlccfby_jp.pdf"),
+    ("DLCコート 2枚刃 フラットドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_dlcdfy_jp.pdf"),
+    ("UDCコート2枚刃 ドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_udcmxy_jp.pdf"),
+    ("HARDMAX 2枚刃 ロングネックボール/ショートシャンクロングネックボールエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_hlb_hlb-s_jp.pdf"),
+    ("DLCコート 2枚刃 スクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/022681-01_d-d_a4.pdf"),
+    ("DLCコート 3枚刃 アルミ加工用ロングネックスクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/022683-01_d-a_a4.pdf"),
+    ("UTコート 2枚刃 2段角センタードリル", "https://www.uniontool.co.jp/assets/pdf/catalog/022682-01_c_a4.pdf"),
+    ("ダイヤモンドコート 多刃 ダイヤ目工具・2/4枚刃スクエア", "https://www.uniontool.co.jp/assets/pdf/catalog/DCDRSY_DCESY2000_DCESY4000_jp.pdf"),
+    ("UTコート・DLCコート4枚刃 小径ねじ切り工具", "https://www.uniontool.co.jp/assets/pdf/catalog/CTMY_DLC-CTMY_jp.pdf"),
+    ("HARDMAXコート 6枚刃 逆段 スクエアエンドミル", "https://www.uniontool.co.jp/assets/pdf/catalog/HMSY_jp.pdf"),
+    ("DLCコート超硬ドリル/ノンコート超硬ドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_umd_ty_jp.pdf"),
+    ("UDCコート 2枚刃 ロング溝長ドリル", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_udclxy_jp.pdf"),
+    ("UTコート2枚刃 フラットドリルφ3シャンク", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_sp_utdf-ty_jp.pdf"),
+    ("DLCコート 4枚刃 高能率縦横送り スクエアエンドミル（部品加工用）", "https://www.uniontool.co.jp/assets/pdf/catalog/DLCZS-TY.jp.pdf"),
+]
+
+
+OSG_CATALOG_ITEMS = [
+    ("超硬防振型エンドミルAE-VMシリーズ", "https://www.osg.co.jp/media_dl/flier/file/n_115.pdf"),
+    ("超硬防振型エンドミル自動旋盤対応型AE-VTSS", "https://www.osg.co.jp/media_dl/flier/file/n_134.pdf"),
+    ("非鉄用DLCエンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_132.pdf"),
+    ("銅電極用DLC超硬エンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_133.pdf"),
+    ("高硬度鋼用エンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_130.pdf"),
+    ("2枚刃CBNボールエンドミルCBN-FB2", "https://www.osg.co.jp/media_dl/flier/file/n_140.pdf"),
+    ("スーパーエンプラ用DLC超硬エンドミルSEP-EL", "https://www.osg.co.jp/media_dl/flier/file/n_138.pdf"),
+    ("アディティブ・マニュファクチャリング用エンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_125.pdf"),
+    ("仕上げ用異形工具VU-Rシリーズ", "https://www.osg.co.jp/media_dl/flier/file/c_93.pdf"),
+    ("フェニックスエンドミルPHX", "https://www.osg.co.jp/media_dl/flier/file/n_72.pdf"),
+    ("WXL/WXSエンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_100.pdf"),
+    ("セラミックエンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_121.pdf"),
+    ("チタン合金加工用エンドミルUVX-TI・HFC-TI", "https://www.osg.co.jp/media_dl/flier/file/n_107.pdf"),
+    ("アルミニウム高速加工用エンドミルAERO", "https://www.osg.co.jp/media_dl/flier/file/n_106.pdf"),
+    ("インペラ・タービンブレード用超硬テーパボールエンドミルIB-TPBT", "https://www.osg.co.jp/media_dl/flier/file/n_127.pdf"),
+    ("サイレントラフィングエンドミル", "https://www.osg.co.jp/media_dl/flier/file/n_101.pdf"),
+    ("ハイプロ面取り工具", "https://www.osg.co.jp/media_dl/flier/file/h_29.pdf"),
+]
+
+
+OSG_CATALOG_METADATA = {
+    "超硬防振型エンドミルAE-VMシリーズ": {
+        "series_codes": "AE-VM, AE-VMSS, AE-VMS, AE-VMSX, AE-VML, AE-VMFE",
+        "coating": "DUARISE",
+        "material_hint": "汎用/炭素鋼/合金鋼/ステンレス/チタン",
+    },
+    "超硬防振型エンドミル自動旋盤対応型AE-VTSS": {
+        "series_codes": "AE-VTSS",
+        "coating": "DUARISE",
+        "material_hint": "自動旋盤/小径加工",
+    },
+    "非鉄用DLCエンドミル": {
+        "series_codes": "DLC",
+        "coating": "DLC",
+        "material_hint": "非鉄/アルミ/銅",
+    },
+    "銅電極用DLC超硬エンドミル": {
+        "series_codes": "DLC",
+        "coating": "DLC",
+        "material_hint": "銅電極",
+    },
+    "高硬度鋼用エンドミル": {
+        "series_codes": "高硬度鋼用",
+        "coating": "",
+        "material_hint": "高硬度鋼",
+    },
+    "2枚刃CBNボールエンドミルCBN-FB2": {
+        "series_codes": "CBN-FB2",
+        "coating": "CBN",
+        "material_hint": "高硬度鋼/仕上げ",
+    },
+    "スーパーエンプラ用DLC超硬エンドミルSEP-EL": {
+        "series_codes": "SEP-EL",
+        "coating": "DLC",
+        "material_hint": "スーパーエンプラ/樹脂",
+    },
+    "アディティブ・マニュファクチャリング用エンドミル": {
+        "series_codes": "AM",
+        "coating": "",
+        "material_hint": "積層造形/AM",
+    },
+    "仕上げ用異形工具VU-Rシリーズ": {
+        "series_codes": "VU-R",
+        "coating": "",
+        "material_hint": "仕上げ/異形",
+    },
+    "フェニックスエンドミルPHX": {
+        "series_codes": "PHX",
+        "coating": "",
+        "material_hint": "汎用",
+    },
+    "WXL/WXSエンドミル": {
+        "series_codes": "WXL, WXS",
+        "coating": "WXL/WXS",
+        "material_hint": "汎用/高精度",
+    },
+    "セラミックエンドミル": {
+        "series_codes": "CERAMIC",
+        "coating": "セラミック",
+        "material_hint": "耐熱合金",
+    },
+    "チタン合金加工用エンドミルUVX-TI・HFC-TI": {
+        "series_codes": "UVX-TI, HFC-TI",
+        "coating": "",
+        "material_hint": "チタン合金",
+    },
+    "アルミニウム高速加工用エンドミルAERO": {
+        "series_codes": "AERO",
+        "coating": "",
+        "material_hint": "アルミ",
+    },
+    "インペラ・タービンブレード用超硬テーパボールエンドミルIB-TPBT": {
+        "series_codes": "IB-TPBT",
+        "coating": "",
+        "material_hint": "インペラ/タービンブレード",
+    },
+    "サイレントラフィングエンドミル": {
+        "series_codes": "SILENT ROUGHING",
+        "coating": "",
+        "material_hint": "ラフィング/荒加工",
+    },
+    "ハイプロ面取り工具": {
+        "series_codes": "HY-PRO",
+        "coating": "",
+        "material_hint": "面取り",
+    },
+}
+
+
+def infer_catalog_tool_type(name: str) -> str:
+    if "ドリル" in name or "センタードリル" in name:
+        return "DRILL"
+    if "スレッドミル" in name or "ねじ切り" in name or "タップ" in name:
+        return "THREAD"
+    if "ボール" in name:
+        return "BALL"
+    if "ラジアス" in name:
+        return "RADIUS"
+    if "バレル" in name:
+        return "BARREL"
+    if "面取り" in name:
+        return "CHAMFER"
+    if "スクエア" in name or "エンドミル" in name:
+        return "SQUARE"
+    return "CATALOG"
+
+
+def infer_catalog_coating(name: str) -> str:
+    for coating in ["DLCCOAT", "DLCコート", "UTCOAT", "UTコート", "HMGCOAT", "HARDMAX", "UDC", "CBN", "ダイヤモンドコート"]:
+        if coating in name:
+            return coating
+    if "ノンコート" in name:
+        return "ノンコート"
+    return ""
+
+
+def infer_material_hint(name: str) -> str:
+    hints = []
+    if "アルミ" in name:
+        hints.append("アルミ")
+    if "銅電極" in name or "銅" in name:
+        hints.append("銅電極")
+    if "高硬度" in name:
+        hints.append("高硬度材")
+    if "超硬合金" in name or "硬脆材" in name:
+        hints.append("超硬合金/硬脆材")
+    if "鉄鋼" in name:
+        hints.append("鉄鋼")
+    return "/".join(dict.fromkeys(hints))
+
+
+def infer_series_codes(name: str) -> str:
+    codes = re.findall(r"\b[A-Z][A-Z0-9-]{2,}(?:/[A-Z][A-Z0-9-]{2,})*", name)
+    split_codes: list[str] = []
+    for code in codes:
+        split_codes.extend(part for part in code.split("/") if part)
+    return ", ".join(dict.fromkeys(split_codes))
+
+
+def infer_flute_info(name: str) -> str:
+    matches = re.findall(r"(\d+)\s*枚刃", name)
+    return "/".join(dict.fromkeys(matches))
+
+
+def seed_union_tool_catalogs(conn: sqlite3.Connection) -> None:
+    rows = []
+    conn.execute(
+        "DELETE FROM manufacturer_catalogs WHERE manufacturer = ? OR source_url = ?",
+        ("ユニオンツール", UNION_TOOL_SOURCE_URL),
+    )
+    for product_name, catalog_url in UNION_TOOL_CATALOG_ITEMS_OFFICIAL:
+        rows.append(
+            (
+                "ユニオンツール",
+                product_name,
+                infer_catalog_tool_type(product_name),
+                infer_flute_info(product_name),
+                infer_catalog_coating(product_name),
+                infer_material_hint(product_name),
+                infer_series_codes(product_name),
+                catalog_url,
+                UNION_TOOL_SOURCE_URL,
+                "公式カタログページ掲載のシリーズ/リーフレット情報。径・有効長はPDF本文で確認が必要。",
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO manufacturer_catalogs
+        (manufacturer, product_name, tool_type, flute_info, coating, material_hint,
+         series_codes, catalog_url, source_url, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def seed_osg_catalogs(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM manufacturer_catalogs WHERE manufacturer = ? OR source_url = ?",
+        ("OSG", OSG_SOURCE_URL),
+    )
+    rows = []
+    for product_name, catalog_url in OSG_CATALOG_ITEMS:
+        metadata = OSG_CATALOG_METADATA.get(product_name, {})
+        rows.append(
+            (
+                "OSG",
+                product_name,
+                infer_catalog_tool_type(product_name),
+                infer_flute_info(product_name),
+                metadata.get("coating") or infer_catalog_coating(product_name),
+                metadata.get("material_hint") or infer_material_hint(product_name),
+                metadata.get("series_codes") or infer_series_codes(product_name),
+                catalog_url,
+                OSG_SOURCE_URL,
+                "OSG公式製品カタログページ掲載のエンドミルPDF。シリーズ名・用途を登録済み。径・有効長・切削条件はPDF本文で確認。",
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO manufacturer_catalogs
+        (manufacturer, product_name, tool_type, flute_info, coating, material_hint,
+         series_codes, catalog_url, source_url, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def seed_union_tool_cutting_conditions(conn: sqlite3.Connection) -> None:
+    paths = sorted((BASE_DIR / "data").glob("*_cutting_conditions.csv"))
+    rows = []
+    for path in paths:
+        with path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            rows.extend(
+                (
+                    row["manufacturer"],
+                    row["series_code"],
+                    row["product_name"],
+                    row["tool_type"],
+                    row["model_family"],
+                    float(row["outside_diameter_mm"]),
+                    row["corner_radius_label"],
+                    float(row["effective_length_mm"]),
+                    row["work_material"],
+                    row["hardness"],
+                    row["material_group"],
+                    int(float(row["spindle_rpm"])),
+                    float(row["feed_rate_mm_min"]),
+                    float(row["axial_depth_mm"]),
+                    float(row["radial_depth_mm"]),
+                    row["source_url"],
+                    int(row["source_page"]) if row["source_page"] else None,
+                    row["memo"],
+                )
+                for row in reader
+            )
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT OR REPLACE INTO manufacturer_cutting_conditions
+        (manufacturer, series_code, product_name, tool_type, model_family,
+         outside_diameter_mm, corner_radius_label, effective_length_mm,
+         work_material, hardness, material_group, spindle_rpm, feed_rate_mm_min,
+         axial_depth_mm, radial_depth_mm, source_url, source_page, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+def ensure_catalog_tool_master(conn: sqlite3.Connection) -> None:
+    if conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0] > 0:
+        return
+
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM manufacturer_cutting_conditions
+        ORDER BY manufacturer, series_code, model_family, outside_diameter_mm,
+                 effective_length_mm, condition_id
+        """
+    ).fetchall()
+    if not rows:
+        seed_master(conn)
+        return
+
+    tool_ids: dict[tuple[Any, ...], int] = {}
+    for row in rows:
+        tool_type = "EM" if row["tool_type"] in {"SQUARE", "RADIUS", "BALL"} else row["tool_type"]
+        key = (
+            row["manufacturer"],
+            row["series_code"],
+            row["model_family"],
+            float(row["outside_diameter_mm"]),
+            float(row["effective_length_mm"]),
+            row["corner_radius_label"],
+        )
+        if key in tool_ids:
+            continue
+        tool_name = (
+            f'{row["manufacturer"]} {row["series_code"]} {row["model_family"]} '
+            f'φ{float(row["outside_diameter_mm"]):g} {row["corner_radius_label"]}'
+        )
+        cur = conn.execute(
+            """
+            INSERT INTO tools
+            (tool_name, tool_type, diameter_mm, flute_count, max_depth_mm,
+             material, roughing, finishing, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tool_name,
+                tool_type,
+                float(row["outside_diameter_mm"]),
+                4,
+                float(row["effective_length_mm"]),
+                row["work_material"],
+                1,
+                1,
+                f'メーカーPDF条件から自動生成: {row["source_url"]} p.{row["source_page"] or "-"}',
+            ),
+        )
+        tool_ids[key] = int(cur.lastrowid)
+
+    condition_rows = []
+    for row in rows:
+        key = (
+            row["manufacturer"],
+            row["series_code"],
+            row["model_family"],
+            float(row["outside_diameter_mm"]),
+            float(row["effective_length_mm"]),
+            row["corner_radius_label"],
+        )
+        process_type = "ポケット" if row["tool_type"] in {"SQUARE", "RADIUS", "BALL"} else row["tool_type"]
+        condition_rows.append(
+            (
+                tool_ids[key],
+                row["work_material"],
+                process_type,
+                int(row["spindle_rpm"]),
+                float(row["feed_rate_mm_min"]),
+                float(row["axial_depth_mm"]),
+                float(row["radial_depth_mm"]),
+                8,
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO cutting_conditions
+        (tool_id, material_type, process_type, spindle_rpm, feed_rate_mm_min,
+         depth_of_cut_mm, width_of_cut_mm, tool_change_sec)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        condition_rows,
+    )
+
+
+@dataclass
+class Feature:
+    feature_type: str
+    dimensions: str
+    quantity: int
+    tool_id: int | None
+    tool_name: str
+    process_type: str
+    machining_sec: float
+    note: str
+
+
+def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    entity_count = len(re.findall(r"^#\d+=", text, flags=re.MULTILINE))
+    face_count = len(re.findall(r"ADVANCED_FACE|FACE_BOUND", text, flags=re.IGNORECASE))
+    plane_count = len(re.findall(r"\bPLANE\s*\(", text, flags=re.IGNORECASE))
+    cylindrical_radii = [
+        float(match.group(1))
+        for match in re.finditer(r"CYLINDRICAL_SURFACE\s*\([^,]+,\s*#[0-9]+,\s*([0-9.+\-Ee]+)", text)
+    ]
+    point_values = re.findall(
+        r"CARTESIAN_POINT\s*\([^,]*,\s*\(\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*\)\s*\)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    points = [(float(x), float(y), float(z)) for x, y, z in point_values[:20000]]
+    if points:
+        xs, ys, zs = zip(*points)
+        x_len = max(xs) - min(xs)
+        y_len = max(ys) - min(ys)
+        z_len = max(zs) - min(zs)
+    else:
+        scale = max(40.0, min(260.0, math.sqrt(max(path.stat().st_size, 1)) * 0.9))
+        x_len, y_len, z_len = scale, scale * 0.65, scale * 0.35
+
+    x_len = max(1.0, x_len + blank_allowance_mm * 2)
+    y_len = max(1.0, y_len + blank_allowance_mm * 2)
+    z_len = max(1.0, z_len + blank_allowance_mm * 2)
+    small_radii = [r for r in cylindrical_radii if 1.0 <= r <= 20.0]
+
+    return {
+        "entity_count": entity_count,
+        "face_count": face_count,
+        "plane_count": plane_count,
+        "cylindrical_radii": small_radii,
+        "bbox": {"x": x_len, "y": y_len, "z": z_len},
+        "points_detected": len(points),
+        "parser": "STEPテキスト解析",
+    }
+
+
+def pick_tool(conn: sqlite3.Connection, tool_type: str, target_diameter: float | None = None) -> sqlite3.Row:
+    rows = conn.execute("SELECT * FROM tools WHERE tool_type = ? ORDER BY diameter_mm", (tool_type,)).fetchall()
+    if not rows:
+        rows = conn.execute("SELECT * FROM tools ORDER BY diameter_mm").fetchall()
+    if not rows:
+        raise RuntimeError("工具マスタが未登録です。")
+    if target_diameter is None:
+        return rows[-1]
+    return min(rows, key=lambda row: abs(float(row["diameter_mm"]) - target_diameter))
+
+
+def condition_for(conn: sqlite3.Connection, tool_id: int, material_type: str, process_hint: str) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT * FROM cutting_conditions
+        WHERE tool_id = ? AND material_type = ? AND process_type = ?
+        ORDER BY condition_id LIMIT 1
+        """,
+        (tool_id, material_type, process_hint),
+    ).fetchone()
+    if row:
+        return row
+    row = conn.execute(
+        """
+        SELECT * FROM cutting_conditions
+        WHERE tool_id = ? AND material_type = ?
+        ORDER BY condition_id LIMIT 1
+        """,
+        (tool_id, material_type),
+    ).fetchone()
+    if row:
+        return row
+    return conn.execute(
+        "SELECT * FROM cutting_conditions WHERE tool_id = ? ORDER BY condition_id LIMIT 1",
+        (tool_id,),
+    ).fetchone()
+
+
+def manufacturer_condition_for(
+    conn: sqlite3.Connection,
+    series_code: str,
+    material_key: str,
+    target_diameter: float,
+    max_effective_length: float | None = None,
+    condition_id: int | None = None,
+) -> sqlite3.Row | None:
+    if condition_id:
+        row = conn.execute(
+            """
+            SELECT *
+            FROM manufacturer_cutting_conditions
+            WHERE condition_id = ?
+            """,
+            (condition_id,),
+        ).fetchone()
+        if row is not None:
+            return row
+
+    query = """
+        SELECT *
+        FROM manufacturer_cutting_conditions
+        WHERE series_code = ?
+          AND work_material = ?
+    """
+    params: list[Any] = [series_code, material_key]
+    if max_effective_length is not None:
+        query += " AND effective_length_mm <= ?"
+        params.append(max_effective_length)
+    query += """
+        ORDER BY ABS(outside_diameter_mm - ?), effective_length_mm DESC, condition_id
+        LIMIT 1
+    """
+    params.append(target_diameter)
+    row = conn.execute(query, params).fetchone()
+    if row is not None:
+        return row
+    return conn.execute(
+        """
+        SELECT *
+        FROM manufacturer_cutting_conditions
+        WHERE series_code = ?
+        ORDER BY ABS(outside_diameter_mm - ?), effective_length_mm DESC, condition_id
+        LIMIT 1
+        """,
+        (series_code, target_diameter),
+    ).fetchone()
+
+
+def material_keywords(material_type: str) -> list[str]:
+    text = material_type.upper()
+    if "SUS" in text or "ステンレス" in material_type:
+        return ["SUS", "SUS304", "STAINLESS"]
+    if "アルミ" in material_type or "AL" in text:
+        return ["A5052", "A7075", "ALUMINUM", "ALUMINIUM", "ALLOYS", "アルミ"]
+    if "銅" in material_type or "COPPER" in text:
+        return ["COPPER", "C1100", "銅"]
+    return ["S50C", "S45C", "SCM", "SKD", "STAVAX", "NAK", "HAP", "STEEL", "鋼", "FC"]
+
+
+def auto_manufacturer_condition_for(
+    conn: sqlite3.Connection,
+    material_type: str,
+    target_diameter: float,
+    required_depth: float,
+    process_hint: str,
+) -> sqlite3.Row | None:
+    rows = conn.execute("SELECT * FROM manufacturer_cutting_conditions").fetchall()
+    if not rows:
+        return None
+
+    keywords = material_keywords(material_type)
+    process_text = process_hint.upper()
+
+    def score(row: sqlite3.Row) -> tuple[float, float, int]:
+        searchable = " ".join(
+            str(row[key] or "")
+            for key in ("work_material", "material_group", "product_name", "memo", "tool_type", "series_code")
+        ).upper()
+        value = 0.0
+
+        if any(keyword.upper() in searchable for keyword in keywords):
+            value += 1000
+        if "ポケット" in process_hint or "POCKET" in process_text:
+            if any(word in searchable for word in ("POCKET", "TROCHOIDAL", "SLOTTING", "SIDE")):
+                value += 120
+        elif "側面" in process_hint or "SIDE" in process_text:
+            if any(word in searchable for word in ("SIDE", "MILLING", "FINISHING")):
+                value += 120
+
+        if row["tool_type"] in {"SQUARE", "RADIUS"}:
+            value += 80
+        if row["manufacturer"] == "OSG":
+            value += 10
+
+        diameter = float(row["outside_diameter_mm"])
+        effective_length = float(row["effective_length_mm"])
+        value -= abs(diameter - target_diameter) * 18
+        value -= max(0.0, required_depth - effective_length) * 22
+        value -= max(0.0, effective_length - required_depth) * 0.3
+        value += min(float(row["feed_rate_mm_min"]), 3000.0) / 3000.0 * 25
+        return (value, -abs(diameter - target_diameter), -int(row["condition_id"]))
+
+    return max(rows, key=score)
+
+
+def estimate(
+    path: Path,
+    file_name: str,
+    material_type: str,
+    blank_allowance_mm: float,
+    machine_id: int,
+    use_manufacturer_conditions: bool = True,
+) -> dict[str, Any]:
+    analysis = parse_step_file(path, blank_allowance_mm)
+    bbox = analysis["bbox"]
+
+    with db() as conn:
+        ensure_catalog_tool_master(conn)
+        machine = conn.execute("SELECT * FROM machines WHERE machine_id = ?", (machine_id,)).fetchone()
+        if machine is None:
+            machine = conn.execute("SELECT * FROM machines ORDER BY machine_id LIMIT 1").fetchone()
+
+        features: list[Feature] = []
+
+        face_tool = pick_tool(conn, "FACE")
+        face_cond = condition_for(conn, face_tool["tool_id"], material_type, "平面")
+        top_area = bbox["x"] * bbox["y"]
+        face_pick = max(1.0, float(face_tool["diameter_mm"]) * 0.45)
+        top_sec = (top_area / (float(face_tool["diameter_mm"]) * face_pick)) / face_cond["feed_rate_mm_min"] * 60
+        features.append(
+            Feature(
+                "平面加工（上面）",
+                f'{bbox["x"]:.1f} x {bbox["y"]:.1f} mm / 面積 {top_area:.0f} mm2',
+                1,
+                face_tool["tool_id"],
+                face_tool["tool_name"],
+                "平面",
+                top_sec,
+                "バウンディングボックスから概算",
+            )
+        )
+
+        side_tool = pick_tool(conn, "EM", 16)
+        side_cond = condition_for(conn, side_tool["tool_id"], material_type, "ポケット")
+        side_catalog_cond = None
+        if use_manufacturer_conditions:
+            side_target_diameter = 6.0 if min(bbox["x"], bbox["y"]) >= 40 or bbox["z"] >= 12 else 3.0
+            side_catalog_cond = auto_manufacturer_condition_for(
+                conn,
+                material_type,
+                side_target_diameter,
+                bbox["z"],
+                "側面",
+            )
+        side_area = 2 * (bbox["x"] + bbox["y"]) * bbox["z"]
+        if side_catalog_cond is not None:
+            side_diameter = float(side_catalog_cond["outside_diameter_mm"])
+            side_pick = max(0.001, float(side_catalog_cond["radial_depth_mm"]))
+            side_feed = float(side_catalog_cond["feed_rate_mm_min"])
+            side_tool_name = (
+                f'{side_catalog_cond["manufacturer"]} {side_catalog_cond["series_code"]} '
+                f'φ{side_diameter:g} {side_catalog_cond["corner_radius_label"]}'
+            )
+            side_note = (
+                f'STP形状から自動選定: {side_catalog_cond["work_material"]} '
+                f'{side_catalog_cond["hardness"]}, {side_catalog_cond["model_family"]}, rpm {side_catalog_cond["spindle_rpm"]}, '
+                f'ap {side_catalog_cond["axial_depth_mm"]}, ae {side_catalog_cond["radial_depth_mm"]}, '
+                f'出典 p.{side_catalog_cond["source_page"]}'
+            )
+            side_tool_id = None
+        else:
+            side_diameter = float(side_tool["diameter_mm"])
+            side_pick = max(1.0, side_diameter * 0.35)
+            side_feed = float(side_cond["feed_rate_mm_min"])
+            side_tool_name = side_tool["tool_name"]
+            side_note = "外周側面として概算"
+            side_tool_id = side_tool["tool_id"]
+        side_sec = (side_area / (side_diameter * side_pick)) / side_feed * 60
+        features.append(
+            Feature(
+                "平面加工（側面）",
+                f'周長 {2 * (bbox["x"] + bbox["y"]):.1f} mm / 高さ {bbox["z"]:.1f} mm',
+                1,
+                side_tool_id,
+                side_tool_name,
+                "平面",
+                side_sec,
+                side_note,
+            )
+        )
+
+        radii = analysis["cylindrical_radii"]
+        grouped_holes: dict[float, int] = {}
+        for radius in radii:
+            diameter = round(radius * 2, 1)
+            grouped_holes[diameter] = grouped_holes.get(diameter, 0) + 1
+        if not grouped_holes and analysis["face_count"] > 25:
+            grouped_holes[6.0] = max(1, min(8, analysis["face_count"] // 18))
+
+        for diameter, count in sorted(grouped_holes.items()):
+            drill = pick_tool(conn, "DRILL", diameter)
+            cond = condition_for(conn, drill["tool_id"], material_type, "穴")
+            depth = min(float(drill["max_depth_mm"]), max(3.0, bbox["z"] * 0.75))
+            hole_sec = (depth * count) / cond["feed_rate_mm_min"] * 60
+            features.append(
+                Feature(
+                    "穴加工（ドリル）",
+                    f"φ{diameter:.1f} / 深さ {depth:.1f} mm",
+                    count,
+                    drill["tool_id"],
+                    drill["tool_name"],
+                    "穴",
+                    hole_sec,
+                    "円筒面から穴候補を抽出",
+                )
+            )
+
+        if analysis["face_count"] >= 18:
+            pocket_tool = pick_tool(conn, "EM", 10)
+            pocket_cond = condition_for(conn, pocket_tool["tool_id"], material_type, "ポケット")
+            pocket_catalog_cond = None
+            if use_manufacturer_conditions:
+                pocket_target_diameter = 6.0 if bbox["x"] * bbox["y"] >= 2500 else 3.0
+                pocket_catalog_cond = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    pocket_target_diameter,
+                    bbox["z"],
+                    "ポケット",
+                )
+            complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
+            volume = bbox["x"] * bbox["y"] * bbox["z"] * complexity
+            if pocket_catalog_cond is not None:
+                removal_rate = max(
+                    0.000001,
+                    float(pocket_catalog_cond["radial_depth_mm"]) * float(pocket_catalog_cond["axial_depth_mm"]),
+                )
+                pocket_feed = float(pocket_catalog_cond["feed_rate_mm_min"])
+                pocket_tool_name = (
+                    f'{pocket_catalog_cond["manufacturer"]} {pocket_catalog_cond["series_code"]} '
+                    f'φ{float(pocket_catalog_cond["outside_diameter_mm"]):g} '
+                    f'{pocket_catalog_cond["corner_radius_label"]}'
+                )
+                pocket_note = (
+                    f'STP形状から自動選定: {pocket_catalog_cond["work_material"]} '
+                    f'{pocket_catalog_cond["hardness"]}, {pocket_catalog_cond["model_family"]}, rpm {pocket_catalog_cond["spindle_rpm"]}, '
+                    f'ap {pocket_catalog_cond["axial_depth_mm"]}, ae {pocket_catalog_cond["radial_depth_mm"]}, '
+                    f'出典 p.{pocket_catalog_cond["source_page"]}'
+                )
+                pocket_tool_id = None
+            else:
+                removal_rate = max(1.0, pocket_cond["width_of_cut_mm"] * pocket_cond["depth_of_cut_mm"])
+                pocket_feed = float(pocket_cond["feed_rate_mm_min"])
+                pocket_tool_name = pocket_tool["tool_name"]
+                pocket_note = "面数からポケット相当の除去量を概算"
+                pocket_tool_id = pocket_tool["tool_id"]
+            pocket_sec = (volume / removal_rate) / pocket_feed * 60
+            features.append(
+                Feature(
+                    "ポケット加工",
+                    f"推定除去体積 {volume:.0f} mm3",
+                    1,
+                    pocket_tool_id,
+                    pocket_tool_name,
+                    "ポケット",
+                    pocket_sec,
+                    pocket_note,
+                )
+            )
+
+        machining_sec = sum(feature.machining_sec for feature in features)
+        unique_tools = {feature.tool_id if feature.tool_id is not None else feature.tool_name for feature in features}
+        tool_change_sec = len(unique_tools) * float(machine["atc_time_sec"])
+        setup_sec = float(machine["setup_time_min"]) * 60
+        travel_length = (bbox["x"] + bbox["y"] + bbox["z"]) * max(1, len(features))
+        rapid_sec = travel_length / max(1.0, float(machine["rapid_feed_mm_min"])) * 60
+        total_sec = setup_sec + machining_sec + tool_change_sec + rapid_sec
+
+        confidence = 0.7
+        if analysis["points_detected"] == 0:
+            confidence -= 0.15
+        if analysis["face_count"] > 120:
+            confidence -= 0.12
+        if len(features) <= 2:
+            confidence -= 0.08
+        confidence = max(0.35, min(0.82, confidence))
+
+        tool_usage: dict[str, dict[str, Any]] = {}
+        for feature in features:
+            item = tool_usage.setdefault(
+                feature.tool_name,
+                {"tool_name": feature.tool_name, "usage_count": 0, "machining_sec": 0.0},
+            )
+            item["usage_count"] += feature.quantity
+            item["machining_sec"] += feature.machining_sec
+
+        result = {
+            "file_name": file_name,
+            "material_type": material_type,
+            "machine": dict(machine),
+            "blank_allowance_mm": blank_allowance_mm,
+            "analysis": analysis,
+            "features": [asdict(feature) for feature in features],
+            "tool_usage": list(tool_usage.values()),
+            "breakdown": {
+                "setup_sec": setup_sec,
+                "machining_sec": machining_sec,
+                "tool_change_sec": tool_change_sec,
+                "rapid_sec": rapid_sec,
+                "total_sec": total_sec,
+            },
+            "confidence": confidence,
+            "condition_source": "STP形状からメーカー条件を自動選定" if use_manufacturer_conditions else "社内マスタ条件",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        cur = conn.execute(
+            """
+            INSERT INTO histories
+            (created_at, file_name, material_type, blank_allowance_mm, machine_name,
+             total_sec, confidence, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                result["created_at"],
+                file_name,
+                material_type,
+                blank_allowance_mm,
+                machine["machine_name"],
+                total_sec,
+                confidence,
+                json.dumps(result, ensure_ascii=False),
+            ),
+        )
+        result["history_id"] = cur.lastrowid
+        return result
+
+
+def seconds_label(seconds: float) -> str:
+    seconds = int(round(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, sec = divmod(rest, 60)
+    return f"{hours:02d}:{minutes:02d}:{sec:02d}"
+
+
+@app.template_filter("seconds_label")
+def seconds_label_filter(seconds: float) -> str:
+    return seconds_label(seconds)
+
+
+@app.get("/")
+def index() -> str:
+    return render_template("index.html")
+
+
+@app.get("/api/master")
+def api_master() -> Response:
+    with db() as conn:
+        ensure_catalog_tool_master(conn)
+        return jsonify(
+            {
+                "tools": rows_to_dicts(conn.execute("SELECT * FROM tools ORDER BY tool_id").fetchall()),
+                "conditions": rows_to_dicts(
+                    conn.execute(
+                        """
+                        SELECT c.*, t.tool_name, t.memo AS tool_memo
+                        FROM cutting_conditions c
+                        JOIN tools t ON t.tool_id = c.tool_id
+                        ORDER BY c.condition_id
+                        """
+                    ).fetchall()
+                ),
+                "machines": rows_to_dicts(conn.execute("SELECT * FROM machines ORDER BY machine_id").fetchall()),
+                "manufacturer_catalogs": rows_to_dicts(
+                    conn.execute(
+                        """
+                        SELECT *
+                        FROM manufacturer_catalogs
+                        ORDER BY manufacturer, tool_type, product_name
+                        """
+                    ).fetchall()
+                ),
+                "manufacturer_cutting_conditions": rows_to_dicts(
+                    conn.execute(
+                        """
+                        SELECT *
+                        FROM manufacturer_cutting_conditions
+                        ORDER BY series_code, outside_diameter_mm, corner_radius_label,
+                                 effective_length_mm, work_material
+                        """
+                    ).fetchall()
+                ),
+            }
+        )
+
+
+@app.post("/api/analyze")
+def api_analyze() -> Response:
+    upload = request.files.get("stp_file")
+    if upload is None or upload.filename == "":
+        return jsonify({"error": "STPファイルを選択してください。"}), 400
+    suffix = Path(upload.filename).suffix.lower()
+    if suffix not in {".stp", ".step"}:
+        return jsonify({"error": "拡張子 .stp または .step のファイルを指定してください。"}), 400
+
+    material_type = request.form.get("material_type", "鉄")
+    blank_allowance_mm = float(request.form.get("blank_allowance_mm", "5") or 5)
+    machine_id = int(request.form.get("machine_id", "1") or 1)
+    use_manufacturer_conditions = request.form.get("use_manufacturer_conditions", "on") == "on"
+
+    cleanup_old_uploads()
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
+    path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{safe_name}"
+    upload.save(path)
+    try:
+        result = estimate(
+            path,
+            upload.filename,
+            material_type,
+            blank_allowance_mm,
+            machine_id,
+            use_manufacturer_conditions=use_manufacturer_conditions,
+        )
+        result["time_label"] = seconds_label(result["breakdown"]["total_sec"])
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.get("/api/histories")
+def api_histories() -> Response:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT history_id, created_at, file_name, material_type, blank_allowance_mm,
+                   machine_name, total_sec, confidence
+            FROM histories
+            ORDER BY history_id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+    payload = rows_to_dicts(rows)
+    for row in payload:
+        row["time_label"] = seconds_label(row["total_sec"])
+    return jsonify(payload)
+
+
+@app.get("/api/histories/<int:history_id>")
+def api_history(history_id: int) -> Response:
+    with db() as conn:
+        row = conn.execute("SELECT payload_json FROM histories WHERE history_id = ?", (history_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": "履歴が見つかりません。"}), 404
+    payload = json.loads(row["payload_json"])
+    payload["history_id"] = history_id
+    payload["time_label"] = seconds_label(payload["breakdown"]["total_sec"])
+    return jsonify(payload)
+
+
+@app.get("/api/histories/<int:history_id>/csv")
+def api_history_csv(history_id: int) -> Response:
+    with db() as conn:
+        row = conn.execute("SELECT payload_json FROM histories WHERE history_id = ?", (history_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": "履歴が見つかりません。"}), 404
+    payload = json.loads(row["payload_json"])
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(["ファイル名", payload["file_name"]])
+    writer.writerow(["材質", payload["material_type"]])
+    writer.writerow(["機械", payload["machine"]["machine_name"]])
+    writer.writerow(["合計時間", seconds_label(payload["breakdown"]["total_sec"])])
+    writer.writerow([])
+    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "加工時間秒", "備考"])
+    for feature in payload["features"]:
+        writer.writerow(
+            [
+                feature["feature_type"],
+                feature["dimensions"],
+                feature["quantity"],
+                feature["tool_name"],
+                feature["process_type"],
+                round(feature["machining_sec"], 2),
+                feature["note"],
+            ]
+        )
+    csv_bytes = out.getvalue().encode("utf-8-sig")
+    filename = f"stp_estimate_{history_id}.csv"
+    return Response(
+        csv_bytes,
+        mimetype="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/tools")
+def api_create_tool() -> Response:
+    data = request.get_json(force=True)
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tools
+            (tool_name, tool_type, diameter_mm, flute_count, max_depth_mm, material, roughing, finishing, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["tool_name"],
+                data["tool_type"],
+                float(data["diameter_mm"]),
+                int(data["flute_count"]),
+                float(data["max_depth_mm"]),
+                data.get("material", ""),
+                1 if data.get("roughing", True) else 0,
+                1 if data.get("finishing", True) else 0,
+                data.get("memo", ""),
+            ),
+        )
+    return jsonify({"tool_id": cur.lastrowid})
+
+
+@app.delete("/api/tools/<int:tool_id>")
+def api_delete_tool(tool_id: int) -> Response:
+    with db() as conn:
+        conn.execute("DELETE FROM cutting_conditions WHERE tool_id = ?", (tool_id,))
+        conn.execute("DELETE FROM tools WHERE tool_id = ?", (tool_id,))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/conditions")
+def api_create_condition() -> Response:
+    data = request.get_json(force=True)
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO cutting_conditions
+            (tool_id, material_type, process_type, spindle_rpm, feed_rate_mm_min,
+             depth_of_cut_mm, width_of_cut_mm, tool_change_sec)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(data["tool_id"]),
+                data["material_type"],
+                data["process_type"],
+                int(data["spindle_rpm"]),
+                float(data["feed_rate_mm_min"]),
+                float(data["depth_of_cut_mm"]),
+                float(data["width_of_cut_mm"]),
+                int(data["tool_change_sec"]),
+            ),
+        )
+    return jsonify({"condition_id": cur.lastrowid})
+
+
+@app.delete("/api/conditions/<int:condition_id>")
+def api_delete_condition(condition_id: int) -> Response:
+    with db() as conn:
+        conn.execute("DELETE FROM cutting_conditions WHERE condition_id = ?", (condition_id,))
+    return jsonify({"ok": True})
+
+
+@app.post("/api/machines")
+def api_create_machine() -> Response:
+    data = request.get_json(force=True)
+    with db() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO machines
+            (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec,
+             max_spindle_rpm, setup_time_min, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["machine_name"],
+                int(data["axis_count"]),
+                float(data["rapid_feed_mm_min"]),
+                int(data["atc_time_sec"]),
+                int(data["max_spindle_rpm"]),
+                int(data["setup_time_min"]),
+                data.get("memo", ""),
+            ),
+        )
+    return jsonify({"machine_id": cur.lastrowid})
+
+
+@app.delete("/api/machines/<int:machine_id>")
+def api_delete_machine(machine_id: int) -> Response:
+    with db() as conn:
+        conn.execute("DELETE FROM machines WHERE machine_id = ?", (machine_id,))
+    return jsonify({"ok": True})
+
+
+init_db()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="127.0.0.1", port=port, debug=True)

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STP加工時間算出ツール</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">STP</span>
+        <div>
+          <h1>加工時間算出</h1>
+          <p>Phase 1 概算</p>
+        </div>
+      </div>
+      <nav class="tabs" aria-label="画面切替">
+        <button class="tab active" data-tab="analyze">解析</button>
+        <button class="tab" data-tab="catalogs">カタログ</button>
+        <button class="tab" data-tab="conditions">切削条件</button>
+        <button class="tab" data-tab="machines">機械</button>
+        <button class="tab" data-tab="history">履歴</button>
+      </nav>
+      <div class="scope-note">
+        STEPテキスト構造から形状特徴を抽出する概算版です。Python-OCC連携は次段階で差し替え可能な構成です。
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <section id="tab-analyze" class="view active">
+        <div class="view-header">
+          <div>
+            <p class="eyebrow">解析画面</p>
+            <h2>STPファイルから加工時間を概算</h2>
+          </div>
+          <div id="totalBadge" class="total-badge muted">未解析</div>
+        </div>
+
+        <form id="analyzeForm" class="analysis-grid">
+          <label class="drop-zone">
+            <input type="file" name="stp_file" accept=".stp,.step" required>
+            <span class="drop-icon">↓</span>
+            <strong>STP / STEP ファイル</strong>
+            <small id="fileName">ファイルを選択</small>
+          </label>
+
+          <div class="upload-side">
+            <div class="settings-panel">
+              <label>材質
+                <select name="material_type">
+                  <option>鉄</option>
+                  <option>アルミ</option>
+                  <option>SUS</option>
+                </select>
+              </label>
+              <label>ブランク代 mm
+                <input type="number" name="blank_allowance_mm" value="5" min="0" step="0.1">
+              </label>
+              <label>使用機械
+                <select id="machineSelect" name="machine_id"></select>
+              </label>
+              <button class="primary" type="submit">解析実行</button>
+            </div>
+
+            <section id="previewPanel" class="preview-panel">
+              <div class="preview-head">
+                <div>
+                  <h3>STPプレビュー</h3>
+                  <p id="previewStatus">ファイルをドロップすると概要を表示します</p>
+                </div>
+                <span id="previewBadge" class="preview-badge">待機中</span>
+              </div>
+              <div class="preview-body">
+                <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
+                <dl id="previewStats" class="preview-stats"></dl>
+              </div>
+            </section>
+          </div>
+        </form>
+
+        <div id="resultPanel" class="result-grid hidden">
+          <section class="panel metrics-panel">
+            <h3>時間内訳</h3>
+            <div class="metrics">
+              <div><span>段取り</span><strong id="setupSec">0</strong></div>
+              <div><span>加工</span><strong id="machiningSec">0</strong></div>
+              <div><span>工具交換</span><strong id="toolChangeSec">0</strong></div>
+              <div><span>早送り</span><strong id="rapidSec">0</strong></div>
+            </div>
+            <div class="confidence">
+              <span>信頼度</span>
+              <meter id="confidenceMeter" min="0" max="1" value="0"></meter>
+              <strong id="confidenceLabel">0%</strong>
+            </div>
+            <a id="csvLink" class="secondary-link" href="#">CSV出力</a>
+          </section>
+
+          <section class="panel">
+            <h3>認識フィーチャ</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>種別</th><th>寸法</th><th>数量</th><th>工具</th><th>時間</th></tr>
+                </thead>
+                <tbody id="featureRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h3>工具使用一覧</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>工具</th><th>使用回数</th><th>加工時間</th></tr>
+                </thead>
+                <tbody id="toolUsageRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <h3>解析情報</h3>
+            <dl id="analysisInfo" class="info-list"></dl>
+          </section>
+        </div>
+      </section>
+
+      <section id="tab-conditions" class="view">
+        <div class="view-header">
+          <div>
+            <p class="eyebrow">計算に使用する条件</p>
+            <h2>切削条件</h2>
+          </div>
+          <div id="makerConditionCountBadge" class="total-badge muted">0件</div>
+        </div>
+        <div class="catalog-toolbar maker-condition-toolbar">
+          <input id="makerConditionSearch" type="search" placeholder="メーカー・シリーズ・型番・被削材で検索">
+          <select id="makerConditionMaterialFilter">
+            <option value="">全被削材</option>
+          </select>
+        </div>
+        <div class="panel">
+          <div class="table-wrap">
+            <table class="condition-table">
+              <thead>
+                <tr>
+                  <th>区分</th><th>メーカー/工具</th><th>シリーズ</th><th>型番系</th><th>外径</th><th>有効長</th>
+                  <th>被削材</th><th>rpm</th><th>送り</th><th>ap</th><th>ae</th><th>出典</th>
+                </tr>
+              </thead>
+              <tbody id="conditionRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-catalogs" class="view">
+        <div class="view-header">
+          <div>
+            <p class="eyebrow">公式カタログ参照</p>
+            <h2>メーカーカタログ</h2>
+          </div>
+          <div id="catalogCountBadge" class="total-badge muted">0件</div>
+        </div>
+        <div class="catalog-toolbar">
+          <input id="catalogSearch" type="search" placeholder="シリーズ名・用途・型番で検索">
+          <select id="catalogTypeFilter">
+            <option value="">全種別</option>
+          </select>
+        </div>
+        <div class="panel">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>ID</th><th>メーカー</th><th>製品/シリーズ</th><th>種別</th><th>刃数</th><th>コート</th><th>用途目安</th><th>型番</th><th>資料</th></tr>
+              </thead>
+              <tbody id="catalogRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-machines" class="view">
+        <div class="view-header"><h2>機械マスタ管理</h2></div>
+        <form id="machineForm" class="inline-form">
+          <input name="machine_name" placeholder="機械名" required>
+          <input name="axis_count" type="number" placeholder="軸数" value="3" required>
+          <input name="rapid_feed_mm_min" type="number" placeholder="早送り" required>
+          <input name="atc_time_sec" type="number" placeholder="ATC秒" required>
+          <input name="max_spindle_rpm" type="number" placeholder="最大rpm" required>
+          <input name="setup_time_min" type="number" placeholder="段取り分" required>
+          <button type="submit" class="primary compact">追加</button>
+        </form>
+        <div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>機械</th><th>軸</th><th>早送り</th><th>ATC</th><th>最大rpm</th><th>段取り</th><th></th></tr></thead><tbody id="machineRows"></tbody></table></div></div>
+      </section>
+
+      <section id="tab-history" class="view">
+        <div class="view-header"><h2>履歴画面</h2></div>
+        <div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>日時</th><th>ファイル</th><th>材質</th><th>機械</th><th>合計</th><th>信頼度</th><th></th></tr></thead><tbody id="historyRows"></tbody></table></div></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
