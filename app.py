@@ -783,6 +783,14 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
     try:
         shape = cq.importers.importStep(str(path)).val()
         bbox = shape.BoundingBox()
+        bounds = {
+            "xmin": float(bbox.xmin),
+            "xmax": float(bbox.xmax),
+            "ymin": float(bbox.ymin),
+            "ymax": float(bbox.ymax),
+            "zmin": float(bbox.zmin),
+            "zmax": float(bbox.zmax),
+        }
         raw_x = float(bbox.xlen)
         raw_y = float(bbox.ylen)
         raw_z = float(bbox.zlen)
@@ -794,12 +802,13 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
 
         faces = shape.Faces()
         cylindrical_faces: list[dict[str, Any]] = []
-        hole_groups: dict[tuple[float, str], dict[str, Any]] = {}
+        face_type_counts: dict[str, int] = {}
         for face in faces:
             try:
                 geom_type = face.geomType()
             except Exception:
                 continue
+            face_type_counts[geom_type] = face_type_counts.get(geom_type, 0) + 1
             if geom_type != "CYLINDER":
                 continue
             try:
@@ -825,40 +834,13 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
                 }
             )
 
-            if not (1.5 <= radius <= 20.0 and estimated_depth >= 1.0):
-                continue
-            axis_label = max(
-                (("X", abs(axis[0])), ("Y", abs(axis[1])), ("Z", abs(axis[2]))),
-                key=lambda item: item[1],
-            )[0]
-            diameter = round(radius * 2, 1)
-            key = (diameter, axis_label)
-            group = hole_groups.setdefault(
-                key,
-                {
-                    "diameter": diameter,
-                    "axis": axis_label,
-                    "count": 0,
-                    "total_depth": 0.0,
-                    "max_depth": 0.0,
-                },
-            )
-            group["count"] += 1
-            group["total_depth"] += estimated_depth
-            group["max_depth"] = max(group["max_depth"], estimated_depth)
-
-        normalized_hole_groups = []
-        for group in hole_groups.values():
-            count = max(1, int(group["count"]))
-            normalized_hole_groups.append(
-                {
-                    "diameter": group["diameter"],
-                    "axis": group["axis"],
-                    "count": count,
-                    "avg_depth": group["total_depth"] / count,
-                    "max_depth": group["max_depth"],
-                }
-            )
+        machining_features = classify_brep_machining_features(
+            cylindrical_faces,
+            bounds,
+            {"x": raw_x, "y": raw_y, "z": raw_z},
+            max(0.0, stock_volume - part_volume),
+            face_type_counts,
+        )
 
         return {
             "parser": "OpenCascade B-Rep解析 + STEPテキスト補助",
@@ -866,21 +848,236 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             "solid_count": len(shape.Solids()),
             "edge_count": len(shape.Edges()),
             "face_count": len(faces),
-            "plane_count": sum(1 for face in faces if face.geomType() == "PLANE"),
+            "plane_count": face_type_counts.get("PLANE", 0),
+            "face_type_counts": face_type_counts,
             "bbox": {"x": stock_x, "y": stock_y, "z": stock_z},
             "raw_bbox": {"x": raw_x, "y": raw_y, "z": raw_z},
+            "raw_bounds": bounds,
             "part_volume_mm3": part_volume,
             "stock_volume_mm3": stock_volume,
             "removal_volume_mm3": max(0.0, stock_volume - part_volume),
             "cylindrical_radii": [item["radius"] for item in cylindrical_faces if 1.0 <= item["radius"] <= 20.0],
             "cylindrical_faces": cylindrical_faces[:300],
-            "hole_groups": sorted(normalized_hole_groups, key=lambda item: (item["axis"], item["diameter"])),
+            "hole_groups": machining_features["holes"],
+            "machining_features": machining_features,
         }
     except Exception as exc:
         return {
             "brep_available": False,
             "brep_error": str(exc),
         }
+
+
+def axis_label(axis: tuple[float, float, float] | list[float]) -> str:
+    return max((("X", abs(axis[0])), ("Y", abs(axis[1])), ("Z", abs(axis[2]))), key=lambda item: item[1])[0]
+
+
+def group_feature_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = tuple(row[item] for item in keys)
+        item = grouped.setdefault(
+            key,
+            {
+                **{field: row[field] for field in keys},
+                "count": 0,
+                "total_depth": 0.0,
+                "max_depth": 0.0,
+                "total_volume": 0.0,
+                "_metric_totals": {},
+            },
+        )
+        count = int(row.get("count", 1))
+        item["count"] += count
+        depth = float(row.get("depth", row.get("avg_depth", 0.0)))
+        item["total_depth"] += depth * count
+        item["max_depth"] = max(item["max_depth"], depth)
+        item["total_volume"] += float(row.get("volume", 0.0))
+        metric_totals = item["_metric_totals"]
+        for field, value in row.items():
+            if field in keys or field in {"count", "volume", "depth", "avg_depth"}:
+                continue
+            if isinstance(value, (int, float)):
+                metric_totals[field] = metric_totals.get(field, 0.0) + float(value) * count
+    result = []
+    for item in grouped.values():
+        count = max(1, int(item["count"]))
+        item["avg_depth"] = item["total_depth"] / count
+        metric_totals = item.pop("_metric_totals", {})
+        for field, total in metric_totals.items():
+            item[field] = total / count
+        result.append(item)
+    return sorted(result, key=lambda item: tuple(item[field] for field in keys))
+
+
+def classify_brep_machining_features(
+    cylindrical_faces: list[dict[str, Any]],
+    bounds: dict[str, float],
+    raw_bbox: dict[str, float],
+    removal_volume: float,
+    face_type_counts: dict[str, int],
+) -> dict[str, Any]:
+    vertical: list[dict[str, Any]] = []
+    side: list[dict[str, Any]] = []
+    consumed: set[int] = set()
+
+    for index, item in enumerate(cylindrical_faces):
+        diameter = round(float(item["diameter"]), 1)
+        depth = float(item["estimated_depth"])
+        if not (1.5 <= float(item["radius"]) <= 20.0 and depth >= 1.0):
+            continue
+        center = item["center"]
+        label = axis_label(item["axis"])
+        row = {**item, "index": index, "axis_label": label, "diameter": diameter, "depth": depth}
+        if label == "Z":
+            near_x = min(abs(center[0] - bounds["xmin"]), abs(center[0] - bounds["xmax"])) <= max(diameter, 5.0)
+            near_y = min(abs(center[1] - bounds["ymin"]), abs(center[1] - bounds["ymax"])) <= max(diameter, 5.0)
+            if near_x and near_y:
+                continue
+            if depth < 3.0:
+                continue
+            vertical.append(row)
+        else:
+            if diameter >= 3.0 and depth >= min(raw_bbox["x"], raw_bbox["y"]) * 0.18:
+                side.append(row)
+
+    by_center: dict[tuple[float, float], list[dict[str, Any]]] = {}
+    for row in vertical:
+        center_key = (round(float(row["center"][0]), 1), round(float(row["center"][1]), 1))
+        by_center.setdefault(center_key, []).append(row)
+
+    counterbores = []
+    for center_key, rows in by_center.items():
+        if len(rows) < 2:
+            continue
+        rows = sorted(rows, key=lambda row: float(row["diameter"]))
+        small = rows[0]
+        large = rows[-1]
+        if large["diameter"] <= small["diameter"] * 1.35:
+            continue
+        if large["depth"] > small["depth"] * 0.7:
+            continue
+        consumed.add(int(small["index"]))
+        consumed.add(int(large["index"]))
+        volume = (
+            math.pi * (small["diameter"] / 2) ** 2 * small["depth"]
+            + math.pi * (large["diameter"] / 2) ** 2 * large["depth"]
+        )
+        counterbores.append(
+            {
+                "through_diameter": small["diameter"],
+                "counterbore_diameter": large["diameter"],
+                "through_depth": small["depth"],
+                "counterbore_depth": large["depth"],
+                "count": 1,
+                "volume": volume,
+            }
+        )
+
+    slots = []
+    remaining_vertical = [row for row in vertical if int(row["index"]) not in consumed]
+    for diameter in sorted({row["diameter"] for row in remaining_vertical}):
+        rows = [row for row in remaining_vertical if row["diameter"] == diameter and row["depth"] <= raw_bbox["z"] * 0.32]
+        used: set[int] = set()
+        for i, row in enumerate(rows):
+            if int(row["index"]) in used:
+                continue
+            cx, cy, _ = row["center"]
+            pair_index = None
+            pair_distance = 0.0
+            for j, other in enumerate(rows):
+                if i == j or int(other["index"]) in used:
+                    continue
+                ox, oy, _ = other["center"]
+                same_x = abs(cx - ox) <= diameter * 0.45 and abs(cy - oy) >= diameter * 2.0
+                same_y = abs(cy - oy) <= diameter * 0.45 and abs(cx - ox) >= diameter * 2.0
+                if same_x or same_y:
+                    distance = math.hypot(cx - ox, cy - oy)
+                    if distance > pair_distance:
+                        pair_distance = distance
+                        pair_index = j
+            if pair_index is None:
+                continue
+            other = rows[pair_index]
+            used.add(int(row["index"]))
+            used.add(int(other["index"]))
+            consumed.add(int(row["index"]))
+            consumed.add(int(other["index"]))
+            depth = (row["depth"] + other["depth"]) / 2
+            length = pair_distance + diameter
+            area = max(0.0, (length - diameter) * diameter + math.pi * (diameter / 2) ** 2)
+            slots.append(
+                {
+                    "width": diameter,
+                    "length": round(length, 1),
+                    "depth": depth,
+                    "count": 1,
+                    "volume": area * depth,
+                }
+            )
+
+    holes = []
+    for row in remaining_vertical:
+        if int(row["index"]) in consumed:
+            continue
+        volume = math.pi * (row["diameter"] / 2) ** 2 * row["depth"]
+        holes.append(
+            {
+                "diameter": row["diameter"],
+                "axis": "Z",
+                "depth": row["depth"],
+                "count": 1,
+                "volume": volume,
+            }
+        )
+
+    side_holes_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in side:
+        center = row["center"]
+        if row["axis_label"] == "Y":
+            location_key = (round(center[0] / max(row["diameter"], 1.0)), round(center[2] / max(row["diameter"], 1.0)))
+        elif row["axis_label"] == "X":
+            location_key = (round(center[1] / max(row["diameter"], 1.0)), round(center[2] / max(row["diameter"], 1.0)))
+        else:
+            location_key = (round(center[0] / max(row["diameter"], 1.0)), round(center[1] / max(row["diameter"], 1.0)))
+        key = (row["axis_label"], row["diameter"], *location_key)
+        item = side_holes_by_key.setdefault(
+            key,
+            {
+                "diameter": row["diameter"],
+                "axis": row["axis_label"],
+                "depth": 0.0,
+                "count": 1,
+                "volume": 0.0,
+            },
+        )
+        item["depth"] = max(float(item["depth"]), float(row["depth"]))
+        item["volume"] = math.pi * (row["diameter"] / 2) ** 2 * float(item["depth"])
+    side_holes = list(side_holes_by_key.values())
+
+    hole_groups = group_feature_rows(holes, ("diameter", "axis"))
+    side_hole_groups = group_feature_rows(side_holes, ("diameter", "axis"))
+    counterbore_groups = group_feature_rows(counterbores, ("through_diameter", "counterbore_diameter"))
+    slot_groups = group_feature_rows(slots, ("width", "length"))
+    classified_volume = sum(
+        item.get("total_volume", 0.0)
+        for group in (hole_groups, side_hole_groups, counterbore_groups, slot_groups)
+        for item in group
+    )
+    roughing_volume = max(0.0, removal_volume - classified_volume)
+    finishing_area = max(0.0, 2 * (raw_bbox["x"] + raw_bbox["y"]) * raw_bbox["z"])
+
+    return {
+        "holes": hole_groups,
+        "side_holes": side_hole_groups,
+        "counterbores": counterbore_groups,
+        "slots": slot_groups,
+        "roughing_volume_mm3": roughing_volume,
+        "classified_feature_volume_mm3": classified_volume,
+        "finishing_side_area_mm2": finishing_area,
+        "fillet_face_count": face_type_counts.get("TORUS", 0),
+        "chamfer_face_count": face_type_counts.get("CONE", 0),
+    }
 
 
 def pick_tool(conn: sqlite3.Connection, tool_type: str, target_diameter: float | None = None) -> sqlite3.Row:
@@ -915,10 +1112,36 @@ def condition_for(conn: sqlite3.Connection, tool_id: int, material_type: str, pr
     ).fetchone()
     if row:
         return row
-    return conn.execute(
+    row = conn.execute(
         "SELECT * FROM cutting_conditions WHERE tool_id = ? ORDER BY condition_id LIMIT 1",
         (tool_id,),
     ).fetchone()
+    if row:
+        return row
+    row = conn.execute(
+        """
+        SELECT * FROM cutting_conditions
+        WHERE material_type = ? AND process_type = ?
+        ORDER BY condition_id LIMIT 1
+        """,
+        (material_type, process_hint),
+    ).fetchone()
+    if row:
+        return row
+    row = conn.execute(
+        """
+        SELECT * FROM cutting_conditions
+        WHERE material_type = ?
+        ORDER BY condition_id LIMIT 1
+        """,
+        (material_type,),
+    ).fetchone()
+    if row:
+        return row
+    row = conn.execute("SELECT * FROM cutting_conditions ORDER BY condition_id LIMIT 1").fetchone()
+    if row:
+        return row
+    raise RuntimeError("切削条件マスタが未登録です")
 
 
 def manufacturer_condition_for(
@@ -1114,8 +1337,12 @@ def estimate(
             )
         )
 
-        hole_groups = analysis.get("hole_groups") or []
-        if not hole_groups:
+        machining_features = analysis.get("machining_features") or {}
+        if "holes" in machining_features:
+            hole_groups = machining_features.get("holes") or []
+        else:
+            hole_groups = analysis.get("hole_groups") or []
+        if not hole_groups and not machining_features:
             radii = analysis["cylindrical_radii"]
             grouped_holes: dict[float, int] = {}
             for radius in radii:
@@ -1153,6 +1380,108 @@ def estimate(
                 )
             )
 
+        for group in machining_features.get("side_holes") or []:
+            diameter = float(group["diameter"])
+            count = int(group["count"])
+            drill = pick_tool(conn, "DRILL", diameter)
+            cond = condition_for(conn, drill["tool_id"], material_type, "穴")
+            depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["x"] * 0.5))))
+            side_hole_sec = (depth * count) / cond["feed_rate_mm_min"] * 60
+            features.append(
+                Feature(
+                    "横穴加工（ドリル）",
+                    f"φ{diameter:.1f} / 深さ {depth:.1f} mm / 軸 {group.get('axis', '-')}",
+                    count,
+                    drill["tool_id"],
+                    drill["tool_name"],
+                    "穴",
+                    side_hole_sec,
+                    "B-Rep円筒面から側面穴候補を抽出",
+                )
+            )
+
+        for group in machining_features.get("counterbores") or []:
+            through_diameter = float(group["through_diameter"])
+            counterbore_diameter = float(group["counterbore_diameter"])
+            count = int(group["count"])
+            drill = pick_tool(conn, "DRILL", through_diameter)
+            counterbore_tool = pick_tool(conn, "EM", counterbore_diameter)
+            drill_cond = condition_for(conn, drill["tool_id"], material_type, "穴")
+            counterbore_cond = condition_for(conn, counterbore_tool["tool_id"], material_type, "ポケット")
+            through_depth = min(
+                float(drill["max_depth_mm"]),
+                max(3.0, float(group.get("through_depth", group.get("avg_depth", bbox["z"] * 0.75)))),
+            )
+            counterbore_depth = max(0.5, float(group.get("counterbore_depth", group.get("avg_depth", 2.0))))
+            drill_sec = (through_depth * count) / drill_cond["feed_rate_mm_min"] * 60
+            counterbore_volume = math.pi * (counterbore_diameter / 2) ** 2 * counterbore_depth * count
+            counterbore_rate = max(1.0, counterbore_cond["width_of_cut_mm"] * counterbore_cond["depth_of_cut_mm"])
+            counterbore_sec = (counterbore_volume / counterbore_rate) / counterbore_cond["feed_rate_mm_min"] * 60
+            features.append(
+                Feature(
+                    "座ぐり穴加工",
+                    (
+                        f"下穴 φ{through_diameter:.1f} x {through_depth:.1f} mm / "
+                        f"座ぐり φ{counterbore_diameter:.1f} x {counterbore_depth:.1f} mm"
+                    ),
+                    count,
+                    None,
+                    f'{drill["tool_name"]} + {counterbore_tool["tool_name"]}',
+                    "穴",
+                    drill_sec + counterbore_sec,
+                    "B-Rep円筒面の同芯径違いから座ぐり候補を抽出",
+                )
+            )
+
+        for group in machining_features.get("slots") or []:
+            width = float(group["width"])
+            length = float(group["length"])
+            count = int(group["count"])
+            depth = max(0.5, float(group.get("avg_depth", bbox["z"] * 0.25)))
+            slot_tool = pick_tool(conn, "EM", width)
+            slot_cond = condition_for(conn, slot_tool["tool_id"], material_type, "ポケット")
+            slot_catalog_cond = None
+            if use_manufacturer_conditions:
+                slot_catalog_cond = auto_manufacturer_condition_for(conn, material_type, width, depth, "ポケット")
+            volume = float(group.get("total_volume", max(0.0, length * width * depth * count)))
+            if slot_catalog_cond is not None:
+                slot_rate = max(
+                    0.000001,
+                    float(slot_catalog_cond["radial_depth_mm"]) * float(slot_catalog_cond["axial_depth_mm"]),
+                )
+                slot_feed = float(slot_catalog_cond["feed_rate_mm_min"])
+                slot_tool_name = (
+                    f'{slot_catalog_cond["manufacturer"]} {slot_catalog_cond["series_code"]} '
+                    f'φ{float(slot_catalog_cond["outside_diameter_mm"]):g} '
+                    f'{slot_catalog_cond["corner_radius_label"]}'
+                )
+                slot_tool_id = None
+                slot_note = (
+                    f'B-Repスロット候補から自動選定: {slot_catalog_cond["work_material"]} '
+                    f'{slot_catalog_cond["hardness"]}, rpm {slot_catalog_cond["spindle_rpm"]}, '
+                    f'ap {slot_catalog_cond["axial_depth_mm"]}, ae {slot_catalog_cond["radial_depth_mm"]}, '
+                    f'出典 p.{slot_catalog_cond["source_page"]}'
+                )
+            else:
+                slot_rate = max(1.0, slot_cond["width_of_cut_mm"] * slot_cond["depth_of_cut_mm"])
+                slot_feed = float(slot_cond["feed_rate_mm_min"])
+                slot_tool_name = slot_tool["tool_name"]
+                slot_tool_id = slot_tool["tool_id"]
+                slot_note = "B-Rep円筒端部ペアからスロット候補を抽出"
+            slot_sec = (volume / slot_rate) / slot_feed * 60
+            features.append(
+                Feature(
+                    "溝加工（スロット）",
+                    f"幅 {width:.1f} / 長さ {length:.1f} / 深さ {depth:.1f} mm",
+                    count,
+                    slot_tool_id,
+                    slot_tool_name,
+                    "ポケット",
+                    slot_sec,
+                    slot_note,
+                )
+            )
+
         if analysis["face_count"] >= 18:
             pocket_tool = pick_tool(conn, "EM", 10)
             pocket_cond = condition_for(conn, pocket_tool["tool_id"], material_type, "ポケット")
@@ -1166,7 +1495,9 @@ def estimate(
                     bbox["z"],
                     "ポケット",
                 )
-            if analysis.get("removal_volume_mm3") is not None:
+            if machining_features.get("roughing_volume_mm3") is not None:
+                volume = max(0.0, float(machining_features["roughing_volume_mm3"]))
+            elif analysis.get("removal_volume_mm3") is not None:
                 volume = max(0.0, float(analysis["removal_volume_mm3"]))
             else:
                 complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
@@ -1198,7 +1529,7 @@ def estimate(
             pocket_sec = (volume / removal_rate) / pocket_feed * 60
             features.append(
                 Feature(
-                    "ポケット加工",
+                    "荒取り・ポケット加工",
                     f"推定除去体積 {volume:.0f} mm3",
                     1,
                     pocket_tool_id,

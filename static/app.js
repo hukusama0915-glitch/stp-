@@ -17,6 +17,23 @@ function secLabel(value) {
   return `${h}:${m}:${s}`;
 }
 
+function machiningFeatureSummary(features) {
+  if (!features) return "-";
+  const parts = [];
+  const addCount = (label, rows) => {
+    const count = (rows || []).reduce((total, row) => total + Number(row.count || 0), 0);
+    if (count > 0) parts.push(`${label} ${count}`);
+  };
+  addCount("穴", features.holes);
+  addCount("横穴", features.side_holes);
+  addCount("座ぐり", features.counterbores);
+  addCount("スロット", features.slots);
+  if (Number.isFinite(features.roughing_volume_mm3)) {
+    parts.push(`荒取り ${Math.round(features.roughing_volume_mm3).toLocaleString()} mm3`);
+  }
+  return parts.length ? parts.join(" / ") : "-";
+}
+
 function toast(message) {
   const box = $("#toast");
   box.textContent = message;
@@ -861,6 +878,7 @@ function renderResult(result) {
     <dt>実形状寸法</dt><dd>${rawBbox}</dd>
     <dt>部品体積</dt><dd>${Math.round(result.analysis.part_volume_mm3).toLocaleString()} mm3</dd>
     <dt>推定除去体積</dt><dd>${Math.round(result.analysis.removal_volume_mm3).toLocaleString()} mm3</dd>
+    <dt>加工特徴</dt><dd>${machiningFeatureSummary(result.analysis.machining_features)}</dd>
     <dt>ソリッド/エッジ</dt><dd>${result.analysis.solid_count} / ${result.analysis.edge_count}</dd>
   ` : "";
   $("#analysisInfo").innerHTML = `
