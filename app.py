@@ -21,6 +21,7 @@ DB_PATH = BASE_DIR / "stp_time_tool.sqlite3"
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
+APP_VERSION = "2026-05-23-master-repair-no-face-mill"
 
 
 app = Flask(__name__)
@@ -1952,6 +1953,22 @@ def seconds_label_filter(seconds: float) -> str:
 @app.get("/")
 def index() -> str:
     return render_template("index.html")
+
+
+@app.get("/api/health")
+def api_health() -> Response:
+    with db() as conn:
+        face_mill_count = conn.execute(
+            "SELECT COUNT(*) FROM tools WHERE tool_name = ? AND tool_type = ?",
+            ("φ50 フェイスミル", "FACE"),
+        ).fetchone()[0]
+        return jsonify(
+            {
+                "ok": True,
+                "version": APP_VERSION,
+                "deprecated_face_mill_count": face_mill_count,
+            }
+        )
 
 
 @app.get("/api/master")
