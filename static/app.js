@@ -864,6 +864,7 @@ function renderResult(result) {
       <td>${f.feature_type}</td><td>${f.dimensions}<br><small>${f.note}</small></td>
       <td>${f.quantity}</td><td>${f.tool_name}</td>
       <td class="condition-cell">${f.cutting_condition || "-"}</td>
+      <td class="path-cell">${f.path_plan || "-"}</td>
       <td>${secLabel(f.machining_sec)}</td>
     </tr>
   `).join("");

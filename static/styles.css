@@ -508,7 +508,7 @@ meter {
 table {
   width: 100%;
   border-collapse: collapse;
-  min-width: 780px;
+  min-width: 940px;
 }
 
 th,
@@ -533,6 +533,13 @@ td {
 .condition-cell {
   min-width: 190px;
   color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.45;
+}
+
+.path-cell {
+  min-width: 190px;
+  color: var(--sub);
   font-variant-numeric: tabular-nums;
   line-height: 1.45;
 }
