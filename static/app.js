@@ -3,6 +3,7 @@ const state = {
   lastResult: null,
   preview: null,
   previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0 },
+  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -159,6 +160,25 @@ function project3d(point, model, scale, origin) {
   };
 }
 
+function setPreviewMode(mode) {
+  state.cadPreview.mode = mode;
+  const fallbackCanvas = $("#stpPreviewCanvas");
+  const cadCanvas = $("#cadPreviewCanvas");
+  if (!fallbackCanvas || !cadCanvas) return;
+  fallbackCanvas.classList.toggle("hidden", mode === "cad");
+  cadCanvas.classList.toggle("hidden", mode !== "cad");
+}
+
+function renderCurrentPreview() {
+  if (state.cadPreview.mode === "cad" && state.cadPreview.renderer) {
+    renderCadScene();
+  } else if (state.preview) {
+    drawStepPreview(state.preview);
+  } else {
+    drawPreviewPlaceholder();
+  }
+}
+
 function drawProjectedEllipse(ctx, center, radiusMm, model, scale, origin, options = {}) {
   const c = project3d(center, model, scale, origin);
   const xAxis = project3d([center[0] + radiusMm, center[1], center[2]], model, scale, origin);
@@ -178,7 +198,126 @@ function drawProjectedEllipse(ctx, center, radiusMm, model, scale, origin, optio
   return c;
 }
 
+function initCadPreview() {
+  if (!window.THREE) throw new Error("Three.jsを読み込めませんでした。");
+  const canvas = $("#cadPreviewCanvas");
+  const THREE = window.THREE;
+
+  if (!state.cadPreview.renderer) {
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000000);
+    camera.up.set(0, 0, 1);
+
+    scene.add(new THREE.HemisphereLight(0xf7f3e7, 0x53655d, 1.55));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.7);
+    keyLight.position.set(1.6, -2.4, 2.8);
+    scene.add(keyLight);
+    const rimLight = new THREE.DirectionalLight(0xd9eee8, 0.9);
+    rimLight.position.set(-2.8, 2.2, 1.6);
+    scene.add(rimLight);
+
+    state.cadPreview.renderer = renderer;
+    state.cadPreview.scene = scene;
+    state.cadPreview.camera = camera;
+  }
+
+  if (state.cadPreview.group) {
+    state.cadPreview.scene.remove(state.cadPreview.group);
+  }
+}
+
+function buildCadMesh(geometryMesh) {
+  const THREE = window.THREE;
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(geometryMesh.attributes.position.array, 3));
+  if (geometryMesh.attributes.normal) {
+    geometry.setAttribute("normal", new THREE.Float32BufferAttribute(geometryMesh.attributes.normal.array, 3));
+  } else {
+    geometry.computeVertexNormals();
+  }
+  if (geometryMesh.index?.array) {
+    geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(geometryMesh.index.array), 1));
+  }
+
+  const color = geometryMesh.color || [0.78, 0.82, 0.78];
+  const material = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(color[0], color[1], color[2]),
+    metalness: 0.18,
+    roughness: 0.48,
+    side: THREE.DoubleSide,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(geometry, 28),
+    new THREE.LineBasicMaterial({ color: 0x26352e, transparent: true, opacity: 0.42 }),
+  );
+  return { mesh, edges };
+}
+
+async function loadDetailedCadPreview(buffer) {
+  if (!window.occtimportjs) throw new Error("OpenCascade WASMを読み込めませんでした。");
+  initCadPreview();
+
+  if (!state.cadPreview.occt) {
+    state.cadPreview.occt = await window.occtimportjs();
+  }
+
+  const result = state.cadPreview.occt.ReadStepFile(new Uint8Array(buffer), {
+    linearUnit: "millimeter",
+    linearDeflectionType: "bounding_box_ratio",
+    linearDeflection: 0.0008,
+    angularDeflection: 0.35,
+  });
+  if (!result.success || !result.meshes?.length) {
+    throw new Error("OpenCascadeでSTEP形状をメッシュ化できませんでした。");
+  }
+
+  const THREE = window.THREE;
+  const group = new THREE.Group();
+  for (const geometryMesh of result.meshes) {
+    const { mesh, edges } = buildCadMesh(geometryMesh);
+    group.add(mesh);
+    group.add(edges);
+  }
+
+  const box = new THREE.Box3().setFromObject(group);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  group.position.sub(center);
+
+  state.cadPreview.group = group;
+  state.cadPreview.baseRadius = Math.max(size.x, size.y, size.z, 1);
+  state.cadPreview.scene.add(group);
+  setPreviewMode("cad");
+  renderCadScene();
+}
+
+function renderCadScene() {
+  const { renderer, scene, camera, group, baseRadius } = state.cadPreview;
+  if (!renderer || !scene || !camera || !group) return;
+  const canvas = $("#cadPreviewCanvas");
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  renderer.setSize(width, height, false);
+  camera.aspect = width / height;
+
+  const distance = (baseRadius * 1.85) / Math.max(state.previewView.zoom, 0.2);
+  camera.position.set(0, -distance, distance * 0.62);
+  camera.near = Math.max(0.01, distance / 1000);
+  camera.far = Math.max(1000, distance * 20);
+  camera.lookAt(0, 0, 0);
+  camera.updateProjectionMatrix();
+
+  group.rotation.set(state.previewView.pitch * 0.55, 0, state.previewView.yaw, "XYZ");
+  renderer.render(scene, camera);
+}
+
 function drawPreviewPlaceholder() {
+  setPreviewMode("fallback");
   const canvas = $("#stpPreviewCanvas");
   const ctx = canvas.getContext("2d");
   const rect = canvas.getBoundingClientRect();
@@ -201,6 +340,7 @@ function drawPreviewPlaceholder() {
 }
 
 function drawStepPreview(preview) {
+  setPreviewMode("fallback");
   const canvas = $("#stpPreviewCanvas");
   const ctx = canvas.getContext("2d");
   const rect = canvas.getBoundingClientRect();
@@ -426,8 +566,19 @@ async function previewFile(file) {
   $("#previewBadge").textContent = "読込中";
   $("#previewStatus").textContent = "ブラウザ内でSTEPテキストを読み込んでいます";
   const maxPreviewBytes = 16 * 1024 * 1024;
-  const text = await file.slice(0, maxPreviewBytes).text();
+  const buffer = await file.arrayBuffer();
+  const text = new TextDecoder("utf-8").decode(buffer.slice(0, maxPreviewBytes));
   renderStepPreview(parseStepPreview(text, file));
+  try {
+    $("#previewStatus").textContent = "OpenCascadeでSTEP形状を詳細メッシュ化しています";
+    await loadDetailedCadPreview(buffer);
+    $("#previewBadge").className = "preview-badge ready";
+    $("#previewBadge").textContent = "詳細表示";
+    $("#previewStatus").textContent = "OpenCascadeメッシュをWebGLで表示しています";
+  } catch (error) {
+    setPreviewMode("fallback");
+    $("#previewStatus").textContent = `簡易表示に切替: ${error.message}`;
+  }
 }
 
 function setTab(name) {
@@ -669,57 +820,55 @@ function bindEvents() {
   $$(".tab").forEach((button) => button.addEventListener("click", () => setTab(button.dataset.tab)));
 
   window.addEventListener("resize", () => {
-    if (state.preview) {
-      drawStepPreview(state.preview);
-    } else {
-      drawPreviewPlaceholder();
-    }
+    renderCurrentPreview();
   });
 
   const fileInput = $("input[name='stp_file']");
   const dropZone = $(".drop-zone");
-  const previewCanvas = $("#stpPreviewCanvas");
+  const previewCanvases = [$("#stpPreviewCanvas"), $("#cadPreviewCanvas")].filter(Boolean);
 
-  previewCanvas.addEventListener("pointerdown", (event) => {
-    if (!state.preview) return;
-    state.previewView.dragging = true;
-    state.previewView.lastX = event.clientX;
-    state.previewView.lastY = event.clientY;
-    previewCanvas.setPointerCapture(event.pointerId);
-  });
+  previewCanvases.forEach((previewCanvas) => {
+    previewCanvas.addEventListener("pointerdown", (event) => {
+      if (!state.preview) return;
+      state.previewView.dragging = true;
+      state.previewView.lastX = event.clientX;
+      state.previewView.lastY = event.clientY;
+      previewCanvas.setPointerCapture(event.pointerId);
+    });
 
-  previewCanvas.addEventListener("pointermove", (event) => {
-    if (!state.previewView.dragging || !state.preview) return;
-    const dx = event.clientX - state.previewView.lastX;
-    const dy = event.clientY - state.previewView.lastY;
-    state.previewView.lastX = event.clientX;
-    state.previewView.lastY = event.clientY;
-    state.previewView.yaw += dx * 0.01;
-    state.previewView.pitch = Math.max(-1.35, Math.min(1.15, state.previewView.pitch + dy * 0.01));
-    drawStepPreview(state.preview);
-  });
+    previewCanvas.addEventListener("pointermove", (event) => {
+      if (!state.previewView.dragging || !state.preview) return;
+      const dx = event.clientX - state.previewView.lastX;
+      const dy = event.clientY - state.previewView.lastY;
+      state.previewView.lastX = event.clientX;
+      state.previewView.lastY = event.clientY;
+      state.previewView.yaw += dx * 0.01;
+      state.previewView.pitch = Math.max(-1.35, Math.min(1.15, state.previewView.pitch + dy * 0.01));
+      renderCurrentPreview();
+    });
 
-  previewCanvas.addEventListener("pointerup", () => {
-    state.previewView.dragging = false;
-  });
+    previewCanvas.addEventListener("pointerup", () => {
+      state.previewView.dragging = false;
+    });
 
-  previewCanvas.addEventListener("pointercancel", () => {
-    state.previewView.dragging = false;
-  });
+    previewCanvas.addEventListener("pointercancel", () => {
+      state.previewView.dragging = false;
+    });
 
-  previewCanvas.addEventListener("wheel", (event) => {
-    if (!state.preview) return;
-    event.preventDefault();
-    const factor = event.deltaY > 0 ? 0.92 : 1.08;
-    state.previewView.zoom = Math.max(0.55, Math.min(3.2, state.previewView.zoom * factor));
-    drawStepPreview(state.preview);
-  }, { passive: false });
+    previewCanvas.addEventListener("wheel", (event) => {
+      if (!state.preview) return;
+      event.preventDefault();
+      const factor = event.deltaY > 0 ? 0.92 : 1.08;
+      state.previewView.zoom = Math.max(0.55, Math.min(3.2, state.previewView.zoom * factor));
+      renderCurrentPreview();
+    }, { passive: false });
 
-  previewCanvas.addEventListener("dblclick", () => {
-    state.previewView.yaw = -0.68;
-    state.previewView.pitch = -0.46;
-    state.previewView.zoom = 1;
-    if (state.preview) drawStepPreview(state.preview);
+    previewCanvas.addEventListener("dblclick", () => {
+      state.previewView.yaw = -0.68;
+      state.previewView.pitch = -0.46;
+      state.previewView.zoom = 1;
+      renderCurrentPreview();
+    });
   });
 
   fileInput.addEventListener("change", (event) => {

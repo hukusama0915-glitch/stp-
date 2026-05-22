@@ -73,7 +73,10 @@
                 <span id="previewBadge" class="preview-badge">待機中</span>
               </div>
               <div class="preview-body">
-                <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
+                <div class="viewer-stack">
+                  <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
+                  <canvas id="cadPreviewCanvas" width="720" height="360" aria-label="STP詳細3Dプレビュー" class="hidden"></canvas>
+                </div>
                 <dl id="previewStats" class="preview-stats"></dl>
               </div>
             </section>
@@ -205,6 +208,8 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.138.3/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/occt-import-js@0.0.23/dist/occt-import-js.js"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
