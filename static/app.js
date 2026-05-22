@@ -2,8 +2,8 @@ const state = {
   master: { tools: [], conditions: [], machines: [], manufacturer_catalogs: [], manufacturer_cutting_conditions: [] },
   lastResult: null,
   preview: null,
-  previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0 },
-  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null },
+  previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0, preset: "iso" },
+  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded" },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -179,6 +179,59 @@ function renderCurrentPreview() {
   }
 }
 
+function updateViewerControls() {
+  $$("[data-view-preset]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.viewPreset === state.previewView.preset);
+  });
+  $$("[data-view-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.viewMode === state.cadPreview.displayMode);
+  });
+  const cube = $("#viewCube");
+  if (cube) cube.querySelector("strong").textContent = state.previewView.preset.toUpperCase();
+}
+
+function applyViewPreset(preset) {
+  const presets = {
+    iso: { yaw: -0.72, pitch: -0.58 },
+    top: { yaw: 0, pitch: -1.5 },
+    front: { yaw: 0, pitch: 0 },
+    right: { yaw: -Math.PI / 2, pitch: 0 },
+  };
+  const next = presets[preset] || presets.iso;
+  state.previewView.yaw = next.yaw;
+  state.previewView.pitch = next.pitch;
+  state.previewView.preset = preset in presets ? preset : "iso";
+  updateViewerControls();
+  renderCurrentPreview();
+}
+
+function fitPreview() {
+  state.previewView.zoom = 1;
+  renderCurrentPreview();
+}
+
+function applyCadDisplayMode(mode) {
+  state.cadPreview.displayMode = mode;
+  const group = state.cadPreview.group;
+  if (group) {
+    group.traverse((object) => {
+      if (object.isMesh) {
+        object.material.wireframe = mode === "wire";
+        object.material.transparent = mode === "transparent";
+        object.material.opacity = mode === "transparent" ? 0.48 : 1;
+        object.material.depthWrite = mode !== "transparent";
+        object.material.needsUpdate = true;
+      }
+      if (object.isLineSegments) {
+        object.visible = mode !== "wire";
+        object.material.opacity = mode === "transparent" ? 0.72 : 0.42;
+      }
+    });
+  }
+  updateViewerControls();
+  renderCurrentPreview();
+}
+
 function drawProjectedEllipse(ctx, center, radiusMm, model, scale, origin, options = {}) {
   const c = project3d(center, model, scale, origin);
   const xAxis = project3d([center[0] + radiusMm, center[1], center[2]], model, scale, origin);
@@ -206,15 +259,16 @@ function initCadPreview() {
   if (!state.cadPreview.renderer) {
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;
     const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000000);
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000000);
     camera.up.set(0, 0, 1);
 
-    scene.add(new THREE.HemisphereLight(0xf7f3e7, 0x53655d, 1.55));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 1.7);
+    scene.add(new THREE.HemisphereLight(0xf4f4f4, 0x5f635f, 1.45));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.35);
     keyLight.position.set(1.6, -2.4, 2.8);
     scene.add(keyLight);
-    const rimLight = new THREE.DirectionalLight(0xd9eee8, 0.9);
+    const rimLight = new THREE.DirectionalLight(0xffffff, 0.62);
     rimLight.position.set(-2.8, 2.2, 1.6);
     scene.add(rimLight);
 
@@ -244,15 +298,15 @@ function buildCadMesh(geometryMesh) {
   const color = geometryMesh.color || [0.78, 0.82, 0.78];
   const material = new THREE.MeshStandardMaterial({
     color: new THREE.Color(color[0], color[1], color[2]),
-    metalness: 0.18,
-    roughness: 0.48,
+    metalness: 0.06,
+    roughness: 0.36,
     side: THREE.DoubleSide,
   });
   const mesh = new THREE.Mesh(geometry, material);
 
   const edges = new THREE.LineSegments(
     new THREE.EdgesGeometry(geometry, 28),
-    new THREE.LineBasicMaterial({ color: 0x26352e, transparent: true, opacity: 0.42 }),
+    new THREE.LineBasicMaterial({ color: 0x202020, transparent: true, opacity: 0.42 }),
   );
   return { mesh, edges };
 }
@@ -291,6 +345,7 @@ async function loadDetailedCadPreview(buffer) {
   state.cadPreview.group = group;
   state.cadPreview.baseRadius = Math.max(size.x, size.y, size.z, 1);
   state.cadPreview.scene.add(group);
+  applyCadDisplayMode(state.cadPreview.displayMode);
   setPreviewMode("cad");
   renderCadScene();
 }
@@ -303,16 +358,21 @@ function renderCadScene() {
   const width = Math.max(1, Math.round(rect.width));
   const height = Math.max(1, Math.round(rect.height));
   renderer.setSize(width, height, false);
-  camera.aspect = width / height;
 
   const distance = (baseRadius * 1.85) / Math.max(state.previewView.zoom, 0.2);
   camera.position.set(0, -distance, distance * 0.62);
   camera.near = Math.max(0.01, distance / 1000);
   camera.far = Math.max(1000, distance * 20);
+  const viewSize = Math.max(baseRadius * 1.18 / Math.max(state.previewView.zoom, 0.2), 1);
+  const aspect = width / height;
+  camera.left = -viewSize * aspect;
+  camera.right = viewSize * aspect;
+  camera.top = viewSize;
+  camera.bottom = -viewSize;
   camera.lookAt(0, 0, 0);
   camera.updateProjectionMatrix();
 
-  group.rotation.set(state.previewView.pitch * 0.55, 0, state.previewView.yaw, "XYZ");
+  group.rotation.set(state.previewView.pitch, 0, state.previewView.yaw, "XYZ");
   renderer.render(scene, camera);
 }
 
@@ -843,7 +903,9 @@ function bindEvents() {
       state.previewView.lastX = event.clientX;
       state.previewView.lastY = event.clientY;
       state.previewView.yaw += dx * 0.01;
-      state.previewView.pitch = Math.max(-1.35, Math.min(1.15, state.previewView.pitch + dy * 0.01));
+      state.previewView.pitch = Math.max(-1.55, Math.min(1.35, state.previewView.pitch + dy * 0.01));
+      state.previewView.preset = "free";
+      updateViewerControls();
       renderCurrentPreview();
     });
 
@@ -864,12 +926,20 @@ function bindEvents() {
     }, { passive: false });
 
     previewCanvas.addEventListener("dblclick", () => {
-      state.previewView.yaw = -0.68;
-      state.previewView.pitch = -0.46;
       state.previewView.zoom = 1;
-      renderCurrentPreview();
+      applyViewPreset("iso");
     });
   });
+
+  $$("[data-view-preset]").forEach((button) => {
+    button.addEventListener("click", () => applyViewPreset(button.dataset.viewPreset));
+  });
+
+  $$("[data-view-mode]").forEach((button) => {
+    button.addEventListener("click", () => applyCadDisplayMode(button.dataset.viewMode));
+  });
+
+  $("[data-view-fit]")?.addEventListener("click", fitPreview);
 
   fileInput.addEventListener("change", (event) => {
     const file = event.target.files[0];
@@ -969,4 +1039,5 @@ function bindEvents() {
 
 bindEvents();
 drawPreviewPlaceholder();
+updateViewerControls();
 loadMaster().catch((error) => toast(error.message));

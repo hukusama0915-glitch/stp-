@@ -74,8 +74,23 @@
               </div>
               <div class="preview-body">
                 <div class="viewer-stack">
+                  <div class="viewer-toolbar" aria-label="3D表示操作">
+                    <button type="button" data-view-preset="iso" title="等角表示">ISO</button>
+                    <button type="button" data-view-preset="top" title="上面">TOP</button>
+                    <button type="button" data-view-preset="front" title="正面">FRONT</button>
+                    <button type="button" data-view-preset="right" title="右側面">RIGHT</button>
+                    <button type="button" data-view-mode="shaded" title="シェーディング">SHADE</button>
+                    <button type="button" data-view-mode="wire" title="ワイヤ表示">WIRE</button>
+                    <button type="button" data-view-mode="transparent" title="透過表示">TRANS</button>
+                    <button type="button" data-view-fit title="全体表示">FIT</button>
+                  </div>
                   <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
                   <canvas id="cadPreviewCanvas" width="720" height="360" aria-label="STP詳細3Dプレビュー" class="hidden"></canvas>
+                  <div id="viewCube" class="view-cube" aria-hidden="true">
+                    <span>TOP</span>
+                    <strong>ISO</strong>
+                    <em>FRONT</em>
+                  </div>
                 </div>
                 <dl id="previewStats" class="preview-stats"></dl>
               </div>
