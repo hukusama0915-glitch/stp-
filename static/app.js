@@ -854,10 +854,20 @@ function renderResult(result) {
   `).join("");
 
   const bbox = result.analysis.bbox;
+  const rawBbox = result.analysis.raw_bbox
+    ? `${result.analysis.raw_bbox.x.toFixed(1)} x ${result.analysis.raw_bbox.y.toFixed(1)} x ${result.analysis.raw_bbox.z.toFixed(1)} mm`
+    : "-";
+  const volumeRows = result.analysis.brep_available ? `
+    <dt>実形状寸法</dt><dd>${rawBbox}</dd>
+    <dt>部品体積</dt><dd>${Math.round(result.analysis.part_volume_mm3).toLocaleString()} mm3</dd>
+    <dt>推定除去体積</dt><dd>${Math.round(result.analysis.removal_volume_mm3).toLocaleString()} mm3</dd>
+    <dt>ソリッド/エッジ</dt><dd>${result.analysis.solid_count} / ${result.analysis.edge_count}</dd>
+  ` : "";
   $("#analysisInfo").innerHTML = `
     <dt>解析方式</dt><dd>${result.analysis.parser}</dd>
     <dt>条件ソース</dt><dd>${result.condition_source || "-"}</dd>
     <dt>外形寸法</dt><dd>${bbox.x.toFixed(1)} x ${bbox.y.toFixed(1)} x ${bbox.z.toFixed(1)} mm</dd>
+    ${volumeRows}
     <dt>エンティティ</dt><dd>${result.analysis.entity_count}</dd>
     <dt>面候補</dt><dd>${result.analysis.face_count}</dd>
     <dt>円筒面候補</dt><dd>${result.analysis.cylindrical_radii.length}</dd>

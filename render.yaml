@@ -8,3 +8,5 @@ services:
     envVars:
       - key: UPLOAD_RETENTION_DAYS
         value: "1"
+      - key: ENABLE_BREP_ANALYSIS
+        value: "1"

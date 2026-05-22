@@ -734,7 +734,7 @@ def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
     plane_count = len(re.findall(r"\bPLANE\s*\(", text, flags=re.IGNORECASE))
     cylindrical_radii = [
         float(match.group(1))
-        for match in re.finditer(r"CYLINDRICAL_SURFACE\s*\([^,]+,\s*#[0-9]+,\s*([0-9.+\-Ee]+)", text)
+        for match in re.finditer(r"CYLINDRICAL_SURFACE\s*\([^,]+,\s*#[0-9]+,\s*([0-9.+\-Ee]+)", text, flags=re.IGNORECASE)
     ]
     point_values = re.findall(
         r"CARTESIAN_POINT\s*\([^,]*,\s*\(\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*\)\s*\)",
@@ -756,7 +756,7 @@ def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
     z_len = max(1.0, z_len + blank_allowance_mm * 2)
     small_radii = [r for r in cylindrical_radii if 1.0 <= r <= 20.0]
 
-    return {
+    analysis = {
         "entity_count": entity_count,
         "face_count": face_count,
         "plane_count": plane_count,
@@ -765,6 +765,122 @@ def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
         "points_detected": len(points),
         "parser": "STEPテキスト解析",
     }
+    brep_analysis = parse_step_brep(path, blank_allowance_mm)
+    if brep_analysis:
+        analysis.update(brep_analysis)
+    return analysis
+
+
+def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | None:
+    if os.environ.get("ENABLE_BREP_ANALYSIS", "1") != "1":
+        return None
+
+    try:
+        import cadquery as cq  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        shape = cq.importers.importStep(str(path)).val()
+        bbox = shape.BoundingBox()
+        raw_x = float(bbox.xlen)
+        raw_y = float(bbox.ylen)
+        raw_z = float(bbox.zlen)
+        part_volume = max(0.0, float(shape.Volume()))
+        stock_x = max(1.0, raw_x + blank_allowance_mm * 2)
+        stock_y = max(1.0, raw_y + blank_allowance_mm * 2)
+        stock_z = max(1.0, raw_z + blank_allowance_mm * 2)
+        stock_volume = stock_x * stock_y * stock_z
+
+        faces = shape.Faces()
+        cylindrical_faces: list[dict[str, Any]] = []
+        hole_groups: dict[tuple[float, str], dict[str, Any]] = {}
+        for face in faces:
+            try:
+                geom_type = face.geomType()
+            except Exception:
+                continue
+            if geom_type != "CYLINDER":
+                continue
+            try:
+                cylinder = face._geomAdaptor().Cylinder()
+                radius = float(cylinder.Radius())
+                direction = cylinder.Axis().Direction()
+                axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
+                center = tuple(float(value) for value in face.Center().toTuple())
+                area = float(face.Area())
+            except Exception:
+                continue
+            if radius <= 0:
+                continue
+            estimated_depth = area / max(0.000001, 2 * math.pi * radius)
+            cylindrical_faces.append(
+                {
+                    "radius": radius,
+                    "diameter": radius * 2,
+                    "area": area,
+                    "estimated_depth": estimated_depth,
+                    "axis": axis,
+                    "center": center,
+                }
+            )
+
+            if not (1.5 <= radius <= 20.0 and estimated_depth >= 1.0):
+                continue
+            axis_label = max(
+                (("X", abs(axis[0])), ("Y", abs(axis[1])), ("Z", abs(axis[2]))),
+                key=lambda item: item[1],
+            )[0]
+            diameter = round(radius * 2, 1)
+            key = (diameter, axis_label)
+            group = hole_groups.setdefault(
+                key,
+                {
+                    "diameter": diameter,
+                    "axis": axis_label,
+                    "count": 0,
+                    "total_depth": 0.0,
+                    "max_depth": 0.0,
+                },
+            )
+            group["count"] += 1
+            group["total_depth"] += estimated_depth
+            group["max_depth"] = max(group["max_depth"], estimated_depth)
+
+        normalized_hole_groups = []
+        for group in hole_groups.values():
+            count = max(1, int(group["count"]))
+            normalized_hole_groups.append(
+                {
+                    "diameter": group["diameter"],
+                    "axis": group["axis"],
+                    "count": count,
+                    "avg_depth": group["total_depth"] / count,
+                    "max_depth": group["max_depth"],
+                }
+            )
+
+        return {
+            "parser": "OpenCascade B-Rep解析 + STEPテキスト補助",
+            "brep_available": True,
+            "solid_count": len(shape.Solids()),
+            "edge_count": len(shape.Edges()),
+            "face_count": len(faces),
+            "plane_count": sum(1 for face in faces if face.geomType() == "PLANE"),
+            "bbox": {"x": stock_x, "y": stock_y, "z": stock_z},
+            "raw_bbox": {"x": raw_x, "y": raw_y, "z": raw_z},
+            "part_volume_mm3": part_volume,
+            "stock_volume_mm3": stock_volume,
+            "removal_volume_mm3": max(0.0, stock_volume - part_volume),
+            "cylindrical_radii": [item["radius"] for item in cylindrical_faces if 1.0 <= item["radius"] <= 20.0],
+            "cylindrical_faces": cylindrical_faces[:300],
+            "hole_groups": sorted(normalized_hole_groups, key=lambda item: (item["axis"], item["diameter"])),
+        }
+    except Exception as exc:
+        return {
+            "brep_available": False,
+            "brep_error": str(exc),
+        }
 
 
 def pick_tool(conn: sqlite3.Connection, tool_type: str, target_diameter: float | None = None) -> sqlite3.Row:
@@ -998,29 +1114,42 @@ def estimate(
             )
         )
 
-        radii = analysis["cylindrical_radii"]
-        grouped_holes: dict[float, int] = {}
-        for radius in radii:
-            diameter = round(radius * 2, 1)
-            grouped_holes[diameter] = grouped_holes.get(diameter, 0) + 1
-        if not grouped_holes and analysis["face_count"] > 25:
-            grouped_holes[6.0] = max(1, min(8, analysis["face_count"] // 18))
+        hole_groups = analysis.get("hole_groups") or []
+        if not hole_groups:
+            radii = analysis["cylindrical_radii"]
+            grouped_holes: dict[float, int] = {}
+            for radius in radii:
+                diameter = round(radius * 2, 1)
+                grouped_holes[diameter] = grouped_holes.get(diameter, 0) + 1
+            if not grouped_holes and analysis["face_count"] > 25:
+                grouped_holes[6.0] = max(1, min(8, analysis["face_count"] // 18))
+            hole_groups = [
+                {
+                    "diameter": diameter,
+                    "count": count,
+                    "avg_depth": max(3.0, bbox["z"] * 0.75),
+                    "axis": "Z",
+                }
+                for diameter, count in sorted(grouped_holes.items())
+            ]
 
-        for diameter, count in sorted(grouped_holes.items()):
+        for group in hole_groups:
+            diameter = float(group["diameter"])
+            count = int(group["count"])
             drill = pick_tool(conn, "DRILL", diameter)
             cond = condition_for(conn, drill["tool_id"], material_type, "穴")
-            depth = min(float(drill["max_depth_mm"]), max(3.0, bbox["z"] * 0.75))
+            depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75))))
             hole_sec = (depth * count) / cond["feed_rate_mm_min"] * 60
             features.append(
                 Feature(
                     "穴加工（ドリル）",
-                    f"φ{diameter:.1f} / 深さ {depth:.1f} mm",
+                    f"φ{diameter:.1f} / 深さ {depth:.1f} mm / 軸 {group.get('axis', '-')}",
                     count,
                     drill["tool_id"],
                     drill["tool_name"],
                     "穴",
                     hole_sec,
-                    "円筒面から穴候補を抽出",
+                    "B-Rep円筒面から穴候補を抽出" if analysis.get("brep_available") else "円筒面から穴候補を抽出",
                 )
             )
 
@@ -1037,8 +1166,11 @@ def estimate(
                     bbox["z"],
                     "ポケット",
                 )
-            complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
-            volume = bbox["x"] * bbox["y"] * bbox["z"] * complexity
+            if analysis.get("removal_volume_mm3") is not None:
+                volume = max(0.0, float(analysis["removal_volume_mm3"]))
+            else:
+                complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
+                volume = bbox["x"] * bbox["y"] * bbox["z"] * complexity
             if pocket_catalog_cond is not None:
                 removal_rate = max(
                     0.000001,
@@ -1061,7 +1193,7 @@ def estimate(
                 removal_rate = max(1.0, pocket_cond["width_of_cut_mm"] * pocket_cond["depth_of_cut_mm"])
                 pocket_feed = float(pocket_cond["feed_rate_mm_min"])
                 pocket_tool_name = pocket_tool["tool_name"]
-                pocket_note = "面数からポケット相当の除去量を概算"
+                pocket_note = "B-Rep体積差から除去量を算出" if analysis.get("brep_available") else "面数からポケット相当の除去量を概算"
                 pocket_tool_id = pocket_tool["tool_id"]
             pocket_sec = (volume / removal_rate) / pocket_feed * 60
             features.append(
@@ -1085,14 +1217,14 @@ def estimate(
         rapid_sec = travel_length / max(1.0, float(machine["rapid_feed_mm_min"])) * 60
         total_sec = setup_sec + machining_sec + tool_change_sec + rapid_sec
 
-        confidence = 0.7
-        if analysis["points_detected"] == 0:
+        confidence = 0.86 if analysis.get("brep_available") else 0.7
+        if not analysis.get("brep_available") and analysis["points_detected"] == 0:
             confidence -= 0.15
-        if analysis["face_count"] > 120:
+        if not analysis.get("brep_available") and analysis["face_count"] > 120:
             confidence -= 0.12
         if len(features) <= 2:
             confidence -= 0.08
-        confidence = max(0.35, min(0.82, confidence))
+        confidence = max(0.35, min(0.9, confidence))
 
         tool_usage: dict[str, dict[str, Any]] = {}
         for feature in features:
