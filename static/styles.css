@@ -269,15 +269,15 @@ button, input, select {
 
 .preview-body {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(190px, 240px);
-  gap: 14px;
+  grid-template-columns: minmax(520px, 1fr) minmax(170px, 210px);
+  gap: 12px;
   align-items: stretch;
 }
 
 .viewer-stack {
   position: relative;
   min-width: 0;
-  min-height: 360px;
+  min-height: 520px;
   background: #b8b8b8;
   border: 1px solid #b6bbb7;
   overflow: hidden;
@@ -286,7 +286,7 @@ button, input, select {
 #stpPreviewCanvas,
 #cadPreviewCanvas {
   width: 100%;
-  height: 360px;
+  height: 520px;
   display: block;
   border: 0;
   cursor: grab;
@@ -604,6 +604,15 @@ td {
   .settings-panel,
   .preview-body {
     grid-template-columns: 1fr;
+  }
+
+  .viewer-stack {
+    min-height: 420px;
+  }
+
+  #stpPreviewCanvas,
+  #cadPreviewCanvas {
+    height: 420px;
   }
 
   .inline-form,
