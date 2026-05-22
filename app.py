@@ -166,17 +166,25 @@ def init_db() -> None:
         seed_union_tool_catalogs(conn)
         seed_osg_catalogs(conn)
         seed_union_tool_cutting_conditions(conn)
+        ensure_operational_master(conn)
     cleanup_old_uploads()
 
 
-def seed_master(conn: sqlite3.Connection) -> None:
-    tools = [
-        ("φ50 フェイスミル", "FACE", 50, 6, 3, "アルミ/鉄/SUS", 1, 1, "上面・広い平面"),
+DEFAULT_TOOLS = [
         ("φ16 フラットEM", "EM", 16, 4, 40, "アルミ/鉄/SUS", 1, 1, "側面・ポケット荒"),
         ("φ10 フラットEM", "EM", 10, 4, 30, "アルミ/鉄/SUS", 1, 1, "汎用ポケット"),
         ("φ6 ドリル", "DRILL", 6, 2, 45, "アルミ/鉄/SUS", 1, 0, "小径穴"),
         ("M6 タップ", "TAP", 6, 3, 25, "アルミ/鉄/SUS", 0, 1, "ねじ穴概算"),
     ]
+
+DEFAULT_MACHINES = [
+    ("標準 3軸MC", 3, 15000, 8, 12000, 30, "概算用デフォルト"),
+    ("高速 5軸MC", 5, 30000, 5, 20000, 45, "5軸案件の概算"),
+]
+
+
+def seed_master(conn: sqlite3.Connection) -> None:
+    tools = DEFAULT_TOOLS
     conn.executemany(
         """
         INSERT INTO tools
@@ -186,25 +194,44 @@ def seed_master(conn: sqlite3.Connection) -> None:
         tools,
     )
 
-    machines = [
-        ("標準 3軸MC", 3, 15000, 8, 12000, 30, "概算用デフォルト"),
-        ("高速 5軸MC", 5, 30000, 5, 20000, 45, "5軸案件の概算"),
-    ]
+    seed_default_machines(conn)
+    seed_default_conditions_for_tools(conn)
+
+
+def seed_default_machines(conn: sqlite3.Connection) -> None:
+    existing = {
+        row["machine_name"]
+        for row in conn.execute("SELECT machine_name FROM machines").fetchall()
+    }
+    rows = [row for row in DEFAULT_MACHINES if row[0] not in existing]
+    if not rows:
+        return
     conn.executemany(
         """
         INSERT INTO machines
         (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec, max_spindle_rpm, setup_time_min, memo)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        machines,
+        rows,
     )
 
+
+def seed_default_conditions_for_tools(conn: sqlite3.Connection) -> None:
     condition_rows = []
     material_factor = {"アルミ": 1.8, "鉄": 1.0, "SUS": 0.55}
     for tool_id, tool_name, tool_type, diameter, *_ in conn.execute(
         "SELECT tool_id, tool_name, tool_type, diameter_mm FROM tools"
     ).fetchall():
         for material, factor in material_factor.items():
+            if conn.execute(
+                """
+                SELECT 1 FROM cutting_conditions
+                WHERE tool_id = ? AND material_type = ?
+                LIMIT 1
+                """,
+                (tool_id, material),
+            ).fetchone():
+                continue
             if tool_type == "FACE":
                 base_feed = 1200
                 process = "平面"
@@ -229,6 +256,8 @@ def seed_master(conn: sqlite3.Connection) -> None:
             condition_rows.append(
                 (tool_id, material, process, rpm, round(base_feed * factor, 1), ap, round(ae, 2), 8)
             )
+    if not condition_rows:
+        return
     conn.executemany(
         """
         INSERT INTO cutting_conditions
@@ -238,6 +267,45 @@ def seed_master(conn: sqlite3.Connection) -> None:
         """,
         condition_rows,
     )
+
+
+def ensure_operational_master(conn: sqlite3.Connection) -> None:
+    remove_deprecated_default_tools(conn)
+    if conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0] == 0:
+        seed_master(conn)
+        return
+
+    existing_tool_types = {
+        row["tool_type"]
+        for row in conn.execute("SELECT DISTINCT tool_type FROM tools").fetchall()
+    }
+    missing_tools = [row for row in DEFAULT_TOOLS if row[1] not in existing_tool_types]
+    if missing_tools:
+        conn.executemany(
+            """
+            INSERT INTO tools
+            (tool_name, tool_type, diameter_mm, flute_count, max_depth_mm, material, roughing, finishing, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            missing_tools,
+        )
+
+    seed_default_machines(conn)
+    seed_default_conditions_for_tools(conn)
+
+
+def remove_deprecated_default_tools(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT tool_id
+        FROM tools
+        WHERE tool_name = ? AND tool_type = ?
+        """,
+        ("φ50 フェイスミル", "FACE"),
+    ).fetchall()
+    for row in rows:
+        conn.execute("DELETE FROM cutting_conditions WHERE tool_id = ?", (row["tool_id"],))
+        conn.execute("DELETE FROM tools WHERE tool_id = ?", (row["tool_id"],))
 
 
 UNION_TOOL_SOURCE_URL = "https://www.uniontool.co.jp/catalog/endmill.html"
@@ -1372,16 +1440,20 @@ def estimate(
     bbox = analysis["bbox"]
 
     with db() as conn:
+        ensure_operational_master(conn)
         ensure_catalog_tool_master(conn)
+        ensure_operational_master(conn)
         machine = conn.execute("SELECT * FROM machines WHERE machine_id = ?", (machine_id,)).fetchone()
         if machine is None:
             machine = conn.execute("SELECT * FROM machines ORDER BY machine_id LIMIT 1").fetchone()
+        if machine is None:
+            raise RuntimeError("機械マスタが未登録です")
         rapid_feed = float(machine["rapid_feed_mm_min"])
 
         features: list[Feature] = []
 
-        face_tool = pick_tool(conn, "FACE")
-        face_cond = condition_for(conn, face_tool["tool_id"], material_type, "平面")
+        face_tool = pick_tool(conn, "EM", 16)
+        face_cond = condition_for(conn, face_tool["tool_id"], material_type, "ポケット")
         top_area = bbox["x"] * bbox["y"]
         face_diameter = float(face_tool["diameter_mm"])
         face_feed, _face_ap, face_ae = condition_params(
@@ -1403,7 +1475,7 @@ def estimate(
                 face_tool["tool_name"],
                 "平面",
                 top_sec,
-                "バウンディングボックスから概算",
+                "上面をエンドミル面走査として概算",
                 master_condition_summary(face_cond),
                 path_plan_summary(top_cutting_length, face_passes, face_passes * 2, method="面走査"),
             )
@@ -1885,7 +1957,9 @@ def index() -> str:
 @app.get("/api/master")
 def api_master() -> Response:
     with db() as conn:
+        ensure_operational_master(conn)
         ensure_catalog_tool_master(conn)
+        ensure_operational_master(conn)
         return jsonify(
             {
                 "tools": rows_to_dicts(conn.execute("SELECT * FROM tools ORDER BY tool_id").fetchall()),
@@ -2054,6 +2128,7 @@ def api_delete_tool(tool_id: int) -> Response:
     with db() as conn:
         conn.execute("DELETE FROM cutting_conditions WHERE tool_id = ?", (tool_id,))
         conn.execute("DELETE FROM tools WHERE tool_id = ?", (tool_id,))
+        ensure_operational_master(conn)
     return jsonify({"ok": True})
 
 
@@ -2086,6 +2161,7 @@ def api_create_condition() -> Response:
 def api_delete_condition(condition_id: int) -> Response:
     with db() as conn:
         conn.execute("DELETE FROM cutting_conditions WHERE condition_id = ?", (condition_id,))
+        ensure_operational_master(conn)
     return jsonify({"ok": True})
 
 
@@ -2117,6 +2193,7 @@ def api_create_machine() -> Response:
 def api_delete_machine(machine_id: int) -> Response:
     with db() as conn:
         conn.execute("DELETE FROM machines WHERE machine_id = ?", (machine_id,))
+        ensure_operational_master(conn)
     return jsonify({"ok": True})
 
 
