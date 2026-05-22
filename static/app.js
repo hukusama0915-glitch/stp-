@@ -862,12 +862,18 @@ function renderResult(result) {
   $("#featureRows").innerHTML = result.features.map((f) => `
     <tr>
       <td>${f.feature_type}</td><td>${f.dimensions}<br><small>${f.note}</small></td>
-      <td>${f.quantity}</td><td>${f.tool_name}</td><td>${secLabel(f.machining_sec)}</td>
+      <td>${f.quantity}</td><td>${f.tool_name}</td>
+      <td class="condition-cell">${f.cutting_condition || "-"}</td>
+      <td>${secLabel(f.machining_sec)}</td>
     </tr>
   `).join("");
 
   $("#toolUsageRows").innerHTML = result.tool_usage.map((t) => `
-    <tr><td>${t.tool_name}</td><td>${t.usage_count}</td><td>${secLabel(t.machining_sec)}</td></tr>
+    <tr>
+      <td>${t.tool_name}</td><td>${t.usage_count}</td>
+      <td class="condition-cell">${t.cutting_conditions || "-"}</td>
+      <td>${secLabel(t.machining_sec)}</td>
+    </tr>
   `).join("");
 
   const bbox = result.analysis.bbox;

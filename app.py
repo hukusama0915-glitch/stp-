@@ -725,6 +725,43 @@ class Feature:
     process_type: str
     machining_sec: float
     note: str
+    cutting_condition: str = ""
+
+
+def fmt_number(value: Any, digits: int = 2) -> str:
+    number = float(value)
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.{digits}f}".rstrip("0").rstrip(".")
+
+
+def master_condition_summary(condition: sqlite3.Row | None) -> str:
+    if condition is None:
+        return "-"
+    return (
+        f'rpm {int(condition["spindle_rpm"]):,} / '
+        f'F {fmt_number(condition["feed_rate_mm_min"])} mm/min / '
+        f'ap {fmt_number(condition["depth_of_cut_mm"])} mm / '
+        f'ae {fmt_number(condition["width_of_cut_mm"])} mm'
+    )
+
+
+def catalog_condition_summary(condition: sqlite3.Row | None) -> str:
+    if condition is None:
+        return "-"
+    material = " ".join(
+        str(condition[key] or "")
+        for key in ("work_material", "hardness")
+        if condition[key]
+    )
+    return (
+        f'rpm {int(condition["spindle_rpm"]):,} / '
+        f'F {fmt_number(condition["feed_rate_mm_min"])} mm/min / '
+        f'ap {fmt_number(condition["axial_depth_mm"])} mm / '
+        f'ae {fmt_number(condition["radial_depth_mm"])} mm'
+        + (f' / {material}' if material else "")
+        + (f' / p.{condition["source_page"]}' if condition["source_page"] else "")
+    )
 
 
 def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
@@ -1285,6 +1322,7 @@ def estimate(
                 "平面",
                 top_sec,
                 "バウンディングボックスから概算",
+                master_condition_summary(face_cond),
             )
         )
 
@@ -1315,6 +1353,7 @@ def estimate(
                 f'ap {side_catalog_cond["axial_depth_mm"]}, ae {side_catalog_cond["radial_depth_mm"]}, '
                 f'出典 p.{side_catalog_cond["source_page"]}'
             )
+            side_condition_text = catalog_condition_summary(side_catalog_cond)
             side_tool_id = None
         else:
             side_diameter = float(side_tool["diameter_mm"])
@@ -1322,6 +1361,7 @@ def estimate(
             side_feed = float(side_cond["feed_rate_mm_min"])
             side_tool_name = side_tool["tool_name"]
             side_note = "外周側面として概算"
+            side_condition_text = master_condition_summary(side_cond)
             side_tool_id = side_tool["tool_id"]
         side_sec = (side_area / (side_diameter * side_pick)) / side_feed * 60
         features.append(
@@ -1334,6 +1374,7 @@ def estimate(
                 "平面",
                 side_sec,
                 side_note,
+                side_condition_text,
             )
         )
 
@@ -1377,6 +1418,7 @@ def estimate(
                     "穴",
                     hole_sec,
                     "B-Rep円筒面から穴候補を抽出" if analysis.get("brep_available") else "円筒面から穴候補を抽出",
+                    master_condition_summary(cond),
                 )
             )
 
@@ -1397,6 +1439,7 @@ def estimate(
                     "穴",
                     side_hole_sec,
                     "B-Rep円筒面から側面穴候補を抽出",
+                    master_condition_summary(cond),
                 )
             )
 
@@ -1430,6 +1473,7 @@ def estimate(
                     "穴",
                     drill_sec + counterbore_sec,
                     "B-Rep円筒面の同芯径違いから座ぐり候補を抽出",
+                    f"下穴: {master_condition_summary(drill_cond)} / 座ぐり: {master_condition_summary(counterbore_cond)}",
                 )
             )
 
@@ -1462,12 +1506,14 @@ def estimate(
                     f'ap {slot_catalog_cond["axial_depth_mm"]}, ae {slot_catalog_cond["radial_depth_mm"]}, '
                     f'出典 p.{slot_catalog_cond["source_page"]}'
                 )
+                slot_condition_text = catalog_condition_summary(slot_catalog_cond)
             else:
                 slot_rate = max(1.0, slot_cond["width_of_cut_mm"] * slot_cond["depth_of_cut_mm"])
                 slot_feed = float(slot_cond["feed_rate_mm_min"])
                 slot_tool_name = slot_tool["tool_name"]
                 slot_tool_id = slot_tool["tool_id"]
                 slot_note = "B-Rep円筒端部ペアからスロット候補を抽出"
+                slot_condition_text = master_condition_summary(slot_cond)
             slot_sec = (volume / slot_rate) / slot_feed * 60
             features.append(
                 Feature(
@@ -1479,6 +1525,7 @@ def estimate(
                     "ポケット",
                     slot_sec,
                     slot_note,
+                    slot_condition_text,
                 )
             )
 
@@ -1519,12 +1566,14 @@ def estimate(
                     f'ap {pocket_catalog_cond["axial_depth_mm"]}, ae {pocket_catalog_cond["radial_depth_mm"]}, '
                     f'出典 p.{pocket_catalog_cond["source_page"]}'
                 )
+                pocket_condition_text = catalog_condition_summary(pocket_catalog_cond)
                 pocket_tool_id = None
             else:
                 removal_rate = max(1.0, pocket_cond["width_of_cut_mm"] * pocket_cond["depth_of_cut_mm"])
                 pocket_feed = float(pocket_cond["feed_rate_mm_min"])
                 pocket_tool_name = pocket_tool["tool_name"]
                 pocket_note = "B-Rep体積差から除去量を算出" if analysis.get("brep_available") else "面数からポケット相当の除去量を概算"
+                pocket_condition_text = master_condition_summary(pocket_cond)
                 pocket_tool_id = pocket_tool["tool_id"]
             pocket_sec = (volume / removal_rate) / pocket_feed * 60
             features.append(
@@ -1537,6 +1586,7 @@ def estimate(
                     "ポケット",
                     pocket_sec,
                     pocket_note,
+                    pocket_condition_text,
                 )
             )
 
@@ -1561,10 +1611,23 @@ def estimate(
         for feature in features:
             item = tool_usage.setdefault(
                 feature.tool_name,
-                {"tool_name": feature.tool_name, "usage_count": 0, "machining_sec": 0.0},
+                {"tool_name": feature.tool_name, "usage_count": 0, "machining_sec": 0.0, "cutting_conditions": set()},
             )
             item["usage_count"] += feature.quantity
             item["machining_sec"] += feature.machining_sec
+            if feature.cutting_condition:
+                item["cutting_conditions"].add(feature.cutting_condition)
+
+        tool_usage_rows = []
+        for item in tool_usage.values():
+            tool_usage_rows.append(
+                {
+                    "tool_name": item["tool_name"],
+                    "usage_count": item["usage_count"],
+                    "machining_sec": item["machining_sec"],
+                    "cutting_conditions": " / ".join(sorted(item["cutting_conditions"])) or "-",
+                }
+            )
 
         result = {
             "file_name": file_name,
@@ -1573,7 +1636,7 @@ def estimate(
             "blank_allowance_mm": blank_allowance_mm,
             "analysis": analysis,
             "features": [asdict(feature) for feature in features],
-            "tool_usage": list(tool_usage.values()),
+            "tool_usage": tool_usage_rows,
             "breakdown": {
                 "setup_sec": setup_sec,
                 "machining_sec": machining_sec,
@@ -1742,7 +1805,7 @@ def api_history_csv(history_id: int) -> Response:
     writer.writerow(["機械", payload["machine"]["machine_name"]])
     writer.writerow(["合計時間", seconds_label(payload["breakdown"]["total_sec"])])
     writer.writerow([])
-    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "加工時間秒", "備考"])
+    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "加工時間秒", "備考"])
     for feature in payload["features"]:
         writer.writerow(
             [
@@ -1751,6 +1814,7 @@ def api_history_csv(history_id: int) -> Response:
                 feature["quantity"],
                 feature["tool_name"],
                 feature["process_type"],
+                feature.get("cutting_condition", ""),
                 round(feature["machining_sec"], 2),
                 feature["note"],
             ]
