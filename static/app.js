@@ -61,10 +61,35 @@ function parseStepPreview(text, file) {
     })
     .filter((point) => point.every(Number.isFinite));
 
+  const vertexPointById = new Map();
+  for (const match of text.matchAll(/#(\d+)=VERTEX_POINT\s*\([^,]*,\s*#(\d+)\s*\)/gi)) {
+    const point = pointById.get(match[2]);
+    if (point) vertexPointById.set(match[1], point);
+  }
+
+  const edgeKeys = new Set();
+  const edges = [];
+  for (const match of text.matchAll(/#(\d+)=EDGE_CURVE\s*\([^,]*,\s*#(\d+)\s*,\s*#(\d+)/gi)) {
+    const start = vertexPointById.get(match[2]);
+    const end = vertexPointById.get(match[3]);
+    if (!start || !end) continue;
+    const key = `${start.join(",")}|${end.join(",")}`;
+    const reverseKey = `${end.join(",")}|${start.join(",")}`;
+    if (edgeKeys.has(key) || edgeKeys.has(reverseKey)) continue;
+    edgeKeys.add(key);
+    edges.push({ start, end });
+  }
+
   const axisPointById = new Map();
   for (const match of text.matchAll(/#(\d+)=AXIS2_PLACEMENT_3D\s*\([^,]*,\s*#(\d+)/gi)) {
     axisPointById.set(match[1], pointById.get(match[2]) || null);
   }
+  const circles = Array.from(text.matchAll(/#(\d+)=CIRCLE\s*\([^,]+,\s*#(\d+),\s*([0-9.+\-Ee]+)/gi))
+    .map((match) => ({
+      radius: Number(match[3]),
+      center: axisPointById.get(match[2]) || null,
+    }))
+    .filter((item) => Number.isFinite(item.radius) && item.radius > 0);
   const cylinders = Array.from(text.matchAll(/#(\d+)=CYLINDRICAL_SURFACE\s*\([^,]+,\s*#(\d+),\s*([0-9.+\-Ee]+)/gi))
     .map((match) => ({
       radius: Number(match[3]),
@@ -98,6 +123,8 @@ function parseStepPreview(text, file) {
     faceCount,
     planeCount,
     cylinders,
+    circles,
+    edges,
     points,
     bbox,
   };
@@ -130,6 +157,25 @@ function project3d(point, model, scale, origin) {
     y: origin.y - rotated.y * scale,
     z: rotated.z,
   };
+}
+
+function drawProjectedEllipse(ctx, center, radiusMm, model, scale, origin, options = {}) {
+  const c = project3d(center, model, scale, origin);
+  const xAxis = project3d([center[0] + radiusMm, center[1], center[2]], model, scale, origin);
+  const yAxis = project3d([center[0], center[1] + radiusMm, center[2]], model, scale, origin);
+  const rx = Math.hypot(xAxis.x - c.x, xAxis.y - c.y);
+  const ry = Math.hypot(yAxis.x - c.x, yAxis.y - c.y);
+  const rotation = Math.atan2(xAxis.y - c.y, xAxis.x - c.x);
+  ctx.beginPath();
+  ctx.ellipse(c.x, c.y, Math.max(2.5, rx), Math.max(2.5, ry), rotation, 0, Math.PI * 2);
+  if (options.fillStyle) {
+    ctx.fillStyle = options.fillStyle;
+    ctx.fill();
+  }
+  ctx.strokeStyle = options.strokeStyle || "#a3392f";
+  ctx.lineWidth = options.lineWidth || 1.2;
+  ctx.stroke();
+  return c;
 }
 
 function drawPreviewPlaceholder() {
@@ -219,18 +265,37 @@ function drawStepPreview(preview) {
     ctx.stroke();
   }
 
-  const edges = [
+  const boxEdges = [
     [0, 1], [1, 2], [2, 3], [3, 0],
     [4, 5], [5, 6], [6, 7], [7, 4],
     [0, 4], [1, 5], [2, 6], [3, 7],
   ];
   ctx.strokeStyle = "#17201b";
   ctx.lineWidth = 1.5;
-  for (const edge of edges) {
+  for (const edge of boxEdges) {
     ctx.beginPath();
     ctx.moveTo(p[edge[0]].x, p[edge[0]].y);
     ctx.lineTo(p[edge[1]].x, p[edge[1]].y);
     ctx.stroke();
+  }
+
+  if (preview.edges?.length) {
+    const edgeStep = Math.max(1, Math.ceil(preview.edges.length / 3500));
+    const modelEdges = [];
+    for (let i = 0; i < preview.edges.length; i += edgeStep) {
+      const start = project3d(preview.edges[i].start, model, scale, origin);
+      const end = project3d(preview.edges[i].end, model, scale, origin);
+      modelEdges.push({ start, end, depth: (start.z + end.z) / 2 });
+    }
+    modelEdges.sort((a, b2) => a.depth - b2.depth);
+    ctx.strokeStyle = "rgba(23,32,27,.58)";
+    ctx.lineWidth = 1;
+    for (const edge of modelEdges) {
+      ctx.beginPath();
+      ctx.moveTo(edge.start.x, edge.start.y);
+      ctx.lineTo(edge.end.x, edge.end.y);
+      ctx.stroke();
+    }
   }
 
   const axisLength = Math.max(b.x, b.y, z) * 0.22;
@@ -271,7 +336,8 @@ function drawStepPreview(preview) {
   }
 
   const topCenter = project3d([model.cx, model.cy, b.minZ + z], model, scale, origin);
-  const holeCount = Math.min(preview.cylinders.length, 18);
+  const circularFeatures = preview.cylinders.length ? preview.cylinders : (preview.circles || []);
+  const holeCount = Math.min(circularFeatures.length, 120);
   if (holeCount) {
     const columns = Math.ceil(Math.sqrt(holeCount));
     const rows = Math.ceil(holeCount / columns);
@@ -280,17 +346,24 @@ function drawStepPreview(preview) {
       const row = Math.floor(i / columns);
       const nx = columns === 1 ? 0.5 : (col + 1) / (columns + 1);
       const ny = rows === 1 ? 0.5 : (row + 1) / (rows + 1);
-      const center = preview.cylinders[i].center || [b.minX + b.x * nx, b.minY + b.y * ny, b.minZ + z];
+      const feature = circularFeatures[i];
+      const center = feature.center || [b.minX + b.x * nx, b.minY + b.y * ny, b.minZ + z];
       const modelPoint = [center[0], center[1], Math.max(center[2], b.minZ + z)];
-      const hp = project3d(modelPoint, model, scale, origin);
-      const radius = Math.max(3, Math.min(15, preview.cylinders[i].radius * scale * 0.8));
-      ctx.beginPath();
-      ctx.ellipse(hp.x, hp.y, radius * 1.25, radius * 0.7, state.previewView.yaw * 0.35, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(163,57,47,.18)";
-      ctx.fill();
-      ctx.strokeStyle = "#a3392f";
-      ctx.lineWidth = 1.4;
-      ctx.stroke();
+      const bottomPoint = [center[0], center[1], b.minZ];
+      const topProjected = drawProjectedEllipse(ctx, modelPoint, feature.radius, model, scale, origin, {
+        fillStyle: "rgba(163,57,47,.16)",
+        strokeStyle: "#a3392f",
+        lineWidth: 1.2,
+      });
+      if (feature.center && preview.cylinders.length) {
+        const bottomProjected = project3d(bottomPoint, model, scale, origin);
+        ctx.strokeStyle = "rgba(163,57,47,.24)";
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        ctx.moveTo(topProjected.x, topProjected.y);
+        ctx.lineTo(bottomProjected.x, bottomProjected.y);
+        ctx.stroke();
+      }
     }
   } else {
     ctx.fillStyle = "#68746f";
@@ -305,7 +378,7 @@ function drawStepPreview(preview) {
   ctx.fillText(`${numberLabel(b.x)} x ${numberLabel(b.y)} x ${numberLabel(b.z)} mm`, 18, 26);
   ctx.fillStyle = "#68746f";
   ctx.font = "12px Yu Gothic, Meiryo, sans-serif";
-  ctx.fillText(`ドラッグで回転 / ホイールでズーム / 平面 ${preview.planeCount} / 円筒 ${preview.cylinders.length}`, 18, 46);
+  ctx.fillText(`ドラッグで回転 / ホイールでズーム / 平面 ${preview.planeCount} / エッジ ${preview.edges?.length || 0} / 円筒 ${preview.cylinders.length}`, 18, 46);
 }
 
 function renderStepPreview(preview) {
@@ -319,7 +392,7 @@ function renderStepPreview(preview) {
   badge.textContent = hasGeometry ? "読込済み" : "点群なし";
   status.textContent = preview.truncated
     ? "先頭部分だけを読み込んで3D概要を表示しています"
-    : "座標点と円筒面候補から3D概要を表示しています";
+    : "座標点・エッジ・円筒面候補から3D概要を表示しています";
 
   const bboxText = preview.bbox
     ? `${numberLabel(preview.bbox.x)} x ${numberLabel(preview.bbox.y)} x ${numberLabel(preview.bbox.z)} mm`
@@ -329,10 +402,11 @@ function renderStepPreview(preview) {
     <dt>サイズ</dt><dd>${(preview.fileSize / 1024).toFixed(1)} KB</dd>
     <dt>外形</dt><dd>${bboxText}</dd>
     <dt>座標点</dt><dd>${preview.points.length}</dd>
+    <dt>エッジ</dt><dd>${preview.edges?.length || 0}</dd>
     <dt>エンティティ</dt><dd>${preview.entityCount}</dd>
     <dt>平面</dt><dd>${preview.planeCount}</dd>
     <dt>面候補</dt><dd>${preview.faceCount}</dd>
-    <dt>円筒面</dt><dd>${preview.cylinders.length}</dd>
+    <dt>円/円筒</dt><dd>${preview.circles?.length || 0} / ${preview.cylinders.length}</dd>
   `;
   drawStepPreview(preview);
 }
