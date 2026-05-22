@@ -729,7 +729,7 @@ class Feature:
 
 def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="ignore")
-    entity_count = len(re.findall(r"^#\d+=", text, flags=re.MULTILINE))
+    entity_count = len(re.findall(r"^#\d+\s*=", text, flags=re.MULTILINE))
     face_count = len(re.findall(r"ADVANCED_FACE|FACE_BOUND", text, flags=re.IGNORECASE))
     plane_count = len(re.findall(r"\bPLANE\s*\(", text, flags=re.IGNORECASE))
     cylindrical_radii = [

@@ -46,11 +46,11 @@ function numberLabel(value, digits = 1) {
 }
 
 function parseStepPreview(text, file) {
-  const entityCount = (text.match(/^#\d+=/gm) || []).length;
+  const entityCount = (text.match(/^#\d+\s*=/gm) || []).length;
   const faceCount = (text.match(/ADVANCED_FACE|FACE_BOUND/gi) || []).length;
   const planeCount = (text.match(/\bPLANE\s*\(/gi) || []).length;
   const pointMatches = Array.from(text.matchAll(
-    /#(\d+)=CARTESIAN_POINT\s*\([^,]*,\s*\(\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*\)\s*\)/gi,
+    /#(\d+)\s*=\s*CARTESIAN_POINT\s*\([^,]*,\s*\(\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*,\s*([0-9.+\-Ee]+)\s*\)\s*\)/gi,
   ));
   const pointById = new Map();
   const points = pointMatches
@@ -63,14 +63,14 @@ function parseStepPreview(text, file) {
     .filter((point) => point.every(Number.isFinite));
 
   const vertexPointById = new Map();
-  for (const match of text.matchAll(/#(\d+)=VERTEX_POINT\s*\([^,]*,\s*#(\d+)\s*\)/gi)) {
+  for (const match of text.matchAll(/#(\d+)\s*=\s*VERTEX_POINT\s*\([^,]*,\s*#(\d+)\s*\)/gi)) {
     const point = pointById.get(match[2]);
     if (point) vertexPointById.set(match[1], point);
   }
 
   const edgeKeys = new Set();
   const edges = [];
-  for (const match of text.matchAll(/#(\d+)=EDGE_CURVE\s*\([^,]*,\s*#(\d+)\s*,\s*#(\d+)/gi)) {
+  for (const match of text.matchAll(/#(\d+)\s*=\s*EDGE_CURVE\s*\([^,]*,\s*#(\d+)\s*,\s*#(\d+)/gi)) {
     const start = vertexPointById.get(match[2]);
     const end = vertexPointById.get(match[3]);
     if (!start || !end) continue;
@@ -82,16 +82,16 @@ function parseStepPreview(text, file) {
   }
 
   const axisPointById = new Map();
-  for (const match of text.matchAll(/#(\d+)=AXIS2_PLACEMENT_3D\s*\([^,]*,\s*#(\d+)/gi)) {
+  for (const match of text.matchAll(/#(\d+)\s*=\s*AXIS2_PLACEMENT_3D\s*\([^,]*,\s*#(\d+)/gi)) {
     axisPointById.set(match[1], pointById.get(match[2]) || null);
   }
-  const circles = Array.from(text.matchAll(/#(\d+)=CIRCLE\s*\([^,]+,\s*#(\d+),\s*([0-9.+\-Ee]+)/gi))
+  const circles = Array.from(text.matchAll(/#(\d+)\s*=\s*CIRCLE\s*\([^,]+,\s*#(\d+),\s*([0-9.+\-Ee]+)/gi))
     .map((match) => ({
       radius: Number(match[3]),
       center: axisPointById.get(match[2]) || null,
     }))
     .filter((item) => Number.isFinite(item.radius) && item.radius > 0);
-  const cylinders = Array.from(text.matchAll(/#(\d+)=CYLINDRICAL_SURFACE\s*\([^,]+,\s*#(\d+),\s*([0-9.+\-Ee]+)/gi))
+  const cylinders = Array.from(text.matchAll(/#(\d+)\s*=\s*CYLINDRICAL_SURFACE\s*\([^,]+,\s*#(\d+),\s*([0-9.+\-Ee]+)/gi))
     .map((match) => ({
       radius: Number(match[3]),
       center: axisPointById.get(match[2]) || null,
