@@ -57,6 +57,32 @@ function formJson(form) {
   return data;
 }
 
+function resetMachineForm() {
+  const form = $("#machineForm");
+  if (!form) return;
+  form.reset();
+  form.elements.machine_id.value = "";
+  form.elements.axis_count.value = 3;
+  $("#machineSubmitButton").textContent = "追加";
+  $("#machineResetButton")?.classList.add("hidden");
+}
+
+function fillMachineForm(machine) {
+  const form = $("#machineForm");
+  if (!form || !machine) return;
+  form.elements.machine_id.value = machine.machine_id;
+  form.elements.machine_name.value = machine.machine_name || "";
+  form.elements.axis_count.value = machine.axis_count ?? 3;
+  form.elements.rapid_feed_mm_min.value = machine.rapid_feed_mm_min ?? "";
+  form.elements.atc_time_sec.value = machine.atc_time_sec ?? "";
+  form.elements.max_spindle_rpm.value = machine.max_spindle_rpm ?? "";
+  form.elements.max_tool_diameter_mm.value = machine.max_tool_diameter_mm ?? "";
+  form.elements.setup_time_min.value = machine.setup_time_min ?? "";
+  $("#machineSubmitButton").textContent = "更新";
+  $("#machineResetButton")?.classList.remove("hidden");
+  form.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
 function numberLabel(value, digits = 1) {
   if (!Number.isFinite(value)) return "-";
   return value.toFixed(digits);
@@ -671,7 +697,7 @@ async function loadMaster() {
 
 function renderMaster() {
   $("#machineSelect").innerHTML = state.master.machines
-    .map((m) => `<option value="${m.machine_id}">${m.machine_name}</option>`)
+    .map((m) => `<option value="${m.machine_id}">${m.machine_name}${m.max_tool_diameter_mm ? ` / 最大工具径 ${m.max_tool_diameter_mm}mm` : ""}</option>`)
     .join("");
   if ($("#conditionToolSelect")) {
     $("#conditionToolSelect").innerHTML = state.master.tools
@@ -679,18 +705,6 @@ function renderMaster() {
       .join("");
   }
 
-  const makerTools = Array.from(new Map(state.master.manufacturer_cutting_conditions.map((c) => {
-    const key = `${c.manufacturer}|${c.series_code}|${c.model_family}|${c.outside_diameter_mm}|${c.effective_length_mm}`;
-    return [key, {
-      tool_id: `M-${c.series_code}-${c.model_family}-${c.effective_length_mm}`,
-      tool_name: `${c.manufacturer} ${c.series_code} ${c.model_family} φ${Number(c.outside_diameter_mm).toFixed(1)}`,
-      tool_type: c.tool_type,
-      diameter_mm: c.outside_diameter_mm,
-      flute_count: "-",
-      max_depth_mm: c.effective_length_mm,
-      source: "メーカーPDF",
-    }];
-  })).values());
   const catalogTools = state.master.manufacturer_catalogs.map((c) => ({
     tool_id: `C-${c.catalog_id}`,
     tool_name: `${c.manufacturer} ${c.product_name}`,
@@ -702,9 +716,11 @@ function renderMaster() {
   }));
   if ($("#toolRows")) {
     $("#toolRows").innerHTML = [
-      ...state.master.tools.map((t) => ({ ...t, source: "社内" })),
       ...catalogTools,
-      ...makerTools,
+      ...state.master.tools.map((t) => ({
+        ...t,
+        source: t.memo?.includes("http") ? "メーカーPDF" : "社内",
+      })),
     ].map((t) => `
       <tr>
         <td>${t.tool_id}<br><small>${t.source}</small></td><td>${t.tool_name}</td><td>${t.tool_type}</td>
@@ -717,8 +733,12 @@ function renderMaster() {
   $("#machineRows").innerHTML = state.master.machines.map((m) => `
     <tr>
       <td>${m.machine_id}</td><td>${m.machine_name}</td><td>${m.axis_count}</td>
-      <td>${m.rapid_feed_mm_min}</td><td>${m.atc_time_sec}</td><td>${m.max_spindle_rpm}</td><td>${m.setup_time_min}</td>
-      <td><button class="danger" data-delete-machine="${m.machine_id}">削除</button></td>
+      <td>${m.rapid_feed_mm_min}</td><td>${m.atc_time_sec}</td><td>${m.max_spindle_rpm}</td>
+      <td>${m.max_tool_diameter_mm ? `${m.max_tool_diameter_mm} mm` : "制限なし"}</td><td>${m.setup_time_min}</td>
+      <td>
+        <button class="secondary-button compact" data-edit-machine="${m.machine_id}">編集</button>
+        <button class="danger compact" data-delete-machine="${m.machine_id}">削除</button>
+      </td>
     </tr>
   `).join("");
 
@@ -801,7 +821,7 @@ function renderMakerConditions() {
     return (!material || item.work_material === material) && (!search || text.includes(search));
   });
   const internalRows = state.master.conditions.filter((item) => {
-    if (item.tool_memo?.includes("メーカーPDF条件から自動生成")) return false;
+    if (item.tool_memo?.includes("http")) return false;
     const text = [
       item.tool_name,
       item.material_type,
@@ -809,7 +829,8 @@ function renderMakerConditions() {
     ].join(" ").toLowerCase();
     return (!material || item.material_type === material) && (!search || text.includes(search));
   });
-  $("#makerConditionCountBadge").textContent = `${makerRows.length + internalRows.length}件`;
+  const toolCount = $("#toolRows")?.querySelectorAll("tr").length || 0;
+  $("#makerConditionCountBadge").textContent = `工具 ${toolCount} / 条件 ${makerRows.length + internalRows.length}`;
   rowsEl.innerHTML = [
     ...makerRows.map((item) => `
     <tr>
@@ -862,7 +883,7 @@ function renderResult(result) {
   $("#featureRows").innerHTML = result.features.map((f) => `
     <tr>
       <td>${f.feature_type}</td><td>${f.dimensions}<br><small>${f.note}</small></td>
-      <td>${f.quantity}</td><td>${f.tool_name}</td>
+      <td>${f.quantity}</td><td>${f.tool_name}${f.selection_reason ? `<br><small>${f.selection_reason}</small>` : ""}</td>
       <td class="condition-cell">${f.cutting_condition || "-"}</td>
       <td class="path-cell">${f.path_plan || "-"}</td>
       <td>${secLabel(f.machining_sec)}</td>
@@ -885,12 +906,16 @@ function renderResult(result) {
     <dt>実形状寸法</dt><dd>${rawBbox}</dd>
     <dt>部品体積</dt><dd>${Math.round(result.analysis.part_volume_mm3).toLocaleString()} mm3</dd>
     <dt>推定除去体積</dt><dd>${Math.round(result.analysis.removal_volume_mm3).toLocaleString()} mm3</dd>
+    <dt>外形ブランク代</dt><dd>${Math.round(result.analysis.outer_allowance_volume_mm3 || 0).toLocaleString()} mm3</dd>
+    <dt>内部除去体積</dt><dd>${Math.round(result.analysis.internal_removal_volume_mm3 || 0).toLocaleString()} mm3</dd>
     <dt>加工特徴</dt><dd>${machiningFeatureSummary(result.analysis.machining_features)}</dd>
     <dt>ソリッド/エッジ</dt><dd>${result.analysis.solid_count} / ${result.analysis.edge_count}</dd>
   ` : "";
   $("#analysisInfo").innerHTML = `
     <dt>解析方式</dt><dd>${result.analysis.parser}</dd>
     <dt>条件ソース</dt><dd>${result.condition_source || "-"}</dd>
+    <dt>見積安全率</dt><dd>${result.estimate_mode_label || "-"}</dd>
+    <dt>最大工具径</dt><dd>${result.machine.max_tool_diameter_mm ? `${result.machine.max_tool_diameter_mm} mm` : "制限なし"}</dd>
     <dt>外形寸法</dt><dd>${bbox.x.toFixed(1)} x ${bbox.y.toFixed(1)} x ${bbox.z.toFixed(1)} mm</dd>
     ${volumeRows}
     <dt>エンティティ</dt><dd>${result.analysis.entity_count}</dd>
@@ -1047,13 +1072,25 @@ function bindEvents() {
 
   $("#machineForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    await jsonFetch("/api/machines", {
-      method: "POST",
+    const data = formJson(event.currentTarget);
+    const machineId = data.machine_id;
+    delete data.machine_id;
+    await jsonFetch(machineId ? `/api/machines/${machineId}` : "/api/machines", {
+      method: machineId ? "PUT" : "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(formJson(event.currentTarget)),
+      body: JSON.stringify(data),
     });
-    event.currentTarget.reset();
+    resetMachineForm();
     await loadMaster();
+  });
+
+  $("#machineResetButton")?.addEventListener("click", resetMachineForm);
+
+  $("#machineForm").addEventListener("reset", () => {
+    window.setTimeout(() => {
+      $("#machineSubmitButton").textContent = "追加";
+      $("#machineResetButton")?.classList.add("hidden");
+    });
   });
 
   $("#catalogSearch")?.addEventListener("input", renderCatalogs);
@@ -1065,9 +1102,18 @@ function bindEvents() {
     const toolId = event.target.dataset.deleteTool;
     const conditionId = event.target.dataset.deleteCondition;
     const machineId = event.target.dataset.deleteMachine;
+    const editMachineId = event.target.dataset.editMachine;
+    if (editMachineId) {
+      const machine = state.master.machines.find((item) => String(item.machine_id) === String(editMachineId));
+      fillMachineForm(machine);
+      return;
+    }
     if (toolId) await jsonFetch(`/api/tools/${toolId}`, { method: "DELETE" });
     if (conditionId) await jsonFetch(`/api/conditions/${conditionId}`, { method: "DELETE" });
-    if (machineId) await jsonFetch(`/api/machines/${machineId}`, { method: "DELETE" });
+    if (machineId) {
+      await jsonFetch(`/api/machines/${machineId}`, { method: "DELETE" });
+      if ($("#machineForm")?.elements.machine_id.value === String(machineId)) resetMachineForm();
+    }
     if (toolId || conditionId || machineId) await loadMaster();
   });
 }

@@ -432,7 +432,8 @@ select {
 }
 
 .primary,
-.secondary-link {
+.secondary-link,
+.secondary-button {
   border: 0;
   background: var(--green);
   color: white;
@@ -445,8 +446,19 @@ select {
 }
 
 .primary:hover,
-.secondary-link:hover {
+.secondary-link:hover,
+.secondary-button:hover {
   background: #173d30;
+}
+
+.secondary-button {
+  border: 1px solid #b9c4bd;
+  background: #f6f7f3;
+  color: var(--ink);
+}
+
+.secondary-button:hover {
+  background: #e8eee8;
 }
 
 .compact {
@@ -558,7 +570,7 @@ td {
 
 .inline-form {
   display: grid;
-  grid-template-columns: repeat(7, minmax(110px, 1fr));
+  grid-template-columns: repeat(9, minmax(110px, 1fr));
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -572,6 +584,27 @@ td {
   grid-template-columns: minmax(220px, 1fr) minmax(140px, 220px);
   gap: 10px;
   margin-bottom: 16px;
+}
+
+.tooling-layout {
+  display: grid;
+  gap: 18px;
+}
+
+.section-head {
+  display: grid;
+  grid-template-columns: minmax(160px, auto) minmax(360px, 1fr);
+  gap: 18px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+.section-head h3 {
+  margin-bottom: 0;
+}
+
+.section-head .catalog-toolbar {
+  margin-bottom: 0;
 }
 
 .danger {
@@ -616,7 +649,8 @@ td {
   .analysis-grid,
   .result-grid,
   .settings-panel,
-  .preview-body {
+  .preview-body,
+  .section-head {
     grid-template-columns: 1fr;
   }
 

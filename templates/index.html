@@ -18,8 +18,7 @@
       </div>
       <nav class="tabs" aria-label="画面切替">
         <button class="tab active" data-tab="analyze">解析</button>
-        <button class="tab" data-tab="catalogs">カタログ</button>
-        <button class="tab" data-tab="conditions">切削条件</button>
+        <button class="tab" data-tab="tooling">工具・条件</button>
         <button class="tab" data-tab="machines">機械</button>
         <button class="tab" data-tab="history">履歴</button>
       </nav>
@@ -60,6 +59,13 @@
               </label>
               <label>使用機械
                 <select id="machineSelect" name="machine_id"></select>
+              </label>
+              <label>見積もり安全率
+                <select name="estimate_mode">
+                  <option value="cautious" selected>慎重</option>
+                  <option value="standard">標準</option>
+                  <option value="conservative">保守的</option>
+                </select>
               </label>
               <button class="primary" type="submit">解析実行</button>
             </div>
@@ -146,36 +152,54 @@
         </div>
       </section>
 
-      <section id="tab-conditions" class="view">
+      <section id="tab-tooling" class="view">
         <div class="view-header">
           <div>
-            <p class="eyebrow">計算に使用する条件</p>
-            <h2>切削条件</h2>
+            <p class="eyebrow">計算に使用する工具と条件</p>
+            <h2>工具・切削条件</h2>
           </div>
           <div id="makerConditionCountBadge" class="total-badge muted">0件</div>
         </div>
-        <div class="catalog-toolbar maker-condition-toolbar">
-          <input id="makerConditionSearch" type="search" placeholder="メーカー・シリーズ・型番・被削材で検索">
-          <select id="makerConditionMaterialFilter">
-            <option value="">全被削材</option>
-          </select>
-        </div>
-        <div class="panel">
-          <div class="table-wrap">
-            <table class="condition-table">
-              <thead>
-                <tr>
-                  <th>区分</th><th>メーカー/工具</th><th>シリーズ</th><th>型番系</th><th>外径</th><th>有効長</th>
-                  <th>被削材</th><th>rpm</th><th>送り</th><th>ap</th><th>ae</th><th>出典</th>
-                </tr>
-              </thead>
-              <tbody id="conditionRows"></tbody>
-            </table>
-          </div>
+
+        <div class="tooling-layout">
+          <section class="panel">
+            <h3>工具情報</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>ID</th><th>工具/シリーズ</th><th>種別</th><th>外径</th><th>刃数</th><th>有効長/最大深さ</th><th>操作</th></tr>
+                </thead>
+                <tbody id="toolRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="section-head">
+              <h3>切削条件</h3>
+              <div class="catalog-toolbar maker-condition-toolbar">
+                <input id="makerConditionSearch" type="search" placeholder="メーカー・シリーズ・型番・被削材で検索">
+                <select id="makerConditionMaterialFilter">
+                  <option value="">全被削材</option>
+                </select>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="condition-table">
+                <thead>
+                  <tr>
+                    <th>区分</th><th>メーカー/工具</th><th>シリーズ</th><th>型番系</th><th>外径</th><th>有効長</th>
+                    <th>被削材</th><th>rpm</th><th>送り</th><th>ap</th><th>ae</th><th>出典</th>
+                  </tr>
+                </thead>
+                <tbody id="conditionRows"></tbody>
+              </table>
+            </div>
+          </section>
         </div>
       </section>
 
-      <section id="tab-catalogs" class="view">
+      <section id="tab-catalogs" class="view hidden">
         <div class="view-header">
           <div>
             <p class="eyebrow">公式カタログ参照</p>
@@ -204,15 +228,18 @@
       <section id="tab-machines" class="view">
         <div class="view-header"><h2>機械マスタ管理</h2></div>
         <form id="machineForm" class="inline-form">
+          <input name="machine_id" type="hidden">
           <input name="machine_name" placeholder="機械名" required>
           <input name="axis_count" type="number" placeholder="軸数" value="3" required>
           <input name="rapid_feed_mm_min" type="number" placeholder="早送り" required>
           <input name="atc_time_sec" type="number" placeholder="ATC秒" required>
           <input name="max_spindle_rpm" type="number" placeholder="最大rpm" required>
+          <input name="max_tool_diameter_mm" type="number" placeholder="最大工具径mm" min="0" step="0.1">
           <input name="setup_time_min" type="number" placeholder="段取り分" required>
-          <button type="submit" class="primary compact">追加</button>
+          <button id="machineSubmitButton" type="submit" class="primary compact">追加</button>
+          <button id="machineResetButton" type="button" class="secondary-button compact hidden">新規入力</button>
         </form>
-        <div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>機械</th><th>軸</th><th>早送り</th><th>ATC</th><th>最大rpm</th><th>段取り</th><th></th></tr></thead><tbody id="machineRows"></tbody></table></div></div>
+        <div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>機械</th><th>軸</th><th>早送り</th><th>ATC</th><th>最大rpm</th><th>最大工具径</th><th>段取り</th><th></th></tr></thead><tbody id="machineRows"></tbody></table></div></div>
       </section>
 
       <section id="tab-history" class="view">

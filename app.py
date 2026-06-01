@@ -104,6 +104,7 @@ def init_db() -> None:
                 rapid_feed_mm_min REAL NOT NULL,
                 atc_time_sec INTEGER NOT NULL,
                 max_spindle_rpm INTEGER NOT NULL,
+                max_tool_diameter_mm REAL,
                 setup_time_min INTEGER NOT NULL,
                 memo TEXT
             );
@@ -162,25 +163,37 @@ def init_db() -> None:
             );
             """
         )
-        if conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0] == 0:
-            seed_master(conn)
+        ensure_schema(conn)
         seed_union_tool_catalogs(conn)
         seed_osg_catalogs(conn)
         seed_union_tool_cutting_conditions(conn)
+        ensure_catalog_tool_master(conn)
         ensure_operational_master(conn)
     cleanup_old_uploads()
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    machine_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(machines)").fetchall()
+    }
+    if "max_tool_diameter_mm" not in machine_columns:
+        conn.execute("ALTER TABLE machines ADD COLUMN max_tool_diameter_mm REAL")
 
 
 DEFAULT_TOOLS = [
         ("φ16 フラットEM", "EM", 16, 4, 40, "アルミ/鉄/SUS", 1, 1, "側面・ポケット荒"),
         ("φ10 フラットEM", "EM", 10, 4, 30, "アルミ/鉄/SUS", 1, 1, "汎用ポケット"),
+        ("φ6 フラットEM", "EM", 6, 4, 24, "アルミ/鉄/SUS", 1, 1, "小型機・小径ポケット"),
         ("φ6 ドリル", "DRILL", 6, 2, 45, "アルミ/鉄/SUS", 1, 0, "小径穴"),
+        ("φ8 ドリル", "DRILL", 8, 2, 55, "アルミ/鉄/SUS", 1, 0, "中径穴"),
+        ("φ10 ドリル", "DRILL", 10, 2, 65, "アルミ/鉄/SUS", 1, 0, "中径穴"),
         ("M6 タップ", "TAP", 6, 3, 25, "アルミ/鉄/SUS", 0, 1, "ねじ穴概算"),
     ]
 
 DEFAULT_MACHINES = [
-    ("標準 3軸MC", 3, 15000, 8, 12000, 30, "概算用デフォルト"),
-    ("高速 5軸MC", 5, 30000, 5, 20000, 45, "5軸案件の概算"),
+    ("標準 3軸MC", 3, 15000, 8, 12000, 16, 30, "概算用デフォルト"),
+    ("高速 5軸MC", 5, 30000, 5, 20000, 20, 45, "5軸案件の概算"),
 ]
 
 
@@ -210,19 +223,21 @@ def seed_default_machines(conn: sqlite3.Connection) -> None:
     conn.executemany(
         """
         INSERT INTO machines
-        (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec, max_spindle_rpm, setup_time_min, memo)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec, max_spindle_rpm, max_tool_diameter_mm, setup_time_min, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         rows,
     )
 
 
-def seed_default_conditions_for_tools(conn: sqlite3.Connection) -> None:
+def seed_default_conditions_for_tools(conn: sqlite3.Connection, tool_ids: set[int] | None = None) -> None:
     condition_rows = []
     material_factor = {"アルミ": 1.8, "鉄": 1.0, "SUS": 0.55}
     for tool_id, tool_name, tool_type, diameter, *_ in conn.execute(
         "SELECT tool_id, tool_name, tool_type, diameter_mm FROM tools"
     ).fetchall():
+        if tool_ids is not None and int(tool_id) not in tool_ids:
+            continue
         for material, factor in material_factor.items():
             if conn.execute(
                 """
@@ -272,27 +287,7 @@ def seed_default_conditions_for_tools(conn: sqlite3.Connection) -> None:
 
 def ensure_operational_master(conn: sqlite3.Connection) -> None:
     remove_deprecated_default_tools(conn)
-    if conn.execute("SELECT COUNT(*) FROM tools").fetchone()[0] == 0:
-        seed_master(conn)
-        return
-
-    existing_tool_types = {
-        row["tool_type"]
-        for row in conn.execute("SELECT DISTINCT tool_type FROM tools").fetchall()
-    }
-    missing_tools = [row for row in DEFAULT_TOOLS if row[1] not in existing_tool_types]
-    if missing_tools:
-        conn.executemany(
-            """
-            INSERT INTO tools
-            (tool_name, tool_type, diameter_mm, flute_count, max_depth_mm, material, roughing, finishing, memo)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            missing_tools,
-        )
-
     seed_default_machines(conn)
-    seed_default_conditions_for_tools(conn)
 
 
 def remove_deprecated_default_tools(conn: sqlite3.Connection) -> None:
@@ -307,6 +302,36 @@ def remove_deprecated_default_tools(conn: sqlite3.Connection) -> None:
     for row in rows:
         conn.execute("DELETE FROM cutting_conditions WHERE tool_id = ?", (row["tool_id"],))
         conn.execute("DELETE FROM tools WHERE tool_id = ?", (row["tool_id"],))
+
+
+def purge_non_catalog_tooling(conn: sqlite3.Connection) -> dict[str, int]:
+    non_catalog_tools = conn.execute(
+        """
+        SELECT tool_id
+        FROM tools
+        WHERE memo IS NULL
+           OR memo NOT LIKE '%http%'
+        """
+    ).fetchall()
+    tool_ids = [int(row["tool_id"]) for row in non_catalog_tools]
+    if not tool_ids:
+        return {"tools": 0, "conditions": 0}
+
+    placeholders = ",".join("?" for _ in tool_ids)
+    condition_count = conn.execute(
+        f"SELECT COUNT(*) FROM cutting_conditions WHERE tool_id IN ({placeholders})",
+        tool_ids,
+    ).fetchone()[0]
+    conn.execute(
+        f"DELETE FROM cutting_conditions WHERE tool_id IN ({placeholders})",
+        tool_ids,
+    )
+    conn.execute(
+        f"DELETE FROM tools WHERE tool_id IN ({placeholders})",
+        tool_ids,
+    )
+    ensure_catalog_tool_master(conn)
+    return {"tools": len(tool_ids), "conditions": int(condition_count)}
 
 
 UNION_TOOL_SOURCE_URL = "https://www.uniontool.co.jp/catalog/endmill.html"
@@ -796,6 +821,7 @@ class Feature:
     note: str
     cutting_condition: str = ""
     path_plan: str = ""
+    selection_reason: str = ""
 
 
 def fmt_number(value: Any, digits: int = 2) -> str:
@@ -831,6 +857,48 @@ def catalog_condition_summary(condition: sqlite3.Row | None) -> str:
         f'ae {fmt_number(condition["radial_depth_mm"])} mm'
         + (f' / {material}' if material else "")
         + (f' / p.{condition["source_page"]}' if condition["source_page"] else "")
+    )
+
+
+def tool_limit_summary(max_tool_diameter_mm: float | None) -> str:
+    if max_tool_diameter_mm is None or max_tool_diameter_mm <= 0:
+        return "最大工具径制限なし"
+    return f"最大工具径 {fmt_number(max_tool_diameter_mm)} mm 以下"
+
+
+def internal_tool_selection_reason(
+    tool: sqlite3.Row,
+    target_diameter: float | None,
+    max_tool_diameter_mm: float | None,
+    process_hint: str,
+) -> str:
+    target = f"目標径 φ{fmt_number(target_diameter)}" if target_diameter else "最大径候補"
+    depth = f"有効深さ {fmt_number(tool['max_depth_mm'])} mm"
+    return (
+        f"{process_hint}: 社内工具マスタから{target}に近い "
+        f"φ{fmt_number(tool['diameter_mm'])} を選定。{depth}、{tool_limit_summary(max_tool_diameter_mm)}。"
+    )
+
+
+def catalog_tool_selection_reason(
+    condition: sqlite3.Row,
+    target_diameter: float,
+    required_depth: float,
+    max_tool_diameter_mm: float | None,
+    process_hint: str,
+) -> str:
+    material = " ".join(
+        str(condition[key] or "")
+        for key in ("work_material", "hardness")
+        if condition[key]
+    )
+    return (
+        f"{process_hint}: メーカー切削条件から材質候補 {material or '-'}、"
+        f"目標径 φ{fmt_number(target_diameter)}、必要深さ {fmt_number(required_depth)} mm に近い "
+        f"{condition['manufacturer']} {condition['series_code']} "
+        f"φ{fmt_number(condition['outside_diameter_mm'])} "
+        f"有効長 {fmt_number(condition['effective_length_mm'])} mm を選定。"
+        f"{tool_limit_summary(max_tool_diameter_mm)}、出典 p.{condition['source_page'] or '-'}。"
     )
 
 
@@ -889,13 +957,127 @@ def path_plan_summary(
     if extra:
         parts.append(extra)
     return " / ".join(parts)
-    return (
-        f'rpm {int(condition["spindle_rpm"]):,} / '
-        f'F {fmt_number(condition["feed_rate_mm_min"])} mm/min / '
-        f'ap {fmt_number(condition["axial_depth_mm"])} mm / '
-        f'ae {fmt_number(condition["radial_depth_mm"])} mm'
-        + (f' / {material}' if material else "")
-        + (f' / p.{condition["source_page"]}' if condition["source_page"] else "")
+
+
+def significant_volume_threshold(bbox: dict[str, float]) -> float:
+    return max(100.0, float(bbox["x"]) * float(bbox["y"]) * 0.01)
+
+
+def roughing_width_for_plan(width_mm: float, tool_diameter_mm: float, ratio: float = 0.35) -> float:
+    diameter = max(0.1, float(tool_diameter_mm))
+    planned = max(float(width_mm), diameter * ratio, 0.5)
+    return min(planned, diameter * 0.8)
+
+
+def axial_depth_for_plan(depth_mm: float, tool_diameter_mm: float, required_depth_mm: float, ratio: float = 1.0) -> float:
+    required = max(0.5, float(required_depth_mm))
+    diameter = max(0.1, float(tool_diameter_mm))
+    planned = max(float(depth_mm), min(required, diameter * ratio), 0.5)
+    return min(planned, required)
+
+
+def feature_tool_change_names(feature: Feature) -> list[str]:
+    if feature.process_type == "補正" or feature.tool_name == "補正":
+        return []
+    return [name.strip() for name in feature.tool_name.split(" + ") if name.strip()]
+
+
+SAFETY_PROFILES = {
+    "standard": {
+        "label": "標準",
+        "roughing": 0.12,
+        "finishing": 0.25,
+        "hole": 0.08,
+        "small_tool": 0.08,
+        "positioning_sec_per_feature": 18,
+        "direction_setup_sec": 0,
+    },
+    "cautious": {
+        "label": "慎重",
+        "roughing": 0.32,
+        "finishing": 0.65,
+        "hole": 0.18,
+        "small_tool": 0.18,
+        "positioning_sec_per_feature": 40,
+        "direction_setup_sec": 12 * 60,
+    },
+    "conservative": {
+        "label": "保守的",
+        "roughing": 0.60,
+        "finishing": 1.05,
+        "hole": 0.32,
+        "small_tool": 0.32,
+        "positioning_sec_per_feature": 70,
+        "direction_setup_sec": 25 * 60,
+    },
+}
+
+
+def tool_diameter_from_name(tool_name: str) -> float | None:
+    matches = re.findall(r"φ\s*([0-9]+(?:\.[0-9]+)?)", tool_name)
+    if not matches:
+        return None
+    return min(float(value) for value in matches)
+
+
+def safety_allowance_feature(
+    features: list[Feature],
+    estimate_mode: str,
+    machining_features: dict[str, Any],
+    max_tool_diameter_mm: float | None,
+) -> Feature | None:
+    profile = SAFETY_PROFILES.get(estimate_mode, SAFETY_PROFILES["cautious"])
+    roughing_sec = sum(feature.machining_sec for feature in features if "荒取り" in feature.feature_type)
+    finishing_sec = sum(
+        feature.machining_sec
+        for feature in features
+        if "仕上げ" in feature.feature_type or "面取り" in feature.feature_type
+    )
+    hole_sec = sum(feature.machining_sec for feature in features if "穴" in feature.feature_type)
+    small_tool_sec = 0.0
+    for feature in features:
+        diameter = tool_diameter_from_name(feature.tool_name)
+        if diameter is not None and diameter <= 6.0:
+            small_tool_sec += feature.machining_sec
+
+    side_hole_count = sum(int(group.get("count", 0)) for group in machining_features.get("side_holes") or [])
+    direction_setup_sec = float(profile["direction_setup_sec"]) if side_hole_count else 0.0
+    if max_tool_diameter_mm is not None and max_tool_diameter_mm <= 6.0:
+        direction_setup_sec += 10 * 60
+
+    correction_sec = (
+        roughing_sec * float(profile["roughing"])
+        + finishing_sec * float(profile["finishing"])
+        + hole_sec * float(profile["hole"])
+        + small_tool_sec * float(profile["small_tool"])
+        + len(features) * float(profile["positioning_sec_per_feature"])
+        + direction_setup_sec
+    )
+    if correction_sec <= 0:
+        return None
+
+    detail = (
+        f'荒取り {int(float(profile["roughing"]) * 100)}% / '
+        f'仕上げ {int(float(profile["finishing"]) * 100)}% / '
+        f'穴 {int(float(profile["hole"]) * 100)}% / '
+        f'小径工具 {int(float(profile["small_tool"]) * 100)}% / '
+        f'位置決め {fmt_number(profile["positioning_sec_per_feature"])}秒x{len(features)}'
+    )
+    if direction_setup_sec:
+        detail += f" / 段取り方向補正 {fmt_number(direction_setup_sec / 60, 1)}分"
+
+    return Feature(
+        "見積安全補正",
+        f'{profile["label"]}モード / 追加 {seconds_label(correction_sec)}',
+        1,
+        None,
+        "補正",
+        "補正",
+        correction_sec,
+        "CAM未生成、エアカット、測定、位置決め、びびり回避を考慮した安全側補正",
+        "-",
+        detail,
+        "工具選定ではなく、CAM未生成・段取り・測定・干渉確認などの安全側補正です。",
     )
 
 
@@ -953,7 +1135,15 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
         return None
 
     try:
-        shape = cq.importers.importStep(str(path)).val()
+        imported = cq.importers.importStep(str(path))
+        candidates = list(getattr(imported, "objects", []) or [])
+        try:
+            candidates.append(imported.val())
+        except Exception:
+            pass
+        shape = next((item for item in candidates if hasattr(item, "BoundingBox") and hasattr(item, "Faces")), None)
+        if shape is None:
+            raise RuntimeError("B-Repソリッドを取得できませんでした")
         bbox = shape.BoundingBox()
         bounds = {
             "xmin": float(bbox.xmin),
@@ -971,6 +1161,10 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
         stock_y = max(1.0, raw_y + blank_allowance_mm * 2)
         stock_z = max(1.0, raw_z + blank_allowance_mm * 2)
         stock_volume = stock_x * stock_y * stock_z
+        raw_box_volume = max(0.0, raw_x * raw_y * raw_z)
+        total_removal_volume = max(0.0, stock_volume - part_volume)
+        outer_allowance_volume = max(0.0, stock_volume - raw_box_volume)
+        internal_removal_volume = max(0.0, total_removal_volume - outer_allowance_volume)
 
         faces = shape.Faces()
         cylindrical_faces: list[dict[str, Any]] = []
@@ -1010,7 +1204,7 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             cylindrical_faces,
             bounds,
             {"x": raw_x, "y": raw_y, "z": raw_z},
-            max(0.0, stock_volume - part_volume),
+            internal_removal_volume,
             face_type_counts,
         )
 
@@ -1027,7 +1221,9 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             "raw_bounds": bounds,
             "part_volume_mm3": part_volume,
             "stock_volume_mm3": stock_volume,
-            "removal_volume_mm3": max(0.0, stock_volume - part_volume),
+            "removal_volume_mm3": total_removal_volume,
+            "outer_allowance_volume_mm3": outer_allowance_volume,
+            "internal_removal_volume_mm3": internal_removal_volume,
             "cylindrical_radii": [item["radius"] for item in cylindrical_faces if 1.0 <= item["radius"] <= 20.0],
             "cylindrical_faces": cylindrical_faces[:300],
             "hole_groups": machining_features["holes"],
@@ -1252,12 +1448,22 @@ def classify_brep_machining_features(
     }
 
 
-def pick_tool(conn: sqlite3.Connection, tool_type: str, target_diameter: float | None = None) -> sqlite3.Row:
+def pick_tool(
+    conn: sqlite3.Connection,
+    tool_type: str,
+    target_diameter: float | None = None,
+    max_tool_diameter_mm: float | None = None,
+) -> sqlite3.Row:
     rows = conn.execute("SELECT * FROM tools WHERE tool_type = ? ORDER BY diameter_mm", (tool_type,)).fetchall()
+    if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
+        rows = [row for row in rows if float(row["diameter_mm"]) <= max_tool_diameter_mm]
     if not rows:
         rows = conn.execute("SELECT * FROM tools ORDER BY diameter_mm").fetchall()
+        if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
+            rows = [row for row in rows if float(row["diameter_mm"]) <= max_tool_diameter_mm]
     if not rows:
-        raise RuntimeError("工具マスタが未登録です。")
+        limit = f"（最大工具径 {max_tool_diameter_mm:g} mm 以下）" if max_tool_diameter_mm else ""
+        raise RuntimeError(f"使用可能な工具マスタが未登録です{limit}。")
     if target_diameter is None:
         return rows[-1]
     return min(rows, key=lambda row: abs(float(row["diameter_mm"]) - target_diameter))
@@ -1374,7 +1580,7 @@ def material_keywords(material_type: str) -> list[str]:
         return ["A5052", "A7075", "ALUMINUM", "ALUMINIUM", "ALLOYS", "アルミ"]
     if "銅" in material_type or "COPPER" in text:
         return ["COPPER", "C1100", "銅"]
-    return ["S50C", "S45C", "SCM", "SKD", "STAVAX", "NAK", "HAP", "STEEL", "鋼", "FC"]
+    return ["S50C", "S45C", "SCM", "SS400", "CARBON STEEL", "ALLOY STEEL", "鋼", "FC"]
 
 
 def auto_manufacturer_condition_for(
@@ -1383,8 +1589,11 @@ def auto_manufacturer_condition_for(
     target_diameter: float,
     required_depth: float,
     process_hint: str,
+    max_tool_diameter_mm: float | None = None,
 ) -> sqlite3.Row | None:
     rows = conn.execute("SELECT * FROM manufacturer_cutting_conditions").fetchall()
+    if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
+        rows = [row for row in rows if float(row["outside_diameter_mm"]) <= max_tool_diameter_mm]
     if not rows:
         return None
 
@@ -1400,6 +1609,12 @@ def auto_manufacturer_condition_for(
 
         if any(keyword.upper() in searchable for keyword in keywords):
             value += 1000
+        if material_type in {"鉄", "鋼"} and any(
+            word in searchable for word in ("HARDENED", "HRC", "SKD", "STAVAX", "NAK", "HAP")
+        ):
+            value -= 420
+        if material_type in {"鉄", "鋼"} and "STAINLESS" in searchable:
+            value -= 520
         if "ポケット" in process_hint or "POCKET" in process_text:
             if any(word in searchable for word in ("POCKET", "TROCHOIDAL", "SLOTTING", "SIDE")):
                 value += 120
@@ -1436,6 +1651,7 @@ def estimate(
     blank_allowance_mm: float,
     machine_id: int,
     use_manufacturer_conditions: bool = True,
+    estimate_mode: str = "cautious",
 ) -> dict[str, Any]:
     analysis = parse_step_file(path, blank_allowance_mm)
     bbox = analysis["bbox"]
@@ -1450,11 +1666,13 @@ def estimate(
         if machine is None:
             raise RuntimeError("機械マスタが未登録です")
         rapid_feed = float(machine["rapid_feed_mm_min"])
+        max_tool_diameter = float(machine["max_tool_diameter_mm"]) if machine["max_tool_diameter_mm"] else None
 
         features: list[Feature] = []
 
-        face_tool = pick_tool(conn, "EM", 16)
+        face_tool = pick_tool(conn, "EM", 16, max_tool_diameter)
         face_cond = condition_for(conn, face_tool["tool_id"], material_type, "ポケット")
+        face_selection_reason = internal_tool_selection_reason(face_tool, 16, max_tool_diameter, "上面加工")
         top_area = bbox["x"] * bbox["y"]
         face_diameter = float(face_tool["diameter_mm"])
         face_feed, _face_ap, face_ae = condition_params(
@@ -1463,7 +1681,7 @@ def estimate(
             fallback_ap=1.0,
             fallback_ae=max(1.0, face_diameter * 0.45),
         )
-        face_pick = max(1.0, face_diameter * 0.45)
+        face_pick = roughing_width_for_plan(face_ae, face_diameter, ratio=0.45)
         face_passes = max(1, math.ceil(bbox["y"] / face_pick))
         top_cutting_length = (bbox["x"] + face_diameter) * face_passes
         top_sec = path_time_sec(top_cutting_length, face_feed, approach_count=face_passes * 2, rapid_feed_mm_min=rapid_feed)
@@ -1479,20 +1697,22 @@ def estimate(
                 "上面をエンドミル面走査として概算",
                 master_condition_summary(face_cond),
                 path_plan_summary(top_cutting_length, face_passes, face_passes * 2, method="面走査"),
+                face_selection_reason,
             )
         )
 
-        side_tool = pick_tool(conn, "EM", 16)
+        side_tool = pick_tool(conn, "EM", 16, max_tool_diameter)
         side_cond = condition_for(conn, side_tool["tool_id"], material_type, "ポケット")
         side_catalog_cond = None
+        side_target_diameter = 6.0 if min(bbox["x"], bbox["y"]) >= 40 or bbox["z"] >= 12 else 3.0
         if use_manufacturer_conditions:
-            side_target_diameter = 6.0 if min(bbox["x"], bbox["y"]) >= 40 or bbox["z"] >= 12 else 3.0
             side_catalog_cond = auto_manufacturer_condition_for(
                 conn,
                 material_type,
                 side_target_diameter,
                 bbox["z"],
                 "側面",
+                max_tool_diameter,
             )
         side_area = 2 * (bbox["x"] + bbox["y"]) * bbox["z"]
         if side_catalog_cond is not None:
@@ -1510,6 +1730,13 @@ def estimate(
             )
             side_condition_text = catalog_condition_summary(side_catalog_cond)
             side_tool_id = None
+            side_selection_reason = catalog_tool_selection_reason(
+                side_catalog_cond,
+                side_target_diameter,
+                bbox["z"],
+                max_tool_diameter,
+                "側面加工",
+            )
         else:
             side_diameter = float(side_tool["diameter_mm"])
             side_feed, side_ap, side_ae = condition_params(side_cond, fallback_ae=max(1.0, side_diameter * 0.35))
@@ -1518,10 +1745,13 @@ def estimate(
             side_note = "外周側面として概算"
             side_condition_text = master_condition_summary(side_cond)
             side_tool_id = side_tool["tool_id"]
+            side_selection_reason = internal_tool_selection_reason(side_tool, 16, max_tool_diameter, "側面加工")
         side_perimeter = 2 * (bbox["x"] + bbox["y"])
-        side_axial_passes = max(1, math.ceil(bbox["z"] / max(0.001, side_ap)))
-        side_radial_stock = max(blank_allowance_mm, side_pick)
-        side_radial_passes = max(1, math.ceil(side_radial_stock / max(0.001, side_pick)))
+        side_plan_ap = axial_depth_for_plan(side_ap, side_diameter, bbox["z"], ratio=1.0)
+        side_plan_pick = roughing_width_for_plan(side_pick, side_diameter, ratio=0.22)
+        side_axial_passes = max(1, math.ceil(bbox["z"] / max(0.001, side_plan_ap)))
+        side_radial_stock = max(blank_allowance_mm, side_plan_pick)
+        side_radial_passes = max(1, math.ceil(side_radial_stock / max(0.001, side_plan_pick)))
         side_passes = side_axial_passes * side_radial_passes
         side_cutting_length = side_perimeter * side_passes
         side_sec = path_time_sec(
@@ -1549,6 +1779,7 @@ def estimate(
                     method="外周輪郭",
                     extra=f"Z {side_axial_passes}段 x 径 {side_radial_passes}回",
                 ),
+                side_selection_reason,
             )
         )
 
@@ -1578,8 +1809,9 @@ def estimate(
         for group in hole_groups:
             diameter = float(group["diameter"])
             count = int(group["count"])
-            drill = pick_tool(conn, "DRILL", diameter)
+            drill = pick_tool(conn, "DRILL", diameter, max_tool_diameter)
             cond = condition_for(conn, drill["tool_id"], material_type, "穴")
+            drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "穴加工")
             depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75))))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
             peck_passes = max(1, math.ceil(depth / max(diameter * 3.0, 1.0)))
@@ -1610,14 +1842,16 @@ def estimate(
                         method="ドリル送り",
                         extra=f"{count}穴",
                     ),
+                    drill_selection_reason,
                 )
             )
 
         for group in machining_features.get("side_holes") or []:
             diameter = float(group["diameter"])
             count = int(group["count"])
-            drill = pick_tool(conn, "DRILL", diameter)
+            drill = pick_tool(conn, "DRILL", diameter, max_tool_diameter)
             cond = condition_for(conn, drill["tool_id"], material_type, "穴")
+            drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "横穴加工")
             depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["x"] * 0.5))))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
             peck_passes = max(1, math.ceil(depth / max(diameter * 3.0, 1.0)))
@@ -1648,6 +1882,7 @@ def estimate(
                         method="横穴ドリル送り",
                         extra=f"{count}穴",
                     ),
+                    drill_selection_reason,
                 )
             )
 
@@ -1655,10 +1890,15 @@ def estimate(
             through_diameter = float(group["through_diameter"])
             counterbore_diameter = float(group["counterbore_diameter"])
             count = int(group["count"])
-            drill = pick_tool(conn, "DRILL", through_diameter)
-            counterbore_tool = pick_tool(conn, "EM", counterbore_diameter)
+            drill = pick_tool(conn, "DRILL", through_diameter, max_tool_diameter)
+            counterbore_tool = pick_tool(conn, "EM", counterbore_diameter, max_tool_diameter)
             drill_cond = condition_for(conn, drill["tool_id"], material_type, "穴")
             counterbore_cond = condition_for(conn, counterbore_tool["tool_id"], material_type, "ポケット")
+            counterbore_selection_reason = (
+                internal_tool_selection_reason(drill, through_diameter, max_tool_diameter, "座ぐり下穴")
+                + " / "
+                + internal_tool_selection_reason(counterbore_tool, counterbore_diameter, max_tool_diameter, "座ぐり加工")
+            )
             through_depth = min(
                 float(drill["max_depth_mm"]),
                 max(3.0, float(group.get("through_depth", group.get("avg_depth", bbox["z"] * 0.75)))),
@@ -1666,6 +1906,9 @@ def estimate(
             counterbore_depth = max(0.5, float(group.get("counterbore_depth", group.get("avg_depth", 2.0))))
             drill_feed, _drill_ap, _drill_ae = condition_params(drill_cond)
             counterbore_feed, counterbore_ap, counterbore_ae = condition_params(counterbore_cond)
+            counterbore_tool_diameter = float(counterbore_tool["diameter_mm"])
+            counterbore_plan_ap = axial_depth_for_plan(counterbore_ap, counterbore_tool_diameter, counterbore_depth, ratio=0.7)
+            counterbore_plan_ae = roughing_width_for_plan(counterbore_ae, counterbore_tool_diameter, ratio=0.22)
             drill_pecks = max(1, math.ceil(through_depth / max(through_diameter * 3.0, 1.0)))
             drill_cutting_length = through_depth * count * (1.0 + 0.18 * max(0, drill_pecks - 1))
             drill_sec = path_time_sec(
@@ -1677,9 +1920,9 @@ def estimate(
                 efficiency=0.9,
             )
             counterbore_volume = math.pi * (counterbore_diameter / 2) ** 2 * counterbore_depth * count
-            counterbore_depth_passes = max(1, math.ceil(counterbore_depth / max(0.001, counterbore_ap)))
+            counterbore_depth_passes = max(1, math.ceil(counterbore_depth / max(0.001, counterbore_plan_ap)))
             counterbore_radial_width = max(0.0, (counterbore_diameter - through_diameter) / 2)
-            counterbore_radial_passes = max(1, math.ceil(counterbore_radial_width / max(0.001, counterbore_ae)))
+            counterbore_radial_passes = max(1, math.ceil(counterbore_radial_width / max(0.001, counterbore_plan_ae)))
             counterbore_passes = counterbore_depth_passes * counterbore_radial_passes
             counterbore_cutting_length = math.pi * counterbore_diameter * counterbore_passes * count
             counterbore_sec = path_time_sec(
@@ -1711,6 +1954,7 @@ def estimate(
                         method="ドリル+円弧補間",
                         extra=f"{count}か所",
                     ),
+                    counterbore_selection_reason,
                 )
             )
 
@@ -1719,17 +1963,18 @@ def estimate(
             length = float(group["length"])
             count = int(group["count"])
             depth = max(0.5, float(group.get("avg_depth", bbox["z"] * 0.25)))
-            slot_tool = pick_tool(conn, "EM", width)
+            slot_tool = pick_tool(conn, "EM", width, max_tool_diameter)
             slot_cond = condition_for(conn, slot_tool["tool_id"], material_type, "ポケット")
             slot_catalog_cond = None
             if use_manufacturer_conditions:
-                slot_catalog_cond = auto_manufacturer_condition_for(conn, material_type, width, depth, "ポケット")
+                slot_catalog_cond = auto_manufacturer_condition_for(conn, material_type, width, depth, "ポケット", max_tool_diameter)
             volume = float(group.get("total_volume", max(0.0, length * width * depth * count)))
             if slot_catalog_cond is not None:
+                slot_diameter = float(slot_catalog_cond["outside_diameter_mm"])
                 slot_feed, slot_ap, slot_ae = condition_params(slot_catalog_cond, catalog=True)
                 slot_tool_name = (
                     f'{slot_catalog_cond["manufacturer"]} {slot_catalog_cond["series_code"]} '
-                    f'φ{float(slot_catalog_cond["outside_diameter_mm"]):g} '
+                    f'φ{slot_diameter:g} '
                     f'{slot_catalog_cond["corner_radius_label"]}'
                 )
                 slot_tool_id = None
@@ -1740,16 +1985,30 @@ def estimate(
                     f'出典 p.{slot_catalog_cond["source_page"]}'
                 )
                 slot_condition_text = catalog_condition_summary(slot_catalog_cond)
+                slot_selection_reason = catalog_tool_selection_reason(
+                    slot_catalog_cond,
+                    width,
+                    depth,
+                    max_tool_diameter,
+                    "溝加工",
+                )
             else:
+                slot_diameter = float(slot_tool["diameter_mm"])
                 slot_feed, slot_ap, slot_ae = condition_params(slot_cond)
                 slot_tool_name = slot_tool["tool_name"]
                 slot_tool_id = slot_tool["tool_id"]
                 slot_note = "B-Rep円筒端部ペアからスロット候補を抽出"
                 slot_condition_text = master_condition_summary(slot_cond)
-            slot_depth_passes = max(1, math.ceil(depth / max(0.001, slot_ap)))
-            slot_radial_passes = max(1, math.ceil(width / max(0.001, slot_ae)))
+                slot_selection_reason = internal_tool_selection_reason(slot_tool, width, max_tool_diameter, "溝加工")
+            slot_plan_ap = axial_depth_for_plan(slot_ap, slot_diameter, depth, ratio=0.8)
+            slot_plan_ae = roughing_width_for_plan(slot_ae, slot_diameter, ratio=0.25)
+            slot_depth_passes = max(1, math.ceil(depth / max(0.001, slot_plan_ap)))
+            slot_radial_passes = max(1, math.ceil(width / max(0.001, slot_plan_ae)))
             slot_passes = slot_depth_passes * slot_radial_passes
-            slot_cutting_length = max(volume / max(0.001, slot_ap * slot_ae), (length + math.pi * width / 2) * slot_passes * count)
+            slot_cutting_length = max(
+                volume / max(0.001, slot_plan_ap * slot_plan_ae),
+                (length + math.pi * width / 2) * slot_passes * count,
+            )
             slot_sec = path_time_sec(
                 slot_cutting_length,
                 slot_feed,
@@ -1776,11 +2035,20 @@ def estimate(
                         method="溝走査",
                         extra=f"Z {slot_depth_passes}段 x 幅 {slot_radial_passes}回",
                     ),
+                    slot_selection_reason,
                 )
             )
 
-        if analysis["face_count"] >= 18:
-            pocket_tool = pick_tool(conn, "EM", 10)
+        if machining_features.get("roughing_volume_mm3") is not None:
+            pocket_volume = max(0.0, float(machining_features["roughing_volume_mm3"]))
+        elif analysis.get("removal_volume_mm3") is not None:
+            pocket_volume = max(0.0, float(analysis["removal_volume_mm3"]))
+        else:
+            complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
+            pocket_volume = bbox["x"] * bbox["y"] * bbox["z"] * complexity
+
+        if analysis["face_count"] >= 18 and pocket_volume > significant_volume_threshold(bbox):
+            pocket_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
             pocket_cond = condition_for(conn, pocket_tool["tool_id"], material_type, "ポケット")
             pocket_catalog_cond = None
             if use_manufacturer_conditions:
@@ -1792,19 +2060,15 @@ def estimate(
                     pocket_target_diameter,
                     pocket_required_depth,
                     "ポケット",
+                    max_tool_diameter,
                 )
-            if machining_features.get("roughing_volume_mm3") is not None:
-                volume = max(0.0, float(machining_features["roughing_volume_mm3"]))
-            elif analysis.get("removal_volume_mm3") is not None:
-                volume = max(0.0, float(analysis["removal_volume_mm3"]))
-            else:
-                complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
-                volume = bbox["x"] * bbox["y"] * bbox["z"] * complexity
+            volume = pocket_volume
             if pocket_catalog_cond is not None:
+                pocket_diameter = float(pocket_catalog_cond["outside_diameter_mm"])
                 pocket_feed, pocket_ap, pocket_ae = condition_params(pocket_catalog_cond, catalog=True)
                 pocket_tool_name = (
                     f'{pocket_catalog_cond["manufacturer"]} {pocket_catalog_cond["series_code"]} '
-                    f'φ{float(pocket_catalog_cond["outside_diameter_mm"]):g} '
+                    f'φ{pocket_diameter:g} '
                     f'{pocket_catalog_cond["corner_radius_label"]}'
                 )
                 pocket_note = (
@@ -1815,17 +2079,27 @@ def estimate(
                 )
                 pocket_condition_text = catalog_condition_summary(pocket_catalog_cond)
                 pocket_tool_id = None
+                pocket_selection_reason = catalog_tool_selection_reason(
+                    pocket_catalog_cond,
+                    pocket_target_diameter,
+                    pocket_required_depth,
+                    max_tool_diameter,
+                    "荒取り・ポケット加工",
+                )
             else:
+                pocket_diameter = float(pocket_tool["diameter_mm"])
                 pocket_feed, pocket_ap, pocket_ae = condition_params(pocket_cond)
                 pocket_tool_name = pocket_tool["tool_name"]
-                pocket_note = "B-Rep体積差から除去量を算出" if analysis.get("brep_available") else "面数からポケット相当の除去量を概算"
+                pocket_note = "B-Rep内部体積差から除去量を算出" if analysis.get("brep_available") else "面数からポケット相当の除去量を概算"
                 pocket_condition_text = master_condition_summary(pocket_cond)
                 pocket_tool_id = pocket_tool["tool_id"]
+                pocket_selection_reason = internal_tool_selection_reason(pocket_tool, 10, max_tool_diameter, "荒取り・ポケット加工")
             pocket_depth = min(bbox["z"], max(1.0, volume / max(1.0, bbox["x"] * bbox["y"])))
-            pocket_depth_passes = max(1, math.ceil(pocket_depth / max(0.001, pocket_ap)))
-            pocket_lane_pitch = max(0.001, pocket_ae)
+            pocket_plan_ap = axial_depth_for_plan(pocket_ap, pocket_diameter, pocket_depth, ratio=0.85)
+            pocket_lane_pitch = roughing_width_for_plan(pocket_ae, pocket_diameter, ratio=0.3)
+            pocket_depth_passes = max(1, math.ceil(pocket_depth / max(0.001, pocket_plan_ap)))
             pocket_lanes = max(1, math.ceil(min(bbox["x"], bbox["y"]) / pocket_lane_pitch))
-            pocket_volume_path = volume / max(0.001, pocket_ap * pocket_ae)
+            pocket_volume_path = volume / max(0.001, pocket_plan_ap * pocket_lane_pitch)
             pocket_scan_path = max(bbox["x"], bbox["y"]) * pocket_lanes * pocket_depth_passes
             pocket_cutting_length = max(pocket_volume_path, pocket_scan_path)
             pocket_passes = pocket_depth_passes * pocket_lanes
@@ -1855,11 +2129,196 @@ def estimate(
                         method="等間隔走査",
                         extra=f"Z {pocket_depth_passes}段 x レーン {pocket_lanes}",
                     ),
+                    pocket_selection_reason,
                 )
             )
 
+        if analysis["face_count"] >= 18:
+            finish_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
+            finish_cond = condition_for(conn, finish_tool["tool_id"], material_type, "ポケット")
+            finish_catalog_cond = None
+            finish_target_diameter = min(10.0, max(3.0, min(bbox["x"], bbox["y"]) * 0.08))
+            finish_required_depth = min(bbox["z"], 10.0)
+            if use_manufacturer_conditions:
+                finish_catalog_cond = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    finish_target_diameter,
+                    finish_required_depth,
+                    "側面",
+                    max_tool_diameter,
+                )
+            if finish_catalog_cond is not None:
+                finish_diameter = float(finish_catalog_cond["outside_diameter_mm"])
+                finish_feed, finish_ap, finish_ae = condition_params(finish_catalog_cond, catalog=True)
+                finish_tool_name = (
+                    f'{finish_catalog_cond["manufacturer"]} {finish_catalog_cond["series_code"]} '
+                    f'φ{finish_diameter:g} {finish_catalog_cond["corner_radius_label"]}'
+                )
+                finish_tool_id = None
+                finish_condition_text = catalog_condition_summary(finish_catalog_cond)
+                finish_selection_reason = catalog_tool_selection_reason(
+                    finish_catalog_cond,
+                    finish_target_diameter,
+                    finish_required_depth,
+                    max_tool_diameter,
+                    "仕上げ加工",
+                )
+            else:
+                finish_diameter = float(finish_tool["diameter_mm"])
+                finish_feed, finish_ap, finish_ae = condition_params(finish_cond)
+                finish_tool_name = finish_tool["tool_name"]
+                finish_tool_id = finish_tool["tool_id"]
+                finish_condition_text = master_condition_summary(finish_cond)
+                finish_selection_reason = internal_tool_selection_reason(finish_tool, 10, max_tool_diameter, "仕上げ加工")
+
+            raw_bbox = analysis.get("raw_bbox") or bbox
+            feature_summary = machining_features if machining_features else {}
+            if feature_summary.get("roughing_volume_mm3") is not None:
+                roughing_volume = float(feature_summary["roughing_volume_mm3"])
+            elif analysis.get("internal_removal_volume_mm3") is not None:
+                roughing_volume = float(analysis["internal_removal_volume_mm3"])
+            else:
+                roughing_volume = float(analysis.get("removal_volume_mm3") or 0.0)
+            estimated_pocket_depth = min(bbox["z"], max(1.0, roughing_volume / max(1.0, bbox["x"] * bbox["y"])))
+            has_internal_finish = (
+                roughing_volume > significant_volume_threshold(bbox)
+                or bool(feature_summary.get("slots"))
+                or bool(feature_summary.get("counterbores"))
+            )
+            estimated_pocket_floor_area = 0.0
+            if has_internal_finish:
+                estimated_pocket_floor_area = min(
+                    bbox["x"] * bbox["y"] * 0.85,
+                    max(bbox["x"] * bbox["y"] * 0.18, roughing_volume / max(1.0, estimated_pocket_depth)),
+                )
+            floor_finish_area = top_area + estimated_pocket_floor_area
+            finish_pitch = max(0.5, min(finish_diameter * 0.25, max(0.5, finish_ae * 0.5)))
+            floor_finish_lanes = max(1, math.ceil(min(bbox["x"], bbox["y"]) / finish_pitch))
+            floor_finish_length = max(floor_finish_area / finish_pitch, max(bbox["x"], bbox["y"]) * floor_finish_lanes)
+            floor_finish_sec = path_time_sec(
+                floor_finish_length,
+                finish_feed,
+                approach_count=floor_finish_lanes * 2,
+                approach_mm=8.0,
+                rapid_feed_mm_min=rapid_feed,
+                efficiency=0.68,
+            )
+            features.append(
+                Feature(
+                    "仕上げ加工（上面・底面）",
+                    f"仕上げ面積 {floor_finish_area:.0f} mm2 / ピッチ {finish_pitch:.2f} mm",
+                    1,
+                    finish_tool_id,
+                    finish_tool_name,
+                    "仕上げ",
+                    floor_finish_sec,
+                    "上面とポケット底面を仕上げ走査として追加" if has_internal_finish else "上面仕上げ走査として追加",
+                    finish_condition_text,
+                    path_plan_summary(
+                        floor_finish_length,
+                        floor_finish_lanes,
+                        floor_finish_lanes * 2,
+                        method="仕上げ面走査",
+                        extra=f"ピッチ {fmt_number(finish_pitch, 2)} mm",
+                    ),
+                    finish_selection_reason,
+                )
+            )
+
+            outer_perimeter = 2 * (float(raw_bbox["x"]) + float(raw_bbox["y"]))
+            internal_perimeter = 0.0
+            if has_internal_finish:
+                internal_perimeter = min(
+                    outer_perimeter * 1.6,
+                    max(outer_perimeter * 0.35, math.sqrt(max(1.0, estimated_pocket_floor_area)) * 4),
+                )
+            wall_finish_perimeter = outer_perimeter + internal_perimeter
+            wall_finish_step = max(1.0, min(finish_ap, 8.0))
+            wall_finish_z_passes = max(1, math.ceil(float(raw_bbox["z"]) / wall_finish_step))
+            wall_finish_length = wall_finish_perimeter * wall_finish_z_passes
+            wall_finish_sec = path_time_sec(
+                wall_finish_length,
+                finish_feed,
+                approach_count=wall_finish_z_passes * 2,
+                approach_mm=10.0,
+                rapid_feed_mm_min=rapid_feed,
+                efficiency=0.72,
+            )
+            features.append(
+                Feature(
+                    "仕上げ加工（側壁・輪郭）",
+                    f"外周+内壁 周長 {wall_finish_perimeter:.1f} mm / 高さ {raw_bbox['z']:.1f} mm",
+                    1,
+                    finish_tool_id,
+                    finish_tool_name,
+                    "仕上げ",
+                    wall_finish_sec,
+                    "外周とポケット内壁の仕上げ輪郭加工を追加" if has_internal_finish else "外周側面の仕上げ輪郭加工を追加",
+                    finish_condition_text,
+                    path_plan_summary(
+                        wall_finish_length,
+                        wall_finish_z_passes,
+                        wall_finish_z_passes * 2,
+                        method="仕上げ輪郭",
+                        extra=f"Z {wall_finish_z_passes}段",
+                    ),
+                    finish_selection_reason,
+                )
+            )
+
+            chamfer_tool = pick_tool(conn, "EM", min(6.0, finish_diameter), max_tool_diameter)
+            chamfer_cond = condition_for(conn, chamfer_tool["tool_id"], material_type, "ポケット")
+            chamfer_selection_reason = internal_tool_selection_reason(
+                chamfer_tool,
+                min(6.0, finish_diameter),
+                max_tool_diameter,
+                "面取り・バリ取り",
+            )
+            chamfer_feed, _chamfer_ap, _chamfer_ae = condition_params(chamfer_cond)
+            hole_chamfer_length = 0.0
+            for group in (feature_summary.get("holes") or []) + (feature_summary.get("side_holes") or []):
+                hole_chamfer_length += math.pi * float(group.get("diameter", 0.0)) * int(group.get("count", 1))
+            for group in feature_summary.get("counterbores") or []:
+                hole_chamfer_length += math.pi * float(group.get("counterbore_diameter", 0.0)) * int(group.get("count", 1))
+            for group in feature_summary.get("slots") or []:
+                hole_chamfer_length += 2 * float(group.get("length", 0.0)) * int(group.get("count", 1))
+            chamfer_length = outer_perimeter + hole_chamfer_length
+            chamfer_sec = path_time_sec(
+                chamfer_length,
+                chamfer_feed * 0.55,
+                approach_count=max(2, math.ceil(chamfer_length / 180.0)),
+                approach_mm=6.0,
+                rapid_feed_mm_min=rapid_feed,
+                efficiency=0.7,
+            )
+            features.append(
+                Feature(
+                    "面取り・バリ取り",
+                    f"推定エッジ長 {chamfer_length:.1f} mm",
+                    1,
+                    chamfer_tool["tool_id"],
+                    chamfer_tool["tool_name"],
+                    "仕上げ",
+                    chamfer_sec,
+                    "外周・穴・座ぐり・スロット周辺の面取り相当を追加",
+                    master_condition_summary(chamfer_cond),
+                    path_plan_summary(
+                        chamfer_length,
+                        max(1, math.ceil(chamfer_length / 180.0)),
+                        max(2, math.ceil(chamfer_length / 180.0)),
+                        method="面取り輪郭",
+                    ),
+                    chamfer_selection_reason,
+                )
+            )
+
+        safety_feature = safety_allowance_feature(features, estimate_mode, machining_features, max_tool_diameter)
+        if safety_feature is not None:
+            features.append(safety_feature)
+
         machining_sec = sum(feature.machining_sec for feature in features)
-        unique_tools = {feature.tool_id if feature.tool_id is not None else feature.tool_name for feature in features}
+        unique_tools = {tool_name for feature in features for tool_name in feature_tool_change_names(feature)}
         tool_change_sec = len(unique_tools) * float(machine["atc_time_sec"])
         setup_sec = float(machine["setup_time_min"]) * 60
         travel_length = (bbox["x"] + bbox["y"] + bbox["z"]) * max(1, len(features))
@@ -1877,6 +2336,8 @@ def estimate(
 
         tool_usage: dict[str, dict[str, Any]] = {}
         for feature in features:
+            if feature.process_type == "補正" or feature.tool_name == "補正":
+                continue
             item = tool_usage.setdefault(
                 feature.tool_name,
                 {"tool_name": feature.tool_name, "usage_count": 0, "machining_sec": 0.0, "cutting_conditions": set()},
@@ -1913,6 +2374,8 @@ def estimate(
                 "total_sec": total_sec,
             },
             "confidence": confidence,
+            "estimate_mode": estimate_mode if estimate_mode in SAFETY_PROFILES else "cautious",
+            "estimate_mode_label": SAFETY_PROFILES.get(estimate_mode, SAFETY_PROFILES["cautious"])["label"],
             "condition_source": "STP形状からメーカー条件を自動選定" if use_manufacturer_conditions else "社内マスタ条件",
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
@@ -2027,6 +2490,7 @@ def api_analyze() -> Response:
     blank_allowance_mm = float(request.form.get("blank_allowance_mm", "5") or 5)
     machine_id = int(request.form.get("machine_id", "1") or 1)
     use_manufacturer_conditions = request.form.get("use_manufacturer_conditions", "on") == "on"
+    estimate_mode = request.form.get("estimate_mode", "cautious")
 
     cleanup_old_uploads()
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
@@ -2040,6 +2504,7 @@ def api_analyze() -> Response:
             blank_allowance_mm,
             machine_id,
             use_manufacturer_conditions=use_manufacturer_conditions,
+            estimate_mode=estimate_mode,
         )
         result["time_label"] = seconds_label(result["breakdown"]["total_sec"])
         return jsonify(result)
@@ -2089,9 +2554,10 @@ def api_history_csv(history_id: int) -> Response:
     writer.writerow(["ファイル名", payload["file_name"]])
     writer.writerow(["材質", payload["material_type"]])
     writer.writerow(["機械", payload["machine"]["machine_name"]])
+    writer.writerow(["見積安全率", payload.get("estimate_mode_label", "-")])
     writer.writerow(["合計時間", seconds_label(payload["breakdown"]["total_sec"])])
     writer.writerow([])
-    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "加工パス", "加工時間秒", "備考"])
+    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "工具選定理由", "加工パス", "加工時間秒", "備考"])
     for feature in payload["features"]:
         writer.writerow(
             [
@@ -2101,6 +2567,7 @@ def api_history_csv(history_id: int) -> Response:
                 feature["tool_name"],
                 feature["process_type"],
                 feature.get("cutting_condition", ""),
+                feature.get("selection_reason", ""),
                 feature.get("path_plan", ""),
                 round(feature["machining_sec"], 2),
                 feature["note"],
@@ -2190,8 +2657,8 @@ def api_create_machine() -> Response:
             """
             INSERT INTO machines
             (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec,
-             max_spindle_rpm, setup_time_min, memo)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+             max_spindle_rpm, max_tool_diameter_mm, setup_time_min, memo)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["machine_name"],
@@ -2199,11 +2666,46 @@ def api_create_machine() -> Response:
                 float(data["rapid_feed_mm_min"]),
                 int(data["atc_time_sec"]),
                 int(data["max_spindle_rpm"]),
+                float(data["max_tool_diameter_mm"]) if data.get("max_tool_diameter_mm") else None,
                 int(data["setup_time_min"]),
                 data.get("memo", ""),
             ),
         )
     return jsonify({"machine_id": cur.lastrowid})
+
+
+@app.put("/api/machines/<int:machine_id>")
+def api_update_machine(machine_id: int) -> Response:
+    data = request.get_json(force=True)
+    with db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE machines
+            SET machine_name = ?,
+                axis_count = ?,
+                rapid_feed_mm_min = ?,
+                atc_time_sec = ?,
+                max_spindle_rpm = ?,
+                max_tool_diameter_mm = ?,
+                setup_time_min = ?,
+                memo = ?
+            WHERE machine_id = ?
+            """,
+            (
+                data["machine_name"],
+                int(data["axis_count"]),
+                float(data["rapid_feed_mm_min"]),
+                int(data["atc_time_sec"]),
+                int(data["max_spindle_rpm"]),
+                float(data["max_tool_diameter_mm"]) if data.get("max_tool_diameter_mm") else None,
+                int(data["setup_time_min"]),
+                data.get("memo", ""),
+                machine_id,
+            ),
+        )
+    if cur.rowcount == 0:
+        return jsonify({"error": "機械マスタが見つかりません。"}), 404
+    return jsonify({"ok": True})
 
 
 @app.delete("/api/machines/<int:machine_id>")
