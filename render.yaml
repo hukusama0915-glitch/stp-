@@ -10,3 +10,5 @@ services:
         value: "1"
       - key: ENABLE_BREP_ANALYSIS
         value: "1"
+      - key: PYTHON_VERSION
+        value: "3.12.10"
