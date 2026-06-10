@@ -27,7 +27,11 @@ function machiningFeatureSummary(features) {
   addCount("穴", features.holes);
   addCount("横穴", features.side_holes);
   addCount("座ぐり", features.counterbores);
+  addCount("皿もみ", features.countersinks);
   addCount("スロット", features.slots);
+  addCount("深穴", features.deep_holes);
+  addCount("面取り", features.chamfers);
+  addCount("小R", features.corner_radii);
   if (Number.isFinite(features.roughing_volume_mm3)) {
     parts.push(`荒取り ${Math.round(features.roughing_volume_mm3).toLocaleString()} mm3`);
   }

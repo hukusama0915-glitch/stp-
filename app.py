@@ -1168,6 +1168,8 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
 
         faces = shape.Faces()
         cylindrical_faces: list[dict[str, Any]] = []
+        conical_faces: list[dict[str, Any]] = []
+        torus_faces: list[dict[str, Any]] = []
         face_type_counts: dict[str, int] = {}
         for face in faces:
             try:
@@ -1175,33 +1177,96 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             except Exception:
                 continue
             face_type_counts[geom_type] = face_type_counts.get(geom_type, 0) + 1
-            if geom_type != "CYLINDER":
-                continue
-            try:
-                cylinder = face._geomAdaptor().Cylinder()
-                radius = float(cylinder.Radius())
-                direction = cylinder.Axis().Direction()
-                axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
-                center = tuple(float(value) for value in face.Center().toTuple())
-                area = float(face.Area())
-            except Exception:
-                continue
-            if radius <= 0:
-                continue
-            estimated_depth = area / max(0.000001, 2 * math.pi * radius)
-            cylindrical_faces.append(
-                {
-                    "radius": radius,
-                    "diameter": radius * 2,
-                    "area": area,
-                    "estimated_depth": estimated_depth,
-                    "axis": axis,
-                    "center": center,
-                }
-            )
+            if geom_type == "CYLINDER":
+                try:
+                    cylinder = face._geomAdaptor().Cylinder()
+                    radius = float(cylinder.Radius())
+                    direction = cylinder.Axis().Direction()
+                    axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
+                    center = tuple(float(value) for value in face.Center().toTuple())
+                    area = float(face.Area())
+                except Exception:
+                    continue
+                if radius <= 0:
+                    continue
+                estimated_depth = area / max(0.000001, 2 * math.pi * radius)
+                cylindrical_faces.append(
+                    {
+                        "radius": radius,
+                        "diameter": radius * 2,
+                        "area": area,
+                        "estimated_depth": estimated_depth,
+                        "axis": axis,
+                        "center": center,
+                    }
+                )
+            elif geom_type == "CONE":
+                try:
+                    cone = face._geomAdaptor().Cone()
+                    direction = cone.Axis().Direction()
+                    axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
+                    center = tuple(float(value) for value in face.Center().toTuple())
+                    area = float(face.Area())
+                    face_bbox = face.BoundingBox()
+                    bbox_lengths = {
+                        "x": float(face_bbox.xlen),
+                        "y": float(face_bbox.ylen),
+                        "z": float(face_bbox.zlen),
+                    }
+                    ref_radius = abs(float(cone.RefRadius()))
+                    semi_angle = abs(float(cone.SemiAngle()))
+                except Exception:
+                    continue
+                axis_name = axis_label(axis)
+                axis_extent = bbox_lengths[axis_name.lower()]
+                radial_extent = max(value for key, value in bbox_lengths.items() if key != axis_name.lower())
+                conical_faces.append(
+                    {
+                        "ref_radius": ref_radius,
+                        "diameter": max(ref_radius * 2, radial_extent),
+                        "area": area,
+                        "depth": axis_extent,
+                        "semi_angle": semi_angle,
+                        "axis": axis,
+                        "axis_label": axis_name,
+                        "center": center,
+                    }
+                )
+            elif geom_type == "TORUS":
+                try:
+                    torus = face._geomAdaptor().Torus()
+                    direction = torus.Axis().Direction()
+                    axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
+                    center = tuple(float(value) for value in face.Center().toTuple())
+                    area = float(face.Area())
+                    face_bbox = face.BoundingBox()
+                    bbox_lengths = {
+                        "x": float(face_bbox.xlen),
+                        "y": float(face_bbox.ylen),
+                        "z": float(face_bbox.zlen),
+                    }
+                    major_radius = float(torus.MajorRadius())
+                    minor_radius = float(torus.MinorRadius())
+                except Exception:
+                    continue
+                if minor_radius <= 0:
+                    continue
+                torus_faces.append(
+                    {
+                        "major_radius": major_radius,
+                        "minor_radius": minor_radius,
+                        "area": area,
+                        "axis": axis,
+                        "axis_label": axis_label(axis),
+                        "center": center,
+                        "bbox": bbox_lengths,
+                    }
+                )
 
         machining_features = classify_brep_machining_features(
             cylindrical_faces,
+            conical_faces,
+            torus_faces,
             bounds,
             {"x": raw_x, "y": raw_y, "z": raw_z},
             internal_removal_volume,
@@ -1226,6 +1291,8 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             "internal_removal_volume_mm3": internal_removal_volume,
             "cylindrical_radii": [item["radius"] for item in cylindrical_faces if 1.0 <= item["radius"] <= 20.0],
             "cylindrical_faces": cylindrical_faces[:300],
+            "conical_faces": conical_faces[:300],
+            "torus_faces": torus_faces[:300],
             "hole_groups": machining_features["holes"],
             "machining_features": machining_features,
         }
@@ -1278,8 +1345,40 @@ def group_feature_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> lis
     return sorted(result, key=lambda item: tuple(item[field] for field in keys))
 
 
+def group_surface_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        key = tuple(row[item] for item in keys)
+        item = grouped.setdefault(
+            key,
+            {
+                **{field: row[field] for field in keys},
+                "count": 0,
+                "total_area": 0.0,
+                "total_length": 0.0,
+                "total_depth": 0.0,
+                "max_depth": 0.0,
+            },
+        )
+        count = int(row.get("count", 1))
+        item["count"] += count
+        item["total_area"] += float(row.get("area", 0.0)) * count
+        item["total_length"] += float(row.get("edge_length", 0.0)) * count
+        depth = float(row.get("depth", row.get("avg_depth", 0.0)))
+        item["total_depth"] += depth * count
+        item["max_depth"] = max(float(item["max_depth"]), depth)
+    result = []
+    for item in grouped.values():
+        count = max(1, int(item["count"]))
+        item["avg_depth"] = float(item["total_depth"]) / count
+        result.append(item)
+    return sorted(result, key=lambda item: tuple(item[field] for field in keys))
+
+
 def classify_brep_machining_features(
     cylindrical_faces: list[dict[str, Any]],
+    conical_faces: list[dict[str, Any]],
+    torus_faces: list[dict[str, Any]],
     bounds: dict[str, float],
     raw_bbox: dict[str, float],
     removal_volume: float,
@@ -1296,7 +1395,14 @@ def classify_brep_machining_features(
             continue
         center = item["center"]
         label = axis_label(item["axis"])
-        row = {**item, "index": index, "axis_label": label, "diameter": diameter, "depth": depth}
+        row = {
+            **item,
+            "index": index,
+            "axis_label": label,
+            "diameter": diameter,
+            "depth": depth,
+            "depth_ratio": depth / max(diameter, 0.1),
+        }
         if label == "Z":
             near_x = min(abs(center[0] - bounds["xmin"]), abs(center[0] - bounds["xmax"])) <= max(diameter, 5.0)
             near_y = min(abs(center[1] - bounds["ymin"]), abs(center[1] - bounds["ymax"])) <= max(diameter, 5.0)
@@ -1337,6 +1443,8 @@ def classify_brep_machining_features(
                 "counterbore_diameter": large["diameter"],
                 "through_depth": small["depth"],
                 "counterbore_depth": large["depth"],
+                "center_x": center_key[0],
+                "center_y": center_key[1],
                 "count": 1,
                 "volume": volume,
             }
@@ -1394,6 +1502,9 @@ def classify_brep_machining_features(
                 "diameter": row["diameter"],
                 "axis": "Z",
                 "depth": row["depth"],
+                "depth_ratio": row["depth_ratio"],
+                "center_x": float(row["center"][0]),
+                "center_y": float(row["center"][1]),
                 "count": 1,
                 "volume": volume,
             }
@@ -1415,21 +1526,102 @@ def classify_brep_machining_features(
                 "diameter": row["diameter"],
                 "axis": row["axis_label"],
                 "depth": 0.0,
+                "depth_ratio": 0.0,
                 "count": 1,
                 "volume": 0.0,
             },
         )
         item["depth"] = max(float(item["depth"]), float(row["depth"]))
+        item["depth_ratio"] = max(float(item["depth_ratio"]), float(row["depth_ratio"]))
         item["volume"] = math.pi * (row["diameter"] / 2) ** 2 * float(item["depth"])
     side_holes = list(side_holes_by_key.values())
+
+    countersinks = []
+    chamfers = []
+    for item in conical_faces:
+        diameter = round(float(item.get("diameter", 0.0)), 1)
+        depth = float(item.get("depth", 0.0))
+        if diameter <= 0 or depth <= 0:
+            continue
+        axis = str(item.get("axis_label") or axis_label(item["axis"]))
+        center = item.get("center", (0.0, 0.0, 0.0))
+        edge_length = math.pi * diameter
+        matched_hole: dict[str, Any] | None = None
+        if axis == "Z" and depth <= max(8.0, raw_bbox["z"] * 0.35):
+            candidates = []
+            for hole in holes:
+                hole_diameter = float(hole["diameter"])
+                if diameter <= hole_diameter * 1.2:
+                    continue
+                distance = math.hypot(float(center[0]) - float(hole["center_x"]), float(center[1]) - float(hole["center_y"]))
+                if distance <= max(hole_diameter * 0.55, 1.5):
+                    candidates.append((distance, hole))
+            if candidates:
+                matched_hole = min(candidates, key=lambda pair: pair[0])[1]
+
+        if matched_hole is not None:
+            hole_diameter = float(matched_hole["diameter"])
+            sink_volume = math.pi * depth / 3.0 * (
+                (diameter / 2) ** 2
+                + (diameter / 2) * (hole_diameter / 2)
+                + (hole_diameter / 2) ** 2
+            )
+            countersinks.append(
+                {
+                    "hole_diameter": round(hole_diameter, 1),
+                    "sink_diameter": diameter,
+                    "axis": axis,
+                    "depth": depth,
+                    "edge_length": edge_length,
+                    "count": 1,
+                    "volume": sink_volume,
+                }
+            )
+        elif depth <= max(6.0, raw_bbox["z"] * 0.25):
+            chamfers.append(
+                {
+                    "axis": axis,
+                    "diameter": diameter,
+                    "depth": depth,
+                    "edge_length": edge_length,
+                    "area": float(item.get("area", 0.0)),
+                    "count": 1,
+                }
+            )
+
+    corner_radii = []
+    for item in torus_faces:
+        radius = round(float(item.get("minor_radius", 0.0)), 2)
+        area = float(item.get("area", 0.0))
+        if not (0.2 <= radius <= 8.0 and area > 0):
+            continue
+        # Most modeled fillets are close to quarter-round faces; this converts surface area
+        # into an approximate contour length that a CAM finishing pass would trace.
+        edge_length = area / max(0.001, (math.pi / 2.0) * radius)
+        corner_radii.append(
+            {
+                "radius": radius,
+                "axis": str(item.get("axis_label") or axis_label(item["axis"])),
+                "area": area,
+                "edge_length": edge_length,
+                "count": 1,
+            }
+        )
 
     hole_groups = group_feature_rows(holes, ("diameter", "axis"))
     side_hole_groups = group_feature_rows(side_holes, ("diameter", "axis"))
     counterbore_groups = group_feature_rows(counterbores, ("through_diameter", "counterbore_diameter"))
+    countersink_groups = group_feature_rows(countersinks, ("hole_diameter", "sink_diameter", "axis"))
     slot_groups = group_feature_rows(slots, ("width", "length"))
+    deep_hole_groups = group_feature_rows(
+        [row for row in holes if float(row.get("depth_ratio", 0.0)) >= 5.0 or float(row.get("depth", 0.0)) >= 30.0],
+        ("diameter", "axis"),
+    )
+    chamfer_groups = group_surface_rows(chamfers, ("axis",))
+    corner_radius_groups = group_surface_rows(corner_radii, ("radius", "axis"))
     classified_volume = sum(
         item.get("total_volume", 0.0)
-        for group in (hole_groups, side_hole_groups, counterbore_groups, slot_groups)
+        for group in (hole_groups, side_hole_groups, counterbore_groups, countersink_groups, slot_groups)
         for item in group
     )
     roughing_volume = max(0.0, removal_volume - classified_volume)
@@ -1439,7 +1631,11 @@ def classify_brep_machining_features(
         "holes": hole_groups,
         "side_holes": side_hole_groups,
         "counterbores": counterbore_groups,
+        "countersinks": countersink_groups,
         "slots": slot_groups,
+        "deep_holes": deep_hole_groups,
+        "chamfers": chamfer_groups,
+        "corner_radii": corner_radius_groups,
         "roughing_volume_mm3": roughing_volume,
         "classified_feature_volume_mm3": classified_volume,
         "finishing_side_area_mm2": finishing_area,
@@ -1814,15 +2010,19 @@ def estimate(
             drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "穴加工")
             depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75))))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
+            depth_ratio = float(group.get("depth_ratio", depth / max(diameter, 0.1)))
+            deep_hole = depth_ratio >= 5.0 or depth >= 30.0
             peck_passes = max(1, math.ceil(depth / max(diameter * 3.0, 1.0)))
-            drill_cutting_length = depth * count * (1.0 + 0.18 * max(0, peck_passes - 1))
+            peck_extra = 0.28 if deep_hole else 0.18
+            approach_count = count * (peck_passes + (2 if deep_hole else 1))
+            drill_cutting_length = depth * count * (1.0 + peck_extra * max(0, peck_passes - 1))
             hole_sec = path_time_sec(
                 drill_cutting_length,
                 drill_feed,
-                approach_count=count * (peck_passes + 1),
+                approach_count=approach_count,
                 approach_mm=min(depth + 5.0, 60.0),
                 rapid_feed_mm_min=rapid_feed,
-                efficiency=0.9,
+                efficiency=0.82 if deep_hole else 0.9,
             )
             features.append(
                 Feature(
@@ -1833,14 +2033,20 @@ def estimate(
                     drill["tool_name"],
                     "穴",
                     hole_sec,
-                    "B-Rep円筒面から穴候補を抽出" if analysis.get("brep_available") else "円筒面から穴候補を抽出",
+                    (
+                        "B-Rep円筒面から深穴候補を抽出し、ペック退避を重めに補正"
+                        if deep_hole and analysis.get("brep_available")
+                        else "B-Rep円筒面から穴候補を抽出"
+                        if analysis.get("brep_available")
+                        else "円筒面から穴候補を抽出"
+                    ),
                     master_condition_summary(cond),
                     path_plan_summary(
                         drill_cutting_length,
                         peck_passes,
-                        count * (peck_passes + 1),
+                        approach_count,
                         method="ドリル送り",
-                        extra=f"{count}穴",
+                        extra=f"{count}穴" + (f" / L/D {depth_ratio:.1f}" if deep_hole else ""),
                     ),
                     drill_selection_reason,
                 )
@@ -1854,15 +2060,19 @@ def estimate(
             drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "横穴加工")
             depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["x"] * 0.5))))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
+            depth_ratio = float(group.get("depth_ratio", depth / max(diameter, 0.1)))
+            deep_hole = depth_ratio >= 5.0 or depth >= 30.0
             peck_passes = max(1, math.ceil(depth / max(diameter * 3.0, 1.0)))
-            side_hole_cutting_length = depth * count * (1.0 + 0.18 * max(0, peck_passes - 1))
+            peck_extra = 0.3 if deep_hole else 0.18
+            approach_count = count * (peck_passes + (2 if deep_hole else 1))
+            side_hole_cutting_length = depth * count * (1.0 + peck_extra * max(0, peck_passes - 1))
             side_hole_sec = path_time_sec(
                 side_hole_cutting_length,
                 drill_feed,
-                approach_count=count * (peck_passes + 1),
+                approach_count=approach_count,
                 approach_mm=min(depth + 5.0, 80.0),
                 rapid_feed_mm_min=rapid_feed,
-                efficiency=0.88,
+                efficiency=0.8 if deep_hole else 0.88,
             )
             features.append(
                 Feature(
@@ -1873,14 +2083,14 @@ def estimate(
                     drill["tool_name"],
                     "穴",
                     side_hole_sec,
-                    "B-Rep円筒面から側面穴候補を抽出",
+                    "B-Rep円筒面から横深穴候補を抽出し、ペック退避を重めに補正" if deep_hole else "B-Rep円筒面から側面穴候補を抽出",
                     master_condition_summary(cond),
                     path_plan_summary(
                         side_hole_cutting_length,
                         peck_passes,
-                        count * (peck_passes + 1),
+                        approach_count,
                         method="横穴ドリル送り",
-                        extra=f"{count}穴",
+                        extra=f"{count}穴" + (f" / L/D {depth_ratio:.1f}" if deep_hole else ""),
                     ),
                     drill_selection_reason,
                 )
@@ -1955,6 +2165,47 @@ def estimate(
                         extra=f"{count}か所",
                     ),
                     counterbore_selection_reason,
+                )
+            )
+
+        for group in machining_features.get("countersinks") or []:
+            hole_diameter = float(group["hole_diameter"])
+            sink_diameter = float(group["sink_diameter"])
+            count = int(group["count"])
+            sink_depth = max(0.1, float(group.get("avg_depth", 0.8)))
+            chamfer_tool = pick_tool(conn, "EM", min(max(sink_diameter * 0.45, 3.0), 8.0), max_tool_diameter)
+            chamfer_cond = condition_for(conn, chamfer_tool["tool_id"], material_type, "ポケット")
+            chamfer_feed, _chamfer_ap, _chamfer_ae = condition_params(chamfer_cond)
+            cutting_length = max(
+                math.pi * sink_diameter * count,
+                float(group.get("edge_length", math.pi * sink_diameter)) * count,
+            )
+            countersink_sec = path_time_sec(
+                cutting_length,
+                chamfer_feed * 0.45,
+                approach_count=count * 2,
+                approach_mm=min(sink_depth + 4.0, 12.0),
+                rapid_feed_mm_min=rapid_feed,
+                efficiency=0.68,
+            )
+            features.append(
+                Feature(
+                    "皿もみ・穴口面取り",
+                    f"下穴 φ{hole_diameter:.1f} / 皿径 φ{sink_diameter:.1f} / 深さ {sink_depth:.2f} mm",
+                    count,
+                    chamfer_tool["tool_id"],
+                    chamfer_tool["tool_name"],
+                    "仕上げ",
+                    countersink_sec,
+                    "B-Rep円錐面と同芯穴から皿もみ候補を抽出",
+                    master_condition_summary(chamfer_cond),
+                    path_plan_summary(
+                        cutting_length,
+                        count,
+                        count * 2,
+                        method="円錐面取り",
+                    ),
+                    internal_tool_selection_reason(chamfer_tool, sink_diameter, max_tool_diameter, "皿もみ・穴口面取り"),
                 )
             )
 
@@ -2185,6 +2436,7 @@ def estimate(
                 roughing_volume > significant_volume_threshold(bbox)
                 or bool(feature_summary.get("slots"))
                 or bool(feature_summary.get("counterbores"))
+                or bool(feature_summary.get("countersinks"))
             )
             estimated_pocket_floor_area = 0.0
             if has_internal_finish:
@@ -2284,6 +2536,12 @@ def estimate(
             for group in feature_summary.get("slots") or []:
                 hole_chamfer_length += 2 * float(group.get("length", 0.0)) * int(group.get("count", 1))
             chamfer_length = outer_perimeter + hole_chamfer_length
+            recognized_chamfer_length = sum(
+                float(group.get("total_length", 0.0))
+                for group in feature_summary.get("chamfers") or []
+            )
+            if recognized_chamfer_length > 0:
+                chamfer_length = max(chamfer_length, outer_perimeter + recognized_chamfer_length)
             chamfer_sec = path_time_sec(
                 chamfer_length,
                 chamfer_feed * 0.55,
@@ -2312,6 +2570,50 @@ def estimate(
                     chamfer_selection_reason,
                 )
             )
+
+        corner_radius_groups = machining_features.get("corner_radii") or []
+        if corner_radius_groups:
+            total_corner_area = sum(float(group.get("total_area", 0.0)) for group in corner_radius_groups)
+            total_corner_length = sum(float(group.get("total_length", 0.0)) for group in corner_radius_groups)
+            total_corner_count = sum(int(group.get("count", 0)) for group in corner_radius_groups)
+            smallest_radius = min(float(group.get("radius", 0.0)) for group in corner_radius_groups)
+            if total_corner_area > 0 and smallest_radius > 0:
+                corner_tool_target = min(6.0, max(3.0, smallest_radius * 2.0))
+                corner_tool = pick_tool(conn, "EM", corner_tool_target, max_tool_diameter)
+                corner_cond = condition_for(conn, corner_tool["tool_id"], material_type, "ポケット")
+                corner_feed, _corner_ap, corner_ae = condition_params(corner_cond)
+                corner_stepover = max(0.08, min(max(corner_ae * 0.35, smallest_radius * 0.35), 0.6))
+                corner_cutting_length = max(total_corner_length, total_corner_area / corner_stepover)
+                corner_approaches = max(total_corner_count, math.ceil(corner_cutting_length / 120.0))
+                corner_sec = path_time_sec(
+                    corner_cutting_length,
+                    corner_feed * 0.55,
+                    approach_count=corner_approaches,
+                    approach_mm=6.0,
+                    rapid_feed_mm_min=rapid_feed,
+                    efficiency=0.66,
+                )
+                features.append(
+                    Feature(
+                        "小R・フィレット仕上げ",
+                        f"R{smallest_radius:.2f}以上 / 面数 {total_corner_count} / 面積 {total_corner_area:.0f} mm2",
+                        1,
+                        corner_tool["tool_id"],
+                        corner_tool["tool_name"],
+                        "仕上げ",
+                        corner_sec,
+                        "B-Repトーラス面から小R・フィレット仕上げ候補を抽出",
+                        master_condition_summary(corner_cond),
+                        path_plan_summary(
+                            corner_cutting_length,
+                            max(1, total_corner_count),
+                            corner_approaches,
+                            method="小R走査",
+                            extra=f"ピッチ {fmt_number(corner_stepover, 2)} mm",
+                        ),
+                        internal_tool_selection_reason(corner_tool, corner_tool_target, max_tool_diameter, "小R・フィレット仕上げ"),
+                    )
+                )
 
         safety_feature = safety_allowance_feature(features, estimate_mode, machining_features, max_tool_diameter)
         if safety_feature is not None:
