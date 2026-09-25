@@ -5,10 +5,22 @@ const state = {
   previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0, preset: "iso" },
   cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded", toolpathGroup: null, showPaths: true },
   excluded: new Set(),
+  highlightedKey: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+
+// innerHTMLへ差し込む値は必ずエスケープする（ファイル名・機械名などの利用者入力を含むため）
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
+}
+
+function safeUrl(value) {
+  const url = String(value || "");
+  return /^https?:\/\//i.test(url) ? esc(url) : "#";
+}
 
 function secLabel(value) {
   const total = Math.round(Number(value) || 0);
@@ -48,9 +60,22 @@ function toast(message) {
 }
 
 async function jsonFetch(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || "処理に失敗しました。");
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch {
+    throw new Error("サーバーに接続できませんでした。ネットワークを確認してください。");
+  }
+  let data = null;
+  try {
+    data = await response.json();
+  } catch {
+    // HTMLのエラーページなどJSON以外が返った場合
+  }
+  if (!response.ok) {
+    throw new Error(data?.error || `処理に失敗しました（HTTP ${response.status}）。`);
+  }
+  if (data === null) throw new Error("サーバーの応答を読み取れませんでした。");
   return data;
 }
 
@@ -572,12 +597,61 @@ function renderToolpaths(result) {
     const isEdm = edmKeys.has(o.key);
     const color = excluded ? 0x9ca3af : isEdm ? 0xdc2626 : TOOLPATH_COLORS[o.kind] || 0x2563eb;
     for (const object of buildOverlayObjects(o, color, isEdm && !excluded, excluded)) {
+      object.userData.featureKey = o.key;
+      object.userData.baseOpacity = object.material.opacity;
+      object.userData.baseColor = object.material.color.getHex();
       toolpathGroup.add(object);
     }
   }
   cp.toolpathGroup = toolpathGroup;
   toolpathGroup.visible = cp.showPaths;
   cp.group.add(toolpathGroup);
+  applyToolpathHighlight();
+  renderCurrentPreview();
+}
+
+// 選択中フィーチャのパスだけを強調し、他は薄く表示する
+function applyToolpathHighlight() {
+  const group = state.cadPreview.toolpathGroup;
+  const key = state.highlightedKey;
+  if (!group) return false;
+  let matched = false;
+  group.children.forEach((object) => {
+    const isTarget = key !== null && object.userData.featureKey === key;
+    if (isTarget) matched = true;
+    const material = object.material;
+    material.opacity = key === null || isTarget ? object.userData.baseOpacity : 0.12;
+    material.color.setHex(isTarget ? 0xf59e0b : object.userData.baseColor);
+    object.renderOrder = isTarget ? 12 : 10;
+    material.needsUpdate = true;
+  });
+  return matched;
+}
+
+function setHighlightedFeature(key) {
+  state.highlightedKey = state.highlightedKey === key ? null : key;
+  $$("[data-feature-key]").forEach((row) => {
+    row.classList.toggle("feature-selected", row.dataset.featureKey === state.highlightedKey);
+  });
+  const matched = applyToolpathHighlight();
+  if (state.highlightedKey !== null) {
+    if (!state.cadPreview.toolpathGroup) {
+      toast("3Dプレビューが表示されていないため、工具パスを強調できません。");
+    } else if (!matched) {
+      toast("このフィーチャには表示できる工具パスがありません。");
+    } else {
+      if (!state.cadPreview.showPaths) {
+        state.cadPreview.showPaths = true;
+        state.cadPreview.toolpathGroup.visible = true;
+        $("[data-view-toggle='paths']")?.classList.add("active");
+      }
+      const panel = $("#previewPanel");
+      const rect = panel?.getBoundingClientRect();
+      if (rect && (rect.bottom < 80 || rect.top > window.innerHeight - 80)) {
+        panel.scrollIntoView({ behavior: "smooth", block: "center" });
+      }
+    }
+  }
   renderCurrentPreview();
 }
 
@@ -803,7 +877,7 @@ function renderStepPreview(preview) {
     ? `${numberLabel(preview.bbox.x)} x ${numberLabel(preview.bbox.y)} x ${numberLabel(preview.bbox.z)} mm`
     : "取得不可";
   stats.innerHTML = `
-    <dt>ファイル</dt><dd>${preview.fileName}</dd>
+    <dt>ファイル</dt><dd>${esc(preview.fileName)}</dd>
     <dt>サイズ</dt><dd>${(preview.fileSize / 1024).toFixed(1)} KB</dd>
     <dt>外形</dt><dd>${bboxText}</dd>
     <dt>座標点</dt><dd>${preview.points.length}</dd>
@@ -859,11 +933,11 @@ async function loadMaster() {
 
 function renderMaster() {
   $("#machineSelect").innerHTML = state.master.machines
-    .map((m) => `<option value="${m.machine_id}">${m.machine_name}${m.max_tool_diameter_mm ? ` / 最大工具径 ${m.max_tool_diameter_mm}mm` : ""}</option>`)
+    .map((m) => `<option value="${m.machine_id}">${esc(m.machine_name)}${m.max_tool_diameter_mm ? ` / 最大工具径 ${m.max_tool_diameter_mm}mm` : ""}</option>`)
     .join("");
   if ($("#conditionToolSelect")) {
     $("#conditionToolSelect").innerHTML = state.master.tools
-      .map((t) => `<option value="${t.tool_id}">${t.tool_name}</option>`)
+      .map((t) => `<option value="${t.tool_id}">${esc(t.tool_name)}</option>`)
       .join("");
   }
 
@@ -885,8 +959,8 @@ function renderMaster() {
       })),
     ].map((t) => `
       <tr>
-        <td>${t.tool_id}<br><small>${t.source}</small></td><td>${t.tool_name}</td><td>${t.tool_type}</td>
-        <td>${t.diameter_mm}</td><td>${t.flute_count}</td><td>${t.max_depth_mm}</td>
+        <td>${esc(t.tool_id)}<br><small>${t.source}</small></td><td>${esc(t.tool_name)}</td><td>${esc(t.tool_type)}</td>
+        <td>${esc(t.diameter_mm)}</td><td>${esc(t.flute_count)}</td><td>${esc(t.max_depth_mm)}</td>
         <td>${t.source === "社内" ? `<button class="danger" data-delete-tool="${t.tool_id}">削除</button>` : "-"}</td>
       </tr>
     `).join("");
@@ -894,9 +968,9 @@ function renderMaster() {
 
   $("#machineRows").innerHTML = state.master.machines.map((m) => `
     <tr>
-      <td>${m.machine_id}</td><td>${m.machine_name}</td><td>${m.axis_count}</td>
-      <td>${m.rapid_feed_mm_min}</td><td>${m.atc_time_sec}</td><td>${m.max_spindle_rpm}</td>
-      <td>${m.max_tool_diameter_mm ? `${m.max_tool_diameter_mm} mm` : "制限なし"}</td><td>${m.setup_time_min}</td>
+      <td>${m.machine_id}</td><td>${esc(m.machine_name)}</td><td>${esc(m.axis_count)}</td>
+      <td>${esc(m.rapid_feed_mm_min)}</td><td>${esc(m.atc_time_sec)}</td><td>${esc(m.max_spindle_rpm)}</td>
+      <td>${m.max_tool_diameter_mm ? `${esc(m.max_tool_diameter_mm)} mm` : "制限なし"}</td><td>${esc(m.setup_time_min)}</td>
       <td>
         <button class="secondary-button compact" data-edit-machine="${m.machine_id}">編集</button>
         <button class="danger compact" data-delete-machine="${m.machine_id}">削除</button>
@@ -915,7 +989,7 @@ function renderCatalogTypeFilter() {
   if (!select) return;
   const current = select.value;
   const types = Array.from(new Set(state.master.manufacturer_catalogs.map((item) => item.tool_type).filter(Boolean))).sort();
-  select.innerHTML = `<option value="">全種別</option>${types.map((type) => `<option value="${type}">${type}</option>`).join("")}`;
+  select.innerHTML = `<option value="">全種別</option>${types.map((type) => `<option value="${esc(type)}">${esc(type)}</option>`).join("")}`;
   select.value = types.includes(current) ? current : "";
 }
 
@@ -940,28 +1014,45 @@ function renderCatalogs() {
   rowsEl.innerHTML = rows.map((item) => `
     <tr>
       <td>${item.catalog_id}</td>
-      <td>${item.manufacturer}</td>
-      <td>${item.product_name}<br><small>${item.memo || ""}</small></td>
-      <td>${item.tool_type}</td>
-      <td>${item.flute_info || "-"}</td>
-      <td>${item.coating || "-"}</td>
-      <td>${item.material_hint || "-"}</td>
-      <td>${item.series_codes || "-"}</td>
-      <td><a href="${item.catalog_url}" target="_blank" rel="noopener">PDF</a></td>
+      <td>${esc(item.manufacturer)}</td>
+      <td>${esc(item.product_name)}<br><small>${esc(item.memo)}</small></td>
+      <td>${esc(item.tool_type)}</td>
+      <td>${esc(item.flute_info || "-")}</td>
+      <td>${esc(item.coating || "-")}</td>
+      <td>${esc(item.material_hint || "-")}</td>
+      <td>${esc(item.series_codes || "-")}</td>
+      <td><a href="${safeUrl(item.catalog_url)}" target="_blank" rel="noopener">PDF</a></td>
     </tr>
   `).join("");
 }
 
-function renderMakerConditionMaterialFilter() {
-  const select = $("#makerConditionMaterialFilter");
+function fillSelectOptions(select, values, allLabel) {
   if (!select) return;
   const current = select.value;
+  select.innerHTML = `<option value="">${allLabel}</option>${values.map((value) => `<option value="${esc(value)}">${esc(value)}</option>`).join("")}`;
+  select.value = values.includes(current) ? current : "";
+}
+
+function renderMakerConditionMaterialFilter() {
   const materials = Array.from(new Set([
     ...state.master.manufacturer_cutting_conditions.map((item) => item.work_material).filter(Boolean),
     ...state.master.conditions.map((item) => item.material_type).filter(Boolean),
   ])).sort();
-  select.innerHTML = `<option value="">全被削材</option>${materials.map((material) => `<option value="${material}">${material}</option>`).join("")}`;
-  select.value = materials.includes(current) ? current : "";
+  fillSelectOptions($("#makerConditionMaterialFilter"), materials, "全被削材");
+  const makers = Array.from(new Set(
+    state.master.manufacturer_cutting_conditions.map((item) => item.manufacturer).filter(Boolean),
+  )).sort();
+  fillSelectOptions($("#makerConditionMakerFilter"), makers, "全メーカー");
+}
+
+// 条件は1,700件以上あるため、描画はこの件数までに抑えて絞り込みを促す
+const CONDITION_RENDER_LIMIT = 400;
+
+function readDiameterFilter(selector) {
+  const raw = $(selector)?.value;
+  if (raw === undefined || raw === "") return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
 }
 
 function renderMakerConditions() {
@@ -969,7 +1060,16 @@ function renderMakerConditions() {
   if (!rowsEl) return;
   const search = ($("#makerConditionSearch")?.value || "").trim().toLowerCase();
   const material = $("#makerConditionMaterialFilter")?.value || "";
+  const maker = $("#makerConditionMakerFilter")?.value || "";
+  const diameterMin = readDiameterFilter("#makerConditionDiameterMin");
+  const diameterMax = readDiameterFilter("#makerConditionDiameterMax");
   const makerRows = state.master.manufacturer_cutting_conditions.filter((item) => {
+    const diameter = Number(item.outside_diameter_mm);
+    if (maker && item.manufacturer !== maker) return false;
+    if (material && item.work_material !== material) return false;
+    if (diameterMin !== null && diameter < diameterMin) return false;
+    if (diameterMax !== null && diameter > diameterMax) return false;
+    if (!search) return true;
     const text = [
       item.manufacturer,
       item.series_code,
@@ -980,9 +1080,10 @@ function renderMakerConditions() {
       item.hardness,
       item.material_group,
     ].join(" ").toLowerCase();
-    return (!material || item.work_material === material) && (!search || text.includes(search));
+    return text.includes(search);
   });
-  const internalRows = state.master.conditions.filter((item) => {
+  // 社内条件は外径を持たないため、メーカー・径で絞り込んだときは対象外にする
+  const internalRows = maker || diameterMin !== null || diameterMax !== null ? [] : state.master.conditions.filter((item) => {
     if (item.tool_memo?.includes("http")) return false;
     const text = [
       item.tool_name,
@@ -992,45 +1093,84 @@ function renderMakerConditions() {
     return (!material || item.material_type === material) && (!search || text.includes(search));
   });
   const toolCount = $("#toolRows")?.querySelectorAll("tr").length || 0;
-  $("#makerConditionCountBadge").textContent = `工具 ${toolCount} / 条件 ${makerRows.length + internalRows.length}`;
+  const total = makerRows.length + internalRows.length;
+  $("#makerConditionCountBadge").textContent = `工具 ${toolCount} / 条件 ${total}`;
+  const shownMakerRows = makerRows.slice(0, CONDITION_RENDER_LIMIT);
+  const shownInternalRows = internalRows.slice(0, Math.max(0, CONDITION_RENDER_LIMIT - shownMakerRows.length));
+  const shown = shownMakerRows.length + shownInternalRows.length;
+  const note = $("#conditionLimitNote");
+  if (note) {
+    note.classList.toggle("hidden", shown >= total);
+    note.textContent = `${total}件中 ${shown}件を表示しています。メーカー・被削材・外径で絞り込んでください。`;
+  }
   rowsEl.innerHTML = [
-    ...makerRows.map((item) => `
+    ...shownMakerRows.map((item) => `
     <tr>
       <td>メーカーPDF<br><small>#${item.condition_id}</small></td>
-      <td>${item.manufacturer}</td>
-      <td>${item.series_code}</td>
-      <td>${item.model_family}</td>
+      <td>${esc(item.manufacturer)}</td>
+      <td>${esc(item.series_code)}</td>
+      <td>${esc(item.model_family)}</td>
       <td>${Number(item.outside_diameter_mm).toFixed(1)}</td>
       <td>${Number(item.effective_length_mm).toFixed(1)}</td>
-      <td>${item.work_material}<br><small>${item.material_group || ""}</small></td>
-      <td>${item.spindle_rpm}</td>
-      <td>${item.feed_rate_mm_min}</td>
-      <td>${item.axial_depth_mm}</td>
-      <td>${item.radial_depth_mm}</td>
-      <td><a href="${item.source_url}" target="_blank" rel="noopener">p.${item.source_page || "-"}</a></td>
+      <td>${esc(item.work_material)}<br><small>${esc(item.material_group)}</small></td>
+      <td>${esc(item.spindle_rpm)}</td>
+      <td>${esc(item.feed_rate_mm_min)}</td>
+      <td>${esc(item.axial_depth_mm)}</td>
+      <td>${esc(item.radial_depth_mm)}</td>
+      <td><a href="${safeUrl(item.source_url)}" target="_blank" rel="noopener">p.${esc(item.source_page || "-")}</a></td>
     </tr>
   `),
-    ...internalRows.map((item) => `
+    ...shownInternalRows.map((item) => `
     <tr>
       <td>社内<br><small>#${item.condition_id}</small></td>
-      <td>${item.tool_name}</td>
+      <td>${esc(item.tool_name)}</td>
       <td>-</td>
-      <td>${item.process_type}</td>
+      <td>${esc(item.process_type)}</td>
       <td>-</td>
       <td>-</td>
-      <td>${item.material_type}</td>
-      <td>${item.spindle_rpm}</td>
-      <td>${item.feed_rate_mm_min}</td>
-      <td>${item.depth_of_cut_mm}</td>
-      <td>${item.width_of_cut_mm}</td>
+      <td>${esc(item.material_type)}</td>
+      <td>${esc(item.spindle_rpm)}</td>
+      <td>${esc(item.feed_rate_mm_min)}</td>
+      <td>${esc(item.depth_of_cut_mm)}</td>
+      <td>${esc(item.width_of_cut_mm)}</td>
       <td><button class="danger" data-delete-condition="${item.condition_id}">削除</button></td>
     </tr>
   `),
-  ].join("");
+  ].join("") || `<tr><td colspan="12" class="empty-row">条件に一致する切削条件がありません。</td></tr>`;
+}
+
+function scorePoints(points) {
+  const value = Number(points);
+  return `${value > 0 ? "+" : ""}${Number.isInteger(value) ? value : value.toFixed(1)}`;
+}
+
+function candidateComparison(candidates) {
+  if (!candidates || candidates.length === 0) return "";
+  const selected = candidates.find((c) => c.selected) || candidates[0];
+  const runnerUp = candidates.find((c) => c !== selected);
+  const margin = runnerUp ? `次点との差 ${scorePoints(selected.score - runnerUp.score)}` : "対抗候補なし";
+  const rows = candidates.map((c) => `
+    <tr class="${c.selected ? "candidate-selected" : ""}">
+      <td>${c.rank}</td>
+      <td>${esc(c.tool)}${c.selected ? ' <span class="candidate-tag">採用</span>' : ""}<br><small>有効長 ${esc(c.effective_length_mm)} mm / ${esc(c.condition)}</small></td>
+      <td class="candidate-score">${scorePoints(c.score)}</td>
+      <td><div class="candidate-parts">${c.components.map((p) => `<span class="${p.points < 0 ? "minus" : "plus"}">${esc(p.label)} ${scorePoints(p.points)}</span>`).join("")}</div></td>
+    </tr>
+  `).join("");
+  return `
+    <details class="candidate-details">
+      <summary>候補比較（${selected.pool_size || candidates.length}条件中の上位${candidates.length}工具 / ${margin}）</summary>
+      <table class="candidate-table">
+        <thead><tr><th>順位</th><th>工具・条件</th><th>スコア</th><th>内訳</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </details>
+  `;
 }
 
 function renderResult(result) {
   state.lastResult = result;
+  state.highlightedKey = null;
   $("#resultPanel").classList.remove("hidden");
   $("#totalBadge").classList.remove("muted");
   $("#totalBadge").textContent = result.time_label || secLabel(result.breakdown.total_sec);
@@ -1042,16 +1182,21 @@ function renderResult(result) {
   $("#confidenceLabel").textContent = `${Math.round(result.confidence * 100)}%`;
   $("#csvLink").href = `/api/histories/${result.history_id}/csv`;
 
-  $("#featureRows").innerHTML = result.features.map((f) => `
-    <tr>
-      <td>${f.feature_type}</td><td>${f.dimensions}<br><small>${f.note}</small>${f.reachability ? `<br><small class="reachability-warning">${f.reachability}</small>` : ""}</td>
-      <td>${f.quantity}</td><td>${f.tool_name}${f.selection_reason ? `<br><small>${f.selection_reason}</small>` : ""}</td>
-      <td class="condition-cell">${f.cutting_condition || "-"}</td>
-      <td class="path-cell">${f.path_plan || "-"}</td>
-      <td>${secLabel(f.machining_sec)}</td>
-      <td>${f.feature_key ? `<button type="button" class="link-btn" data-exclude-key="${f.feature_key}" title="このフィーチャを加工対象外（穴埋め扱い）にして再計算">穴埋め/除外</button>` : ""}</td>
+  const machiningTotal = Number(result.breakdown.machining_sec) || 0;
+  $("#featureRows").innerHTML = result.features.map((f) => {
+    const share = machiningTotal > 0 ? (Number(f.machining_sec) / machiningTotal) * 100 : 0;
+    const keyAttr = f.feature_key ? ` data-feature-key="${esc(f.feature_key)}" title="クリックで3Dプレビューの工具パスを強調表示"` : "";
+    return `
+    <tr${keyAttr}>
+      <td>${esc(f.feature_type)}</td><td>${esc(f.dimensions)}<br><small>${esc(f.note)}</small>${f.reachability ? `<br><small class="reachability-warning">${esc(f.reachability)}</small>` : ""}</td>
+      <td>${esc(f.quantity)}</td><td>${esc(f.tool_name)}${f.selection_reason ? `<br><small>${esc(f.selection_reason)}</small>` : ""}${candidateComparison(f.selection_candidates)}</td>
+      <td class="condition-cell">${esc(f.cutting_condition || "-")}</td>
+      <td class="path-cell">${esc(f.path_plan || "-")}</td>
+      <td class="time-cell">${secLabel(f.machining_sec)}<span class="share-bar" aria-hidden="true"><i style="width:${Math.min(100, Math.max(0, share)).toFixed(1)}%"></i></span><small>${share.toFixed(1)}%</small></td>
+      <td>${f.feature_key ? `<button type="button" class="link-btn" data-exclude-key="${esc(f.feature_key)}" title="このフィーチャを加工対象外（穴埋め扱い）にして再計算">穴埋め/除外</button>` : ""}</td>
     </tr>
-  `).join("");
+  `;
+  }).join("");
 
   const excludedRows = result.excluded_features || [];
   const excludedPanel = $("#excludedPanel");
@@ -1060,9 +1205,9 @@ function renderResult(result) {
     $("#excludedRows").innerHTML = excludedRows.map((e) => `
       <tr>
         <td>${e.kind === "edm" ? "放電候補" : "切削"}</td>
-        <td>${e.label}</td>
-        <td>${e.count}</td>
-        <td><button type="button" class="link-btn" data-restore-key="${e.feature_key}">加工対象に戻す</button></td>
+        <td>${esc(e.label)}</td>
+        <td>${esc(e.count)}</td>
+        <td><button type="button" class="link-btn" data-restore-key="${esc(e.feature_key)}">加工対象に戻す</button></td>
       </tr>
     `).join("");
   }
@@ -1074,22 +1219,22 @@ function renderResult(result) {
     const edmTotal = edmCandidates.reduce((total, c) => total + Number(c.reference_sec || 0), 0);
     $("#edmBadge").textContent = `${edmCandidates.length}件 / 参考 ${secLabel(edmTotal)}`;
     $("#edmRows").innerHTML = edmCandidates.map((c) => `
-      <tr>
-        <td><span class="edm-type">${c.edm_type}</span></td>
-        <td>${c.feature_type}</td>
-        <td>${c.dimensions}</td>
-        <td>${c.count}</td>
-        <td class="condition-cell">${c.reason}</td>
+      <tr${c.feature_key ? ` data-feature-key="${esc(c.feature_key)}" title="クリックで3Dプレビューの位置を強調表示"` : ""}>
+        <td><span class="edm-type">${esc(c.edm_type)}</span></td>
+        <td>${esc(c.feature_type)}</td>
+        <td>${esc(c.dimensions)}</td>
+        <td>${esc(c.count)}</td>
+        <td class="condition-cell">${esc(c.reason)}</td>
         <td>${secLabel(c.reference_sec)}</td>
-        <td>${c.feature_key ? `<button type="button" class="link-btn" data-exclude-key="${c.feature_key}" title="この形状を加工しない（穴埋め扱い）ことにして候補から外す">除外</button>` : ""}</td>
+        <td>${c.feature_key ? `<button type="button" class="link-btn" data-exclude-key="${esc(c.feature_key)}" title="この形状を加工しない（穴埋め扱い）ことにして候補から外す">除外</button>` : ""}</td>
       </tr>
     `).join("");
   }
 
   $("#toolUsageRows").innerHTML = result.tool_usage.map((t) => `
     <tr>
-      <td>${t.tool_name}</td><td>${t.usage_count}</td>
-      <td class="condition-cell">${t.cutting_conditions || "-"}</td>
+      <td>${esc(t.tool_name)}</td><td>${esc(t.usage_count)}</td>
+      <td class="condition-cell">${esc(t.cutting_conditions || "-")}</td>
       <td>${secLabel(t.machining_sec)}</td>
     </tr>
   `).join("");
@@ -1109,7 +1254,7 @@ function renderResult(result) {
   ` : "";
   const reachabilityIssues = result.analysis.reachability_issues || [];
   const reachabilityRows = reachabilityIssues.length ? `
-    <dt>到達性注意</dt><dd>${reachabilityIssues.length}件 / ${reachabilityIssues.slice(0, 3).map((item) => item.feature_type).join("、")}</dd>
+    <dt>到達性注意</dt><dd>${reachabilityIssues.length}件 / ${esc(reachabilityIssues.slice(0, 3).map((item) => item.feature_type).join("、"))}</dd>
   ` : "";
   const edmPolicy = result.edm_policy || {};
   const edmTaperLabel = Number(edmPolicy.min_taper_deg) > 0 ? ` / テーパ≥${edmPolicy.min_taper_deg}°` : "";
@@ -1117,9 +1262,10 @@ function renderResult(result) {
     ? `<dt>放電置き換え</dt><dd>幅≤${edmPolicy.max_width_mm}mm かつ 深さ≥${edmPolicy.min_depth_mm}mm / 深さ幅比≥${edmPolicy.min_aspect}${edmTaperLabel} / 候補 ${edmCandidates.length}件</dd>`
     : `<dt>放電置き換え</dt><dd>判定オフ</dd>`;
   $("#analysisInfo").innerHTML = `
-    <dt>解析方式</dt><dd>${result.analysis.parser}</dd>
-    <dt>条件ソース</dt><dd>${result.condition_source || "-"}</dd>
-    <dt>見積安全率</dt><dd>${result.estimate_mode_label || "-"}</dd>
+    <dt>ファイル</dt><dd>${esc(result.file_name || "-")}</dd>
+    <dt>解析方式</dt><dd>${esc(result.analysis.parser)}</dd>
+    <dt>条件ソース</dt><dd>${esc(result.condition_source || "-")}</dd>
+    <dt>見積安全率</dt><dd>${esc(result.estimate_mode_label || "-")}</dd>
     <dt>最大工具径</dt><dd>${result.machine.max_tool_diameter_mm ? `${result.machine.max_tool_diameter_mm} mm` : "制限なし"}</dd>
     <dt>外形寸法</dt><dd>${bbox.x.toFixed(1)} x ${bbox.y.toFixed(1)} x ${bbox.z.toFixed(1)} mm</dd>
     ${volumeRows}
@@ -1143,14 +1289,31 @@ async function reanalyzeWithExclusions() {
   $("#analyzeForm").requestSubmit();
 }
 
+async function openHistory(historyId) {
+  const result = await jsonFetch(`/api/histories/${historyId}`);
+  // 履歴のファイルは手元に無いため、除外状態だけ復元し3Dは現在の表示のまま
+  state.excluded = new Set(result.excluded_keys || []);
+  setTab("analyze");
+  renderResult(result);
+  $("#resultPanel").scrollIntoView({ behavior: "smooth", block: "start" });
+  toast(`履歴 #${historyId}（${result.file_name}）の結果を表示しています。再解析するにはファイルを選択してください。`);
+}
+
 async function loadHistories() {
   const rows = await jsonFetch("/api/histories");
+  if (!rows.length) {
+    $("#historyRows").innerHTML = `<tr><td colspan="8" class="empty-row">まだ解析履歴がありません。</td></tr>`;
+    return;
+  }
   $("#historyRows").innerHTML = rows.map((h) => `
     <tr>
-      <td>${h.history_id}</td><td>${h.created_at}</td><td>${h.file_name}</td>
-      <td>${h.material_type}</td><td>${h.machine_name}</td><td>${h.time_label}</td>
+      <td>${h.history_id}</td><td>${esc(h.created_at)}</td><td>${esc(h.file_name)}</td>
+      <td>${esc(h.material_type)}</td><td>${esc(h.machine_name)}</td><td>${esc(h.time_label)}</td>
       <td>${Math.round(h.confidence * 100)}%</td>
-      <td><a class="secondary-link compact" href="/api/histories/${h.history_id}/csv">CSV</a></td>
+      <td class="action-cell">
+        <button type="button" class="secondary-button compact" data-open-history="${h.history_id}">結果を表示</button>
+        <a class="secondary-link compact" href="/api/histories/${h.history_id}/csv">CSV</a>
+      </td>
     </tr>
   `).join("");
 }
@@ -1276,8 +1439,21 @@ function bindEvents() {
     event.preventDefault();
     // requestSubmit()による再解析では event.submitter が null になる
     const button = event.submitter || $("#analyzeForm button.primary[type=submit]") || { disabled: false, textContent: "" };
+    const fileInput = event.currentTarget.elements.stp_file;
+    if (!fileInput?.files?.length) {
+      toast("STP / STEP ファイルを選択してください。");
+      return;
+    }
     button.disabled = true;
-    button.textContent = "解析中";
+    const startedAt = Date.now();
+    const showElapsed = () => {
+      button.textContent = `解析中… ${Math.floor((Date.now() - startedAt) / 1000)}秒`;
+    };
+    showElapsed();
+    const elapsedTimer = window.setInterval(showElapsed, 1000);
+    document.body.classList.add("is-analyzing");
+    $("#totalBadge").textContent = "解析中…";
+    $("#totalBadge").classList.add("muted");
     try {
       const formData = new FormData(event.currentTarget);
       // チェックボックスは未チェック時に送信されないため、明示的にoffを送る
@@ -1288,46 +1464,54 @@ function bindEvents() {
       toast("解析が完了しました。");
     } catch (error) {
       toast(error.message);
+      $("#totalBadge").textContent = state.lastResult ? state.lastResult.time_label || secLabel(state.lastResult.breakdown.total_sec) : "未解析";
+      $("#totalBadge").classList.toggle("muted", !state.lastResult);
     } finally {
+      window.clearInterval(elapsedTimer);
+      document.body.classList.remove("is-analyzing");
       button.disabled = false;
       button.textContent = "解析実行";
     }
   });
 
-  $("#toolForm")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await jsonFetch("/api/tools", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(formJson(event.currentTarget)),
+  const postMasterForm = (selector, url) => {
+    $(selector)?.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const form = event.currentTarget;
+      try {
+        await jsonFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(formJson(form)),
+        });
+        form.reset();
+        await loadMaster();
+        toast("登録しました。");
+      } catch (error) {
+        toast(error.message);
+      }
     });
-    event.currentTarget.reset();
-    await loadMaster();
-  });
-
-  $("#conditionForm")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    await jsonFetch("/api/conditions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(formJson(event.currentTarget)),
-    });
-    event.currentTarget.reset();
-    await loadMaster();
-  });
+  };
+  postMasterForm("#toolForm", "/api/tools");
+  postMasterForm("#conditionForm", "/api/conditions");
 
   $("#machineForm").addEventListener("submit", async (event) => {
     event.preventDefault();
     const data = formJson(event.currentTarget);
     const machineId = data.machine_id;
     delete data.machine_id;
-    await jsonFetch(machineId ? `/api/machines/${machineId}` : "/api/machines", {
-      method: machineId ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(data),
-    });
-    resetMachineForm();
-    await loadMaster();
+    try {
+      await jsonFetch(machineId ? `/api/machines/${machineId}` : "/api/machines", {
+        method: machineId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(data),
+      });
+      resetMachineForm();
+      await loadMaster();
+      toast(machineId ? "機械マスタを更新しました。" : "機械マスタを追加しました。");
+    } catch (error) {
+      toast(error.message);
+    }
   });
 
   $("#machineResetButton")?.addEventListener("click", resetMachineForm);
@@ -1342,25 +1526,57 @@ function bindEvents() {
   $("#catalogSearch")?.addEventListener("input", renderCatalogs);
   $("#catalogTypeFilter")?.addEventListener("change", renderCatalogs);
   $("#makerConditionSearch")?.addEventListener("input", renderMakerConditions);
-  $("#makerConditionMaterialFilter")?.addEventListener("change", renderMakerConditions);
+  ["#makerConditionMaterialFilter", "#makerConditionMakerFilter"].forEach((selector) => {
+    $(selector)?.addEventListener("change", renderMakerConditions);
+  });
+  ["#makerConditionDiameterMin", "#makerConditionDiameterMax"].forEach((selector) => {
+    $(selector)?.addEventListener("input", renderMakerConditions);
+  });
 
   document.body.addEventListener("click", async (event) => {
-    const toolId = event.target.dataset.deleteTool;
-    const conditionId = event.target.dataset.deleteCondition;
-    const machineId = event.target.dataset.deleteMachine;
-    const editMachineId = event.target.dataset.editMachine;
-    if (editMachineId) {
-      const machine = state.master.machines.find((item) => String(item.machine_id) === String(editMachineId));
-      fillMachineForm(machine);
-      return;
+    const target = event.target.closest("button, a");
+    if (!target) return;
+    const {
+      deleteTool: toolId,
+      deleteCondition: conditionId,
+      deleteMachine: machineId,
+      editMachine: editMachineId,
+      openHistory: historyId,
+    } = target.dataset;
+    try {
+      if (historyId) {
+        await openHistory(historyId);
+        return;
+      }
+      if (editMachineId) {
+        const machine = state.master.machines.find((item) => String(item.machine_id) === String(editMachineId));
+        fillMachineForm(machine);
+        return;
+      }
+      if (!toolId && !conditionId && !machineId) return;
+      const machine = machineId && state.master.machines.find((item) => String(item.machine_id) === String(machineId));
+      const label = machine
+        ? `機械「${machine.machine_name}」`
+        : conditionId ? `社内条件 #${conditionId}` : `工具 #${toolId}`;
+      if (!window.confirm(`${label}を削除します。よろしいですか？`)) return;
+      if (toolId) await jsonFetch(`/api/tools/${toolId}`, { method: "DELETE" });
+      if (conditionId) await jsonFetch(`/api/conditions/${conditionId}`, { method: "DELETE" });
+      if (machineId) {
+        await jsonFetch(`/api/machines/${machineId}`, { method: "DELETE" });
+        if ($("#machineForm")?.elements.machine_id.value === String(machineId)) resetMachineForm();
+      }
+      await loadMaster();
+      toast(`${label}を削除しました。`);
+    } catch (error) {
+      toast(error.message);
     }
-    if (toolId) await jsonFetch(`/api/tools/${toolId}`, { method: "DELETE" });
-    if (conditionId) await jsonFetch(`/api/conditions/${conditionId}`, { method: "DELETE" });
-    if (machineId) {
-      await jsonFetch(`/api/machines/${machineId}`, { method: "DELETE" });
-      if ($("#machineForm")?.elements.machine_id.value === String(machineId)) resetMachineForm();
-    }
-    if (toolId || conditionId || machineId) await loadMaster();
+  });
+
+  // 認識フィーチャ・放電候補の行クリックで3D上の工具パスを強調
+  document.body.addEventListener("click", (event) => {
+    const row = event.target.closest("tr[data-feature-key]");
+    if (!row || event.target.closest("button, a, details, summary")) return;
+    setHighlightedFeature(row.dataset.featureKey);
   });
 }
 

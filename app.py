@@ -8,24 +8,29 @@ import os
 import re
 import sqlite3
 import time
-from dataclasses import dataclass, asdict
+from contextlib import contextmanager
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from flask import Flask, Response, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "stp_time_tool.sqlite3"
+# 検証ハーネス等から開発DBを汚さずに起動できるよう、環境変数でDBパスを差し替え可能にする
+DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.sqlite3")
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
-APP_VERSION = "2026-07-10-edm-policy-taper"
+APP_VERSION = "2026-09-25-brushup"
+MAX_UPLOAD_MB = 80
+MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 80 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
 def env_int(name: str, default: int) -> int:
@@ -57,14 +62,72 @@ def cleanup_old_uploads(retention_days: int = UPLOAD_RETENTION_DAYS) -> dict[str
     return {"deleted": deleted, "skipped": skipped}
 
 
-def db() -> sqlite3.Connection:
+@contextmanager
+def db() -> Iterator[sqlite3.Connection]:
+    """成功時にcommit・例外時にrollbackし、最後に必ず接続を閉じる。"""
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def rows_to_dicts(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
+
+
+class InputError(ValueError):
+    """利用者の入力値に起因するエラー（HTTP 400で返す）。"""
+
+
+def input_number(
+    source: Any,
+    key: str,
+    label: str,
+    *,
+    default: float | None = None,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    integer: bool = False,
+) -> float | int | None:
+    """フォーム/JSONから数値を取り出して範囲検証する。空欄は default（None なら必須扱い）。"""
+    raw = source.get(key) if source is not None else None
+    if raw is None or (isinstance(raw, str) and raw.strip() == ""):
+        if default is None:
+            raise InputError(f"{label}を入力してください。")
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise InputError(f"{label}は数値で入力してください。") from None
+    if not math.isfinite(value):
+        raise InputError(f"{label}は数値で入力してください。")
+    if minimum is not None and value < minimum:
+        raise InputError(f"{label}は{minimum:g}以上で入力してください。")
+    if maximum is not None and value > maximum:
+        raise InputError(f"{label}は{maximum:g}以下で入力してください。")
+    return int(round(value)) if integer else value
+
+
+def input_text(source: Any, key: str, label: str, *, max_length: int = 120, required: bool = True) -> str:
+    value = str((source.get(key) if source is not None else "") or "").strip()
+    if required and not value:
+        raise InputError(f"{label}を入力してください。")
+    if len(value) > max_length:
+        raise InputError(f"{label}は{max_length}文字以内で入力してください。")
+    return value
+
+
+def request_json_object() -> dict[str, Any]:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise InputError("リクエスト形式が不正です（JSONオブジェクトを送信してください）。")
+    return data
 
 
 def init_db() -> None:
@@ -214,13 +277,11 @@ def seed_master(conn: sqlite3.Connection) -> None:
 
 
 def seed_default_machines(conn: sqlite3.Connection) -> None:
-    existing = {
-        row["machine_name"]
-        for row in conn.execute("SELECT machine_name FROM machines").fetchall()
-    }
-    rows = [row for row in DEFAULT_MACHINES if row[0] not in existing]
-    if not rows:
+    # 機械マスタが空のときだけ初期値を入れる。
+    # 既存行がある場合に補完すると、利用者が削除した既定機械が即座に復活してしまう。
+    if conn.execute("SELECT COUNT(*) FROM machines").fetchone()[0] > 0:
         return
+    rows = DEFAULT_MACHINES
     conn.executemany(
         """
         INSERT INTO machines
@@ -891,6 +952,7 @@ class Feature:
     selection_reason: str = ""
     reachability: str = ""
     feature_key: str = ""
+    selection_candidates: list[dict[str, Any]] = field(default_factory=list)
 
 
 def fmt_number(value: Any, digits: int = 2) -> str:
@@ -1100,6 +1162,24 @@ def path_plan_summary(
 
 def significant_volume_threshold(bbox: dict[str, float]) -> float:
     return max(100.0, float(bbox["x"]) * float(bbox["y"]) * 0.01)
+
+
+WALL_TOOL_STANDARD_DIAMETERS = (6.0, 8.0, 10.0, 12.0, 16.0)
+
+
+def wall_tool_target_diameter(wall_height_mm: float, min_span_mm: float) -> float:
+    """外周側面の狙い工具径。突出し L/D≈3 に収まる標準径を壁高さから選ぶ。
+
+    固定φ6だと高い壁で有効長の短い工具が選ばれ、材質によって径がばらつく
+    （例: 高さ28mmで鉄はφ6 有効長9mm、SUSはφ10）ため、壁高さを基準にそろえる。
+    """
+    if min_span_mm < 40 and wall_height_mm < 12:
+        return 3.0
+    needed = wall_height_mm / 3.0
+    for diameter in WALL_TOOL_STANDARD_DIAMETERS:
+        if diameter >= needed:
+            return diameter
+    return WALL_TOOL_STANDARD_DIAMETERS[-1]
 
 
 def roughing_width_for_plan(width_mm: float, tool_diameter_mm: float, ratio: float = 0.35) -> float:
@@ -1341,6 +1421,9 @@ def edm_reference_sec(
 def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     entity_count = len(re.findall(r"^#\d+\s*=", text, flags=re.MULTILINE))
+    if entity_count == 0 and "ISO-10303" not in text[:4096].upper():
+        # 形状を読めないファイルに対して、サイズ由来の仮寸法で見積もりを出さない
+        raise InputError("STEP（ISO-10303-21）形式として読み取れませんでした。CADから出力したSTP/STEPファイルを指定してください。")
     face_count = len(re.findall(r"ADVANCED_FACE|FACE_BOUND", text, flags=re.IGNORECASE))
     plane_count = len(re.findall(r"\bPLANE\s*\(", text, flags=re.IGNORECASE))
     cylindrical_radii = [
@@ -2388,6 +2471,7 @@ def auto_manufacturer_condition_for(
     max_tool_diameter_mm: float | None = None,
     max_fit_diameter_mm: float | None = None,
     require_depth_fit: bool = False,
+    candidates_out: list[dict[str, Any]] | None = None,
 ) -> sqlite3.Row | None:
     rows = conn.execute("SELECT * FROM manufacturer_cutting_conditions").fetchall()
     if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
@@ -2405,63 +2489,163 @@ def auto_manufacturer_condition_for(
             rows = depth_rows
 
     keywords = material_keywords(material_type)
-    process_text = process_hint.upper()
+    # 材質の合う標準長（L/D<3）工具で必要深さに届くものがあるか。
+    # 届かない場合、ロングネックは「必要な選択」なので減点を軽くする。
+    standard_reaches = any(
+        float(row["effective_length_mm"]) >= required_depth
+        and float(row["effective_length_mm"]) < float(row["outside_diameter_mm"]) * 3
+        and matches_material_keywords(row, keywords)
+        for row in rows
+    )
+    scored = [
+        (
+            row,
+            score_manufacturer_condition(
+                row,
+                keywords=keywords,
+                material_type=material_type,
+                process_hint=process_hint,
+                target_diameter=target_diameter,
+                required_depth=required_depth,
+                require_depth_fit=require_depth_fit,
+                standard_reaches=standard_reaches,
+            ),
+        )
+        for row in rows
+    ]
 
-    def score(row: sqlite3.Row) -> tuple[float, float, int]:
-        searchable = " ".join(
-            str(row[key] or "")
-            for key in ("work_material", "material_group", "product_name", "memo", "tool_type", "series_code")
-        ).upper()
-        value = 0.0
-
-        if any(keyword.upper() in searchable for keyword in keywords):
-            value += 1000
-        if material_type in {"鉄", "鋼"} and any(
-            word in searchable for word in ("HARDENED", "HRC", "SKD", "STAVAX", "NAK", "HAP")
-        ):
-            value -= 420
-        if material_type in {"鉄", "鋼"} and "STAINLESS" in searchable:
-            value -= 520
-        if "ポケット" in process_hint or "POCKET" in process_text:
-            if any(word in searchable for word in ("POCKET", "TROCHOIDAL", "SLOTTING", "SIDE")):
-                value += 120
-            removal_rate = (
-                float(row["feed_rate_mm_min"])
-                * float(row["axial_depth_mm"])
-                * float(row["radial_depth_mm"])
-            )
-            value += min(removal_rate / 50000.0, 1.0) * 260
-        elif "側面" in process_hint or "SIDE" in process_text:
-            if any(word in searchable for word in ("SIDE", "MILLING", "FINISHING")):
-                value += 120
-
-        if row["tool_type"] in {"SQUARE", "RADIUS"}:
-            value += 80
-        if row["manufacturer"] == "OSG":
-            value += 10
-
+    def sort_key(item: tuple[sqlite3.Row, list[tuple[str, float]]]) -> tuple[float, float, int]:
+        row, components = item
         diameter = float(row["outside_diameter_mm"])
-        effective_length = float(row["effective_length_mm"])
-        if not require_depth_fit:
-            # 汎用パス（側面・ポケット・仕上げ）では深リブ・微細用条件を避ける。
-            # 微細条件のapは工具剛性由来で、汎用形状に適用すると非現実的な見積もりになる。
-            axial_depth = float(row["axial_depth_mm"])
-            radial_depth = float(row["radial_depth_mm"])
-            if axial_depth < 0.3:
-                value -= 300
-            if diameter > 0 and radial_depth < diameter * 0.08:
-                # 深壁仕上げ用の極小ae条件。汎用パスでは径方向切込みを増幅できない
-                value -= 250
-            if diameter > 0 and effective_length / diameter >= 3:
-                # ロングネック（深リブ用）条件。汎用の荒取り・側面には標準工具を優先する
-                value -= 350
-        value -= abs(diameter - target_diameter) * 18
-        value -= max(0.0, required_depth - effective_length) * 22
-        value -= max(0.0, effective_length - required_depth) * 0.3
-        value += min(float(row["feed_rate_mm_min"]), 3000.0) / 3000.0 * 25
-        return (value, -abs(diameter - target_diameter), -int(row["condition_id"]))
+        return (sum(points for _, points in components), -abs(diameter - target_diameter), -int(row["condition_id"]))
 
-    return max(rows, key=score)
+    scored.sort(key=sort_key, reverse=True)
+    if candidates_out is not None:
+        candidates_out.extend(selection_candidates_summary(scored))
+    return scored[0][0]
+
+
+def condition_searchable_text(row: sqlite3.Row) -> str:
+    return " ".join(
+        str(row[key] or "")
+        for key in ("work_material", "material_group", "product_name", "memo", "tool_type", "series_code")
+    ).upper()
+
+
+def matches_material_keywords(row: sqlite3.Row, keywords: list[str]) -> bool:
+    searchable = condition_searchable_text(row)
+    return any(keyword.upper() in searchable for keyword in keywords)
+
+
+def score_manufacturer_condition(
+    row: sqlite3.Row,
+    *,
+    keywords: list[str],
+    material_type: str,
+    process_hint: str,
+    target_diameter: float,
+    required_depth: float,
+    require_depth_fit: bool,
+    standard_reaches: bool = True,
+) -> list[tuple[str, float]]:
+    """工具選定スコアを内訳（ラベル, 点数）のリストで返す。合計が選定スコア。"""
+    searchable = condition_searchable_text(row)
+    process_text = process_hint.upper()
+    components: list[tuple[str, float]] = []
+
+    if any(keyword.upper() in searchable for keyword in keywords):
+        components.append(("材質一致", 1000))
+    if material_type in {"鉄", "鋼"} and any(
+        word in searchable for word in ("HARDENED", "HRC", "SKD", "STAVAX", "NAK", "HAP")
+    ):
+        components.append(("焼入れ鋼向け条件", -420))
+    if material_type in {"鉄", "鋼"} and "STAINLESS" in searchable:
+        components.append(("ステンレス向け条件", -520))
+    if "ポケット" in process_hint or "POCKET" in process_text:
+        if any(word in searchable for word in ("POCKET", "TROCHOIDAL", "SLOTTING", "SIDE")):
+            components.append(("ポケット向け", 120))
+        removal_rate = (
+            float(row["feed_rate_mm_min"])
+            * float(row["axial_depth_mm"])
+            * float(row["radial_depth_mm"])
+        )
+        components.append(("除去能率", min(removal_rate / 50000.0, 1.0) * 260))
+    elif "側面" in process_hint or "SIDE" in process_text:
+        if any(word in searchable for word in ("SIDE", "MILLING", "FINISHING")):
+            components.append(("側面向け", 120))
+
+    if row["tool_type"] in {"SQUARE", "RADIUS"}:
+        components.append(("スクエア/ラジアス", 80))
+    if row["manufacturer"] == "OSG":
+        components.append(("OSG優先", 10))
+
+    diameter = float(row["outside_diameter_mm"])
+    effective_length = float(row["effective_length_mm"])
+    if not require_depth_fit:
+        # 汎用パス（側面・ポケット・仕上げ）では深リブ・微細用条件を避ける。
+        # 微細条件のapは工具剛性由来で、汎用形状に適用すると非現実的な見積もりになる。
+        axial_depth = float(row["axial_depth_mm"])
+        radial_depth = float(row["radial_depth_mm"])
+        if axial_depth < 0.3:
+            components.append(("微細ap条件", -300))
+        if diameter > 0 and radial_depth < diameter * 0.08:
+            # 深壁仕上げ用の極小ae条件。汎用パスでは径方向切込みを増幅できない
+            components.append(("極小ae条件", -250))
+        if diameter > 0 and effective_length / diameter >= 3:
+            # ロングネック（深リブ用）条件。汎用の荒取り・側面には標準工具を優先する。
+            # ただし標準長で届く工具が無いなら、有効長不足の工具より優先されるよう減点を軽くする
+            if standard_reaches:
+                components.append(("ロングネック", -350))
+            else:
+                components.append(("ロングネック（標準長では届かず）", -60))
+    components.append(("径差", -abs(diameter - target_diameter) * 18))
+    components.append(("有効長不足", -max(0.0, required_depth - effective_length) * 22))
+    components.append(("有効長過剰", -max(0.0, effective_length - required_depth) * 0.3))
+    components.append(("送り速度", min(float(row["feed_rate_mm_min"]), 3000.0) / 3000.0 * 25))
+    return components
+
+
+def selection_candidates_summary(
+    scored: list[tuple[sqlite3.Row, list[tuple[str, float]]]],
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """スコア順の候補から、同一工具（メーカー・シリーズ・径・有効長）の重複を除いた上位を返す。"""
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for rank, (row, components) in enumerate(scored, start=1):
+        tool_key = (
+            row["manufacturer"],
+            row["series_code"],
+            float(row["outside_diameter_mm"]),
+            float(row["effective_length_mm"]),
+            row["corner_radius_label"],
+        )
+        if tool_key in seen:
+            continue
+        seen.add(tool_key)
+        candidates.append(
+            {
+                "rank": len(candidates) + 1,
+                "selected": rank == 1,
+                "tool": (
+                    f'{row["manufacturer"]} {row["series_code"]} '
+                    f'φ{fmt_number(row["outside_diameter_mm"])} {row["corner_radius_label"] or ""}'
+                ).strip(),
+                "effective_length_mm": float(row["effective_length_mm"]),
+                "condition": catalog_condition_summary(row),
+                "score": round(sum(points for _, points in components), 1),
+                "components": [
+                    {"label": label, "points": round(points, 1)}
+                    for label, points in components
+                    if abs(points) >= 0.05
+                ],
+            }
+        )
+        if len(candidates) >= limit:
+            break
+    if candidates:
+        candidates[0]["pool_size"] = len(scored)
+    return candidates
 
 
 def estimate(
@@ -2530,8 +2714,9 @@ def estimate(
 
         side_tool = pick_tool(conn, "EM", 16, max_tool_diameter)
         side_cond = condition_for(conn, side_tool["tool_id"], material_type, "ポケット")
+        side_candidates: list[dict[str, Any]] = []
         side_catalog_cond = None
-        side_target_diameter = 6.0 if min(bbox["x"], bbox["y"]) >= 40 or bbox["z"] >= 12 else 3.0
+        side_target_diameter = wall_tool_target_diameter(bbox["z"], min(bbox["x"], bbox["y"]))
         if use_manufacturer_conditions:
             side_catalog_cond = auto_manufacturer_condition_for(
                 conn,
@@ -2540,6 +2725,7 @@ def estimate(
                 bbox["z"],
                 "側面",
                 max_tool_diameter,
+                candidates_out=side_candidates,
             )
         side_area = 2 * (bbox["x"] + bbox["y"]) * bbox["z"]
         if side_catalog_cond is not None:
@@ -2617,6 +2803,7 @@ def estimate(
                 side_selection_reason,
                 side_reachability,
                 feature_key="side_walls",
+                selection_candidates=side_candidates,
             )
         )
 
@@ -3007,6 +3194,7 @@ def estimate(
                 prefer_largest_fit=True,
             )
             slot_cond = condition_for(conn, slot_tool["tool_id"], material_type, "ポケット")
+            slot_candidates: list[dict[str, Any]] = []
             slot_catalog_cond = None
             if use_manufacturer_conditions:
                 slot_catalog_cond = auto_manufacturer_condition_for(
@@ -3017,6 +3205,7 @@ def estimate(
                     "ポケット",
                     max_tool_diameter,
                     max_fit_diameter_mm=slot_fit_diameter,
+                    candidates_out=slot_candidates,
                 )
             volume = float(group.get("total_volume", max(0.0, length * width * depth * count)))
             if slot_catalog_cond is not None:
@@ -3097,6 +3286,7 @@ def estimate(
                     slot_selection_reason,
                     slot_reachability,
                     feature_key=slot_key,
+                    selection_candidates=slot_candidates,
                 )
             )
 
@@ -3130,6 +3320,7 @@ def estimate(
                     }
                 )
                 continue
+            fine_candidates: list[dict[str, Any]] = []
             fine_catalog_cond = None
             if use_manufacturer_conditions:
                 fine_catalog_cond = auto_manufacturer_condition_for(
@@ -3141,6 +3332,7 @@ def estimate(
                     max_tool_diameter,
                     max_fit_diameter_mm=fine_fit_diameter,
                     require_depth_fit=True,
+                    candidates_out=fine_candidates,
                 )
             if fine_catalog_cond is not None:
                 fine_tool_diameter = float(fine_catalog_cond["outside_diameter_mm"])
@@ -3210,6 +3402,7 @@ def estimate(
                     fine_selection_reason,
                     fine_reachability,
                     feature_key=fine_hole_key,
+                    selection_candidates=fine_candidates,
                 )
             )
 
@@ -3249,6 +3442,7 @@ def estimate(
                     }
                 )
                 continue
+            corner_candidates: list[dict[str, Any]] = []
             corner_catalog_cond = None
             if use_manufacturer_conditions:
                 corner_catalog_cond = auto_manufacturer_condition_for(
@@ -3260,6 +3454,7 @@ def estimate(
                     max_tool_diameter,
                     max_fit_diameter_mm=required_diameter,
                     require_depth_fit=True,
+                    candidates_out=corner_candidates,
                 )
             if corner_catalog_cond is not None:
                 fillet_tool_diameter = float(corner_catalog_cond["outside_diameter_mm"])
@@ -3328,6 +3523,7 @@ def estimate(
                     fillet_selection_reason,
                     fillet_reachability,
                     feature_key=corner_key,
+                    selection_candidates=corner_candidates,
                 )
             )
 
@@ -3372,6 +3568,7 @@ def estimate(
         if analysis["face_count"] >= 18 and pocket_volume > significant_volume_threshold(bbox):
             pocket_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
             pocket_cond = condition_for(conn, pocket_tool["tool_id"], material_type, "ポケット")
+            pocket_candidates: list[dict[str, Any]] = []
             pocket_catalog_cond = None
             if use_manufacturer_conditions:
                 pocket_target_diameter = 6.0 if bbox["x"] * bbox["y"] >= 2500 else 3.0
@@ -3383,6 +3580,7 @@ def estimate(
                     pocket_required_depth,
                     "ポケット",
                     max_tool_diameter,
+                    candidates_out=pocket_candidates,
                 )
             volume = pocket_volume
             if pocket_catalog_cond is not None:
@@ -3462,12 +3660,14 @@ def estimate(
                     pocket_selection_reason,
                     pocket_reachability,
                     feature_key="pocket_rough",
+                    selection_candidates=pocket_candidates,
                 )
             )
 
         if analysis["face_count"] >= 18:
             finish_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
             finish_cond = condition_for(conn, finish_tool["tool_id"], material_type, "ポケット")
+            finish_candidates: list[dict[str, Any]] = []
             finish_catalog_cond = None
             finish_target_diameter = min(10.0, max(3.0, min(bbox["x"], bbox["y"]) * 0.08))
             finish_required_depth = min(bbox["z"], 10.0)
@@ -3479,6 +3679,7 @@ def estimate(
                     finish_required_depth,
                     "側面",
                     max_tool_diameter,
+                    candidates_out=finish_candidates,
                 )
             if finish_catalog_cond is not None:
                 finish_diameter = float(finish_catalog_cond["outside_diameter_mm"])
@@ -3557,6 +3758,7 @@ def estimate(
                     ),
                     finish_selection_reason,
                     feature_key="floor_finish",
+                    selection_candidates=finish_candidates,
                 )
             )
 
@@ -3599,6 +3801,7 @@ def estimate(
                     ),
                     finish_selection_reason,
                     feature_key="wall_finish",
+                    selection_candidates=finish_candidates,
                 )
             )
 
@@ -3912,6 +4115,27 @@ def seconds_label_filter(seconds: float) -> str:
     return seconds_label(seconds)
 
 
+@app.errorhandler(InputError)
+def handle_input_error(exc: InputError) -> tuple[Response, int]:
+    return jsonify({"error": str(exc)}), 400
+
+
+@app.errorhandler(413)
+def handle_too_large(_exc: Exception) -> tuple[Response, int]:
+    return jsonify({"error": f"ファイルサイズが上限（{MAX_UPLOAD_MB} MB）を超えています。"}), 413
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(exc: Exception) -> Any:
+    # APIはHTMLのエラーページではなく必ずJSONで返し、画面側でメッセージを表示できるようにする
+    if isinstance(exc, HTTPException):
+        if request.path.startswith("/api/"):
+            return jsonify({"error": exc.description or exc.name}), exc.code or 500
+        return exc
+    app.logger.exception("Unhandled error: %s", request.path)
+    return jsonify({"error": f"サーバー内部でエラーが発生しました: {exc}"}), 500
+
+
 @app.get("/")
 def index() -> str:
     return render_template("index.html")
@@ -3986,8 +4210,12 @@ def api_analyze() -> Response:
         return jsonify({"error": "拡張子 .stp または .step のファイルを指定してください。"}), 400
 
     material_type = request.form.get("material_type", "鉄")
-    blank_allowance_mm = float(request.form.get("blank_allowance_mm", "5") or 5)
-    machine_id = int(request.form.get("machine_id", "1") or 1)
+    if material_type not in MATERIAL_TYPES:
+        raise InputError(f"材質は {' / '.join(MATERIAL_TYPES)} から選択してください。")
+    blank_allowance_mm = float(
+        input_number(request.form, "blank_allowance_mm", "ブランク代", default=5.0, minimum=0, maximum=100)
+    )
+    machine_id = int(input_number(request.form, "machine_id", "使用機械", default=1, minimum=1, integer=True))
     use_manufacturer_conditions = request.form.get("use_manufacturer_conditions", "on") == "on"
     estimate_mode = request.form.get("estimate_mode", "cautious")
     edm_policy = edm_policy_from_form(request.form)
@@ -4015,8 +4243,11 @@ def api_analyze() -> Response:
         )
         result["time_label"] = seconds_label(result["breakdown"]["total_sec"])
         return jsonify(result)
+    except InputError:
+        raise
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        app.logger.exception("解析に失敗しました: %s", upload.filename)
+        return jsonify({"error": f"解析に失敗しました: {exc}"}), 500
 
 
 @app.get("/api/histories")
@@ -4092,7 +4323,7 @@ def api_history_csv(history_id: int) -> Response:
 
 @app.post("/api/tools")
 def api_create_tool() -> Response:
-    data = request.get_json(force=True)
+    data = request_json_object()
     with db() as conn:
         cur = conn.execute(
             """
@@ -4101,11 +4332,11 @@ def api_create_tool() -> Response:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                data["tool_name"],
-                data["tool_type"],
-                float(data["diameter_mm"]),
-                int(data["flute_count"]),
-                float(data["max_depth_mm"]),
+                input_text(data, "tool_name", "工具名"),
+                input_text(data, "tool_type", "工具種別", max_length=20),
+                input_number(data, "diameter_mm", "工具径", minimum=0.01, maximum=200),
+                input_number(data, "flute_count", "刃数", minimum=1, maximum=20, integer=True),
+                input_number(data, "max_depth_mm", "最大深さ", minimum=0.01, maximum=1000),
                 data.get("material", ""),
                 1 if data.get("roughing", True) else 0,
                 1 if data.get("finishing", True) else 0,
@@ -4126,7 +4357,7 @@ def api_delete_tool(tool_id: int) -> Response:
 
 @app.post("/api/conditions")
 def api_create_condition() -> Response:
-    data = request.get_json(force=True)
+    data = request_json_object()
     with db() as conn:
         cur = conn.execute(
             """
@@ -4136,14 +4367,14 @@ def api_create_condition() -> Response:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                int(data["tool_id"]),
-                data["material_type"],
-                data["process_type"],
-                int(data["spindle_rpm"]),
-                float(data["feed_rate_mm_min"]),
-                float(data["depth_of_cut_mm"]),
-                float(data["width_of_cut_mm"]),
-                int(data["tool_change_sec"]),
+                input_number(data, "tool_id", "工具", minimum=1, integer=True),
+                input_text(data, "material_type", "材質", max_length=40),
+                input_text(data, "process_type", "工程", max_length=40),
+                input_number(data, "spindle_rpm", "回転数", minimum=1, maximum=200000, integer=True),
+                input_number(data, "feed_rate_mm_min", "送り速度", minimum=0.1, maximum=100000),
+                input_number(data, "depth_of_cut_mm", "切込み深さ", minimum=0.001, maximum=100),
+                input_number(data, "width_of_cut_mm", "切込み幅", minimum=0.001, maximum=200),
+                input_number(data, "tool_change_sec", "工具交換秒", minimum=0, maximum=600, integer=True),
             ),
         )
     return jsonify({"condition_id": cur.lastrowid})
@@ -4157,9 +4388,23 @@ def api_delete_condition(condition_id: int) -> Response:
     return jsonify({"ok": True})
 
 
+def machine_values_from_json(data: dict[str, Any]) -> tuple[Any, ...]:
+    max_tool_diameter = input_number(data, "max_tool_diameter_mm", "最大工具径", default=0.0, minimum=0, maximum=200)
+    return (
+        input_text(data, "machine_name", "機械名"),
+        input_number(data, "axis_count", "軸数", minimum=3, maximum=9, integer=True),
+        input_number(data, "rapid_feed_mm_min", "早送り", minimum=1, maximum=200000),
+        input_number(data, "atc_time_sec", "ATC秒", minimum=0, maximum=600, integer=True),
+        input_number(data, "max_spindle_rpm", "最大回転数", minimum=1, maximum=200000, integer=True),
+        max_tool_diameter or None,
+        input_number(data, "setup_time_min", "段取り分", minimum=0, maximum=1440, integer=True),
+        input_text(data, "memo", "メモ", max_length=500, required=False),
+    )
+
+
 @app.post("/api/machines")
 def api_create_machine() -> Response:
-    data = request.get_json(force=True)
+    values = machine_values_from_json(request_json_object())
     with db() as conn:
         cur = conn.execute(
             """
@@ -4168,23 +4413,14 @@ def api_create_machine() -> Response:
              max_spindle_rpm, max_tool_diameter_mm, setup_time_min, memo)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (
-                data["machine_name"],
-                int(data["axis_count"]),
-                float(data["rapid_feed_mm_min"]),
-                int(data["atc_time_sec"]),
-                int(data["max_spindle_rpm"]),
-                float(data["max_tool_diameter_mm"]) if data.get("max_tool_diameter_mm") else None,
-                int(data["setup_time_min"]),
-                data.get("memo", ""),
-            ),
+            values,
         )
     return jsonify({"machine_id": cur.lastrowid})
 
 
 @app.put("/api/machines/<int:machine_id>")
 def api_update_machine(machine_id: int) -> Response:
-    data = request.get_json(force=True)
+    values = machine_values_from_json(request_json_object())
     with db() as conn:
         cur = conn.execute(
             """
@@ -4199,17 +4435,7 @@ def api_update_machine(machine_id: int) -> Response:
                 memo = ?
             WHERE machine_id = ?
             """,
-            (
-                data["machine_name"],
-                int(data["axis_count"]),
-                float(data["rapid_feed_mm_min"]),
-                int(data["atc_time_sec"]),
-                int(data["max_spindle_rpm"]),
-                float(data["max_tool_diameter_mm"]) if data.get("max_tool_diameter_mm") else None,
-                int(data["setup_time_min"]),
-                data.get("memo", ""),
-                machine_id,
-            ),
+            (*values, machine_id),
         )
     if cur.rowcount == 0:
         return jsonify({"error": "機械マスタが見つかりません。"}), 404
@@ -4219,6 +4445,9 @@ def api_update_machine(machine_id: int) -> Response:
 @app.delete("/api/machines/<int:machine_id>")
 def api_delete_machine(machine_id: int) -> Response:
     with db() as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM machines WHERE machine_id != ?", (machine_id,)).fetchone()[0]
+        if remaining == 0:
+            raise InputError("機械マスタが1件のみのため削除できません。先に別の機械を登録してください。")
         conn.execute("DELETE FROM machines WHERE machine_id = ?", (machine_id,))
         ensure_operational_master(conn)
     return jsonify({"ok": True})

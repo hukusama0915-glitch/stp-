@@ -23,7 +23,9 @@
         <button class="tab" data-tab="history">履歴</button>
       </nav>
       <div class="scope-note">
-        STEPテキスト構造から形状特徴を抽出する概算版です。Python-OCC連携は次段階で差し替え可能な構成です。
+        CadQuery（OpenCascade）のB-Rep解析で穴・溝・ポケット・微細形状を認識し、
+        メーカー公式の切削条件から工具を自動選定して加工時間を概算します。
+        結果は見積もりの目安で、実際のCAMパスとは異なります。
       </div>
     </aside>
 
@@ -122,10 +124,10 @@
                   </div>
                   <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
                   <canvas id="cadPreviewCanvas" width="720" height="360" aria-label="STP詳細3Dプレビュー" class="hidden"></canvas>
-                  <div id="viewCube" class="view-cube" aria-hidden="true">
-                    <span>TOP</span>
-                    <strong>ISO</strong>
-                    <em>FRONT</em>
+                  <div id="viewCube" class="view-cube" aria-label="視点切替キューブ">
+                    <span data-view-preset="top" title="上面から見る">TOP</span>
+                    <strong data-view-preset="iso" title="等角表示に戻す">ISO</strong>
+                    <em data-view-preset="front" title="正面から見る">FRONT</em>
                   </div>
                 </div>
                 <dl id="previewStats" class="preview-stats"></dl>
@@ -152,7 +154,10 @@
           </section>
 
           <section class="panel">
-            <h3>認識フィーチャ</h3>
+            <div class="section-head">
+              <h3>認識フィーチャ</h3>
+              <span class="section-hint">行をクリックすると3Dプレビューで工具パスを強調表示</span>
+            </div>
             <div class="table-wrap">
               <table>
                 <thead>
@@ -244,11 +249,22 @@
               <h3>切削条件</h3>
               <div class="catalog-toolbar maker-condition-toolbar">
                 <input id="makerConditionSearch" type="search" placeholder="メーカー・シリーズ・型番・被削材で検索">
-                <select id="makerConditionMaterialFilter">
+                <select id="makerConditionMakerFilter" aria-label="メーカーで絞り込み">
+                  <option value="">全メーカー</option>
+                </select>
+                <select id="makerConditionMaterialFilter" aria-label="被削材で絞り込み">
                   <option value="">全被削材</option>
                 </select>
+                <span class="range-filter">
+                  外径
+                  <input id="makerConditionDiameterMin" type="number" min="0" step="0.1" placeholder="最小" aria-label="外径の下限 mm">
+                  〜
+                  <input id="makerConditionDiameterMax" type="number" min="0" step="0.1" placeholder="最大" aria-label="外径の上限 mm">
+                  mm
+                </span>
               </div>
             </div>
+            <p id="conditionLimitNote" class="limit-note hidden"></p>
             <div class="table-wrap">
               <table class="condition-table">
                 <thead>
