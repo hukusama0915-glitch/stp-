@@ -67,6 +67,25 @@
                   <option value="conservative">保守的</option>
                 </select>
               </label>
+              <details class="edm-settings" open>
+                <summary>放電置き換え条件</summary>
+                <label class="checkbox-line">
+                  <input type="checkbox" name="edm_enabled" checked>
+                  <span>切削しない条件を判定して放電加工へ置き換える</span>
+                </label>
+                <label>幅 mm 以下で
+                  <input type="number" name="edm_max_width_mm" value="3" min="0" step="0.1">
+                </label>
+                <label>深さ mm 以上なら放電
+                  <input type="number" name="edm_min_depth_mm" value="10" min="0" step="0.5">
+                </label>
+                <label>深さ/幅比 以上でも放電
+                  <input type="number" name="edm_min_aspect" value="6" min="0" step="0.5">
+                </label>
+                <label>テーパ角 ° 以上でも放電（0で無効）
+                  <input type="number" name="edm_min_taper_deg" value="2" min="0" step="0.5">
+                </label>
+              </details>
               <button class="primary" type="submit">解析実行</button>
             </div>
 
@@ -88,7 +107,18 @@
                     <button type="button" data-view-mode="shaded" title="シェーディング">SHADE</button>
                     <button type="button" data-view-mode="wire" title="ワイヤ表示">WIRE</button>
                     <button type="button" data-view-mode="transparent" title="透過表示">TRANS</button>
+                    <button type="button" data-view-toggle="paths" class="active" title="工具パス表示切替">PATH</button>
                     <button type="button" data-view-fit title="全体表示">FIT</button>
+                  </div>
+                  <div id="pathLegend" class="path-legend hidden" aria-label="工具パス凡例">
+                    <span><i style="background:#2563eb"></i>穴・座ぐり</span>
+                    <span><i style="background:#0e7490"></i>微細穴</span>
+                    <span><i style="background:#d97706"></i>溝</span>
+                    <span><i style="background:#7c3aed"></i>隅R</span>
+                    <span><i style="background:#0d9488"></i>面走査</span>
+                    <span><i style="background:#15803d"></i>輪郭</span>
+                    <span><i style="background:#dc2626"></i>放電候補</span>
+                    <span><i style="background:#9ca3af"></i>除外</span>
                   </div>
                   <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
                   <canvas id="cadPreviewCanvas" width="720" height="360" aria-label="STP詳細3Dプレビュー" class="hidden"></canvas>
@@ -126,9 +156,44 @@
             <div class="table-wrap">
               <table>
                 <thead>
-                  <tr><th>種別</th><th>寸法</th><th>数量</th><th>工具</th><th>切削条件</th><th>加工パス</th><th>時間</th></tr>
+                  <tr><th>種別</th><th>寸法</th><th>数量</th><th>工具</th><th>切削条件</th><th>加工パス</th><th>時間</th><th></th></tr>
                 </thead>
                 <tbody id="featureRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel edm-panel hidden" id="edmPanel">
+            <div class="section-head">
+              <h3>放電加工 置き換え候補</h3>
+              <span id="edmBadge" class="edm-badge">0件</span>
+            </div>
+            <p class="edm-note">
+              指定した幅・深さ条件に該当し、切削（MC）加工の時間からは除外したフィーチャです。
+              放電時間は参考値で、電極製作・段取り替えは含みません。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>方式</th><th>種別</th><th>寸法</th><th>数量</th><th>判定理由</th><th>参考放電時間</th><th></th></tr>
+                </thead>
+                <tbody id="edmRows"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="panel hidden" id="excludedPanel">
+            <h3>加工対象外（穴埋め扱い）</h3>
+            <p class="edm-note">
+              「穴埋め/除外」に指定したフィーチャです。切削時間・放電候補の両方から除外しています。
+              3Dプレビューでは穴はプラグ（灰色）で埋めた表示になります。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>区分</th><th>フィーチャ</th><th>数量</th><th></th></tr>
+                </thead>
+                <tbody id="excludedRows"></tbody>
               </table>
             </div>
           </section>

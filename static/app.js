@@ -3,7 +3,8 @@ const state = {
   lastResult: null,
   preview: null,
   previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0, preset: "iso" },
-  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded" },
+  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded", toolpathGroup: null, showPaths: true },
+  excluded: new Set(),
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -262,6 +263,7 @@ function applyCadDisplayMode(mode) {
   const group = state.cadPreview.group;
   if (group) {
     group.traverse((object) => {
+      if (object.userData && object.userData.overlay) return;
       if (object.isMesh) {
         object.material.wireframe = mode === "wire";
         object.material.transparent = mode === "transparent";
@@ -395,6 +397,7 @@ async function loadDetailedCadPreview(buffer) {
   applyCadDisplayMode(state.cadPreview.displayMode);
   setPreviewMode("cad");
   renderCadScene();
+  if (state.lastResult) renderToolpaths(state.lastResult);
 }
 
 function renderCadScene() {
@@ -421,6 +424,161 @@ function renderCadScene() {
 
   group.rotation.set(state.previewView.pitch, 0, state.previewView.yaw, "XYZ");
   renderer.render(scene, camera);
+}
+
+const TOOLPATH_COLORS = {
+  drill: 0x2563eb,
+  helix: 0x0e7490,
+  slot: 0xd97706,
+  vline: 0x7c3aed,
+  circle: 0x2563eb,
+  hline: 0x2563eb,
+  raster: 0x0d9488,
+  loops: 0x15803d,
+};
+
+function clearToolpaths() {
+  const cp = state.cadPreview;
+  if (cp.toolpathGroup && cp.group) cp.group.remove(cp.toolpathGroup);
+  cp.toolpathGroup = null;
+}
+
+function toolpathLine(points, color, dashed) {
+  const THREE = window.THREE;
+  const geometry = new THREE.BufferGeometry().setFromPoints(points.map((p) => new THREE.Vector3(p[0], p[1], p[2])));
+  const material = dashed
+    ? new THREE.LineDashedMaterial({ color, dashSize: 1.6, gapSize: 1.0, transparent: true, opacity: 0.95, depthTest: false })
+    : new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false });
+  const line = new THREE.Line(geometry, material);
+  if (dashed) line.computeLineDistances();
+  line.userData.overlay = true;
+  line.renderOrder = 10;
+  return line;
+}
+
+function circlePoints(x, y, z, r, segments = 28) {
+  const pts = [];
+  for (let i = 0; i <= segments; i += 1) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push([x + Math.cos(a) * r, y + Math.sin(a) * r, z]);
+  }
+  return pts;
+}
+
+function buildOverlayObjects(o, color, dashed, excluded) {
+  const THREE = window.THREE;
+  const objects = [];
+  if (o.kind === "drill" || o.kind === "helix" || o.kind === "vline") {
+    if (excluded) {
+      // 穴埋め表示: 円柱プラグで埋まっているように見せる
+      const radius = Math.max((o.d || 1) / 2, 0.15);
+      const geometry = new THREE.CylinderGeometry(radius, radius, o.depth, 20);
+      const material = new THREE.MeshStandardMaterial({ color: 0x8a9388, roughness: 0.7, transparent: true, opacity: 0.92 });
+      const plug = new THREE.Mesh(geometry, material);
+      plug.rotation.x = Math.PI / 2;
+      plug.position.set(o.x, o.y, o.z - o.depth / 2);
+      plug.userData.overlay = true;
+      plug.renderOrder = 9;
+      objects.push(plug);
+      return objects;
+    }
+    if (o.kind === "drill") {
+      objects.push(toolpathLine([[o.x, o.y, o.z + 3], [o.x, o.y, o.z - o.depth]], color, dashed));
+      objects.push(toolpathLine(circlePoints(o.x, o.y, o.z, Math.max(o.d / 2, 0.2), 20), color, dashed));
+    } else if (o.kind === "helix") {
+      const r = Math.max(o.d * 0.32, 0.2);
+      const revs = Math.min(24, Math.max(3, Math.round(o.depth / Math.max(0.2, o.d * 0.15))));
+      const steps = revs * 10;
+      const pts = [];
+      for (let i = 0; i <= steps; i += 1) {
+        const a = (i / 10) * Math.PI * 2;
+        pts.push([o.x + Math.cos(a) * r, o.y + Math.sin(a) * r, o.z - (i / steps) * o.depth]);
+      }
+      objects.push(toolpathLine(pts, color, dashed));
+    } else {
+      objects.push(toolpathLine([[o.x, o.y, o.z + 2], [o.x, o.y, o.z - o.depth]], color, dashed));
+    }
+    return objects;
+  }
+  if (o.kind === "circle") {
+    const r = Math.max((o.d || 1) / 2, 0.3);
+    objects.push(toolpathLine(circlePoints(o.x, o.y, o.z + 0.3, r), color, dashed || excluded));
+    if (o.depth > 0.5) objects.push(toolpathLine(circlePoints(o.x, o.y, o.z - o.depth, r * 0.85), color, dashed || excluded));
+    return objects;
+  }
+  if (o.kind === "slot" && Array.isArray(o.seg)) {
+    const [x1, y1, x2, y2] = o.seg;
+    objects.push(toolpathLine([[x1, y1, o.z + 0.4], [x2, y2, o.z + 0.4]], color, dashed || excluded));
+    objects.push(toolpathLine([[x1, y1, o.z - o.depth], [x2, y2, o.z - o.depth]], color, dashed || excluded));
+    objects.push(toolpathLine([[x1, y1, o.z + 0.4], [x1, y1, o.z - o.depth]], color, true));
+    objects.push(toolpathLine([[x2, y2, o.z + 0.4], [x2, y2, o.z - o.depth]], color, true));
+    return objects;
+  }
+  if (o.kind === "hline" && Array.isArray(o.seg3)) {
+    const [x1, y1, z1, x2, y2, z2] = o.seg3;
+    objects.push(toolpathLine([[x1, y1, z1], [x2, y2, z2]], color, dashed || excluded));
+    return objects;
+  }
+  if (o.kind === "raster") {
+    const lanes = Math.max(2, Math.min(40, Math.floor((o.ymax - o.ymin) / Math.max(o.pitch, 0.5)) + 1));
+    const pts = [];
+    for (let i = 0; i < lanes; i += 1) {
+      const y = o.ymin + ((o.ymax - o.ymin) * i) / (lanes - 1);
+      if (i % 2 === 0) {
+        pts.push([o.xmin, y, o.z], [o.xmax, y, o.z]);
+      } else {
+        pts.push([o.xmax, y, o.z], [o.xmin, y, o.z]);
+      }
+    }
+    objects.push(toolpathLine(pts, color, dashed || excluded));
+    return objects;
+  }
+  if (o.kind === "loops") {
+    const loops = Math.max(1, Math.min(12, o.loops || 3));
+    for (let i = 0; i < loops; i += 1) {
+      const z = o.z_top - ((o.z_top - o.z_bottom) * (i + 0.5)) / loops;
+      objects.push(
+        toolpathLine(
+          [
+            [o.xmin, o.ymin, z], [o.xmax, o.ymin, z], [o.xmax, o.ymax, z], [o.xmin, o.ymax, z], [o.xmin, o.ymin, z],
+          ],
+          color,
+          dashed || excluded,
+        ),
+      );
+    }
+    return objects;
+  }
+  return objects;
+}
+
+function renderToolpaths(result) {
+  const cp = state.cadPreview;
+  const legend = $("#pathLegend");
+  const overlays = result?.analysis?.toolpath_overlays || [];
+  if (legend) legend.classList.toggle("hidden", overlays.length === 0);
+  if (!window.THREE || !cp.group) return;
+  clearToolpaths();
+  if (!overlays.length) {
+    renderCurrentPreview();
+    return;
+  }
+  const THREE = window.THREE;
+  const toolpathGroup = new THREE.Group();
+  toolpathGroup.userData.overlay = true;
+  const edmKeys = new Set((result.edm_candidates || []).map((c) => c.feature_key).filter(Boolean));
+  for (const o of overlays) {
+    const excluded = state.excluded.has(o.key);
+    const isEdm = edmKeys.has(o.key);
+    const color = excluded ? 0x9ca3af : isEdm ? 0xdc2626 : TOOLPATH_COLORS[o.kind] || 0x2563eb;
+    for (const object of buildOverlayObjects(o, color, isEdm && !excluded, excluded)) {
+      toolpathGroup.add(object);
+    }
+  }
+  cp.toolpathGroup = toolpathGroup;
+  toolpathGroup.visible = cp.showPaths;
+  cp.group.add(toolpathGroup);
+  renderCurrentPreview();
 }
 
 function drawPreviewPlaceholder() {
@@ -886,13 +1044,47 @@ function renderResult(result) {
 
   $("#featureRows").innerHTML = result.features.map((f) => `
     <tr>
-      <td>${f.feature_type}</td><td>${f.dimensions}<br><small>${f.note}</small></td>
+      <td>${f.feature_type}</td><td>${f.dimensions}<br><small>${f.note}</small>${f.reachability ? `<br><small class="reachability-warning">${f.reachability}</small>` : ""}</td>
       <td>${f.quantity}</td><td>${f.tool_name}${f.selection_reason ? `<br><small>${f.selection_reason}</small>` : ""}</td>
       <td class="condition-cell">${f.cutting_condition || "-"}</td>
       <td class="path-cell">${f.path_plan || "-"}</td>
       <td>${secLabel(f.machining_sec)}</td>
+      <td>${f.feature_key ? `<button type="button" class="link-btn" data-exclude-key="${f.feature_key}" title="このフィーチャを加工対象外（穴埋め扱い）にして再計算">穴埋め/除外</button>` : ""}</td>
     </tr>
   `).join("");
+
+  const excludedRows = result.excluded_features || [];
+  const excludedPanel = $("#excludedPanel");
+  if (excludedPanel) {
+    excludedPanel.classList.toggle("hidden", excludedRows.length === 0);
+    $("#excludedRows").innerHTML = excludedRows.map((e) => `
+      <tr>
+        <td>${e.kind === "edm" ? "放電候補" : "切削"}</td>
+        <td>${e.label}</td>
+        <td>${e.count}</td>
+        <td><button type="button" class="link-btn" data-restore-key="${e.feature_key}">加工対象に戻す</button></td>
+      </tr>
+    `).join("");
+  }
+
+  const edmCandidates = result.edm_candidates || [];
+  const edmPanel = $("#edmPanel");
+  if (edmPanel) {
+    edmPanel.classList.toggle("hidden", edmCandidates.length === 0);
+    const edmTotal = edmCandidates.reduce((total, c) => total + Number(c.reference_sec || 0), 0);
+    $("#edmBadge").textContent = `${edmCandidates.length}件 / 参考 ${secLabel(edmTotal)}`;
+    $("#edmRows").innerHTML = edmCandidates.map((c) => `
+      <tr>
+        <td><span class="edm-type">${c.edm_type}</span></td>
+        <td>${c.feature_type}</td>
+        <td>${c.dimensions}</td>
+        <td>${c.count}</td>
+        <td class="condition-cell">${c.reason}</td>
+        <td>${secLabel(c.reference_sec)}</td>
+        <td>${c.feature_key ? `<button type="button" class="link-btn" data-exclude-key="${c.feature_key}" title="この形状を加工しない（穴埋め扱い）ことにして候補から外す">除外</button>` : ""}</td>
+      </tr>
+    `).join("");
+  }
 
   $("#toolUsageRows").innerHTML = result.tool_usage.map((t) => `
     <tr>
@@ -915,6 +1107,15 @@ function renderResult(result) {
     <dt>加工特徴</dt><dd>${machiningFeatureSummary(result.analysis.machining_features)}</dd>
     <dt>ソリッド/エッジ</dt><dd>${result.analysis.solid_count} / ${result.analysis.edge_count}</dd>
   ` : "";
+  const reachabilityIssues = result.analysis.reachability_issues || [];
+  const reachabilityRows = reachabilityIssues.length ? `
+    <dt>到達性注意</dt><dd>${reachabilityIssues.length}件 / ${reachabilityIssues.slice(0, 3).map((item) => item.feature_type).join("、")}</dd>
+  ` : "";
+  const edmPolicy = result.edm_policy || {};
+  const edmTaperLabel = Number(edmPolicy.min_taper_deg) > 0 ? ` / テーパ≥${edmPolicy.min_taper_deg}°` : "";
+  const edmPolicyRow = edmPolicy.enabled
+    ? `<dt>放電置き換え</dt><dd>幅≤${edmPolicy.max_width_mm}mm かつ 深さ≥${edmPolicy.min_depth_mm}mm / 深さ幅比≥${edmPolicy.min_aspect}${edmTaperLabel} / 候補 ${edmCandidates.length}件</dd>`
+    : `<dt>放電置き換え</dt><dd>判定オフ</dd>`;
   $("#analysisInfo").innerHTML = `
     <dt>解析方式</dt><dd>${result.analysis.parser}</dd>
     <dt>条件ソース</dt><dd>${result.condition_source || "-"}</dd>
@@ -922,10 +1123,24 @@ function renderResult(result) {
     <dt>最大工具径</dt><dd>${result.machine.max_tool_diameter_mm ? `${result.machine.max_tool_diameter_mm} mm` : "制限なし"}</dd>
     <dt>外形寸法</dt><dd>${bbox.x.toFixed(1)} x ${bbox.y.toFixed(1)} x ${bbox.z.toFixed(1)} mm</dd>
     ${volumeRows}
+    ${reachabilityRows}
+    ${edmPolicyRow}
     <dt>エンティティ</dt><dd>${result.analysis.entity_count}</dd>
     <dt>面候補</dt><dd>${result.analysis.face_count}</dd>
     <dt>円筒面候補</dt><dd>${result.analysis.cylindrical_radii.length}</dd>
   `;
+
+  renderToolpaths(result);
+}
+
+async function reanalyzeWithExclusions() {
+  const fileInput = $("#analyzeForm [name=stp_file]");
+  if (!fileInput || !fileInput.files || !fileInput.files.length) {
+    toast("STPファイルを選択し直してから再解析してください。除外指定は保持されます。");
+    if (state.lastResult) renderToolpaths(state.lastResult);
+    return;
+  }
+  $("#analyzeForm").requestSubmit();
 }
 
 async function loadHistories() {
@@ -1005,7 +1220,29 @@ function bindEvents() {
 
   $("[data-view-fit]")?.addEventListener("click", fitPreview);
 
+  document.body.addEventListener("click", async (event) => {
+    const excludeButton = event.target.closest("[data-exclude-key]");
+    const restoreButton = event.target.closest("[data-restore-key]");
+    if (!excludeButton && !restoreButton) return;
+    if (excludeButton) state.excluded.add(excludeButton.dataset.excludeKey);
+    if (restoreButton) state.excluded.delete(restoreButton.dataset.restoreKey);
+    await reanalyzeWithExclusions();
+  });
+
+  $$("[data-view-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.viewToggle !== "paths") return;
+      state.cadPreview.showPaths = !state.cadPreview.showPaths;
+      button.classList.toggle("active", state.cadPreview.showPaths);
+      if (state.cadPreview.toolpathGroup) {
+        state.cadPreview.toolpathGroup.visible = state.cadPreview.showPaths;
+      }
+      renderCurrentPreview();
+    });
+  });
+
   fileInput.addEventListener("change", (event) => {
+    state.excluded.clear();
     const file = event.target.files[0];
     $("#fileName").textContent = file ? file.name : "ファイルを選択";
     previewFile(file).catch((error) => toast(error.message));
@@ -1037,11 +1274,16 @@ function bindEvents() {
 
   $("#analyzeForm").addEventListener("submit", async (event) => {
     event.preventDefault();
-    const button = event.submitter;
+    // requestSubmit()による再解析では event.submitter が null になる
+    const button = event.submitter || $("#analyzeForm button.primary[type=submit]") || { disabled: false, textContent: "" };
     button.disabled = true;
     button.textContent = "解析中";
     try {
-      const data = await jsonFetch("/api/analyze", { method: "POST", body: new FormData(event.currentTarget) });
+      const formData = new FormData(event.currentTarget);
+      // チェックボックスは未チェック時に送信されないため、明示的にoffを送る
+      if (!formData.has("edm_enabled")) formData.set("edm_enabled", "off");
+      formData.set("excluded_features", JSON.stringify(Array.from(state.excluded)));
+      const data = await jsonFetch("/api/analyze", { method: "POST", body: formData });
       renderResult(data);
       toast("解析が完了しました。");
     } catch (error) {

@@ -556,6 +556,14 @@ td {
   line-height: 1.45;
 }
 
+.reachability-warning {
+  display: inline-block;
+  margin-top: 5px;
+  color: var(--danger);
+  font-weight: 700;
+  line-height: 1.45;
+}
+
 .info-list {
   display: grid;
   grid-template-columns: max-content 1fr;
@@ -690,4 +698,111 @@ td {
   .catalog-toolbar {
     grid-template-columns: 1fr;
   }
+}
+
+.edm-settings {
+  grid-column: 1 / -1;
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,.7);
+  padding: 12px 14px;
+}
+
+.edm-settings summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: var(--sub);
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.edm-settings label {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.edm-settings label.checkbox-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edm-settings label.checkbox-line input {
+  width: auto;
+}
+
+.edm-panel {
+  border-left: 4px solid var(--danger);
+}
+
+.edm-badge {
+  justify-self: end;
+  background: #fff5f3;
+  border: 1px solid #dfb4af;
+  color: var(--danger);
+  padding: 6px 12px;
+  font-weight: 700;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.edm-note {
+  color: var(--sub);
+  font-size: 12px;
+  margin-bottom: 10px;
+  line-height: 1.6;
+}
+
+.edm-type {
+  display: inline-block;
+  background: #fff5f3;
+  border: 1px solid #dfb4af;
+  color: var(--danger);
+  font-weight: 700;
+  font-size: 12px;
+  padding: 2px 8px;
+  white-space: nowrap;
+}
+
+.link-btn {
+  border: 1px solid var(--line);
+  background: rgba(255,255,255,.8);
+  color: var(--sub);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.link-btn:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.path-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--sub);
+  background: rgba(255,255,255,.85);
+  border-top: 1px solid var(--line);
+}
+
+.path-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.path-legend i {
+  display: inline-block;
+  width: 14px;
+  height: 3px;
+}
+
+#excludedPanel {
+  border-left: 4px solid #8a9388;
 }

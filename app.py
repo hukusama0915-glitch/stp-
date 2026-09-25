@@ -21,7 +21,7 @@ DB_PATH = BASE_DIR / "stp_time_tool.sqlite3"
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
-APP_VERSION = "2026-05-23-master-repair-no-face-mill"
+APP_VERSION = "2026-07-10-edm-policy-taper"
 
 
 app = Flask(__name__)
@@ -166,6 +166,7 @@ def init_db() -> None:
         ensure_schema(conn)
         seed_union_tool_catalogs(conn)
         seed_osg_catalogs(conn)
+        seed_nstool_catalogs(conn)
         seed_union_tool_cutting_conditions(conn)
         ensure_catalog_tool_master(conn)
         ensure_operational_master(conn)
@@ -336,6 +337,32 @@ def purge_non_catalog_tooling(conn: sqlite3.Connection) -> dict[str, int]:
 
 UNION_TOOL_SOURCE_URL = "https://www.uniontool.co.jp/catalog/endmill.html"
 OSG_SOURCE_URL = "https://www.osg.co.jp/media_dl/flier/endmill.html"
+NSTOOL_SOURCE_URL = "https://www.ns-tool.com/ja/products/"
+
+# 日進工具（NS TOOL）: 公式Webカタログ。切削条件参考表(XLSX)は
+# scripts/fetch_nstool_conditions.py で data/nstool_cutting_conditions.csv に変換する。
+NSTOOL_CATALOG_ITEMS = [
+    (
+        "無限コーティング 2枚刃ロングネックエンドミル（深リブ用） MHR230",
+        "https://www.ns-tool.com/ja/products/detail/44",
+    ),
+    (
+        "無限コーティング 4枚刃ロングネックエンドミル（深リブ用） MHR430",
+        "https://www.ns-tool.com/ja/products/detail/66",
+    ),
+    (
+        "無限コーティング 2枚刃ロングネックラジアスエンドミル MHR230R",
+        "https://www.ns-tool.com/ja/products/detail/45",
+    ),
+    (
+        "無限コーティング 2枚刃エンドミル MSE245",
+        "https://www.ns-tool.com/ja/products/detail/99",
+    ),
+    (
+        "無限コーティング 4枚刃エンドミル MSE445",
+        "https://www.ns-tool.com/ja/products/detail/103",
+    ),
+]
 
 UNION_TOOL_CATALOG_ITEMS = [
     ("超硬エンドミル総合カタログ vol.22", "https://www.uniontool.co.jp/assets/pdf/catalog/endmill_vol22_jp.pdf"),
@@ -677,6 +704,39 @@ def seed_osg_catalogs(conn: sqlite3.Connection) -> None:
     )
 
 
+def seed_nstool_catalogs(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "DELETE FROM manufacturer_catalogs WHERE manufacturer = ? OR source_url = ?",
+        ("日進工具", NSTOOL_SOURCE_URL),
+    )
+    rows = []
+    for product_name, catalog_url in NSTOOL_CATALOG_ITEMS:
+        series = infer_series_codes(product_name)
+        rows.append(
+            (
+                "日進工具",
+                product_name,
+                infer_catalog_tool_type(product_name),
+                infer_flute_info(product_name),
+                "無限コーティング",
+                infer_material_hint(product_name),
+                series,
+                catalog_url,
+                NSTOOL_SOURCE_URL,
+                "NS TOOL公式Webカタログ。MHR系は切削条件参考表XLSXから条件を登録済み。MSE系の切込み量はカタログ図参照。",
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO manufacturer_catalogs
+        (manufacturer, product_name, tool_type, flute_info, coating, material_hint,
+         series_codes, catalog_url, source_url, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
 def seed_union_tool_cutting_conditions(conn: sqlite3.Connection) -> None:
     paths = sorted((BASE_DIR / "data").glob("*_cutting_conditions.csv"))
     rows = []
@@ -708,6 +768,13 @@ def seed_union_tool_cutting_conditions(conn: sqlite3.Connection) -> None:
             )
     if not rows:
         return
+    # CSVを正とし、CSVに含まれるメーカーの既存行は入れ替える（被削材区分の変更等で
+    # UNIQUEキーが変わった旧行が残留しないようにする）
+    for manufacturer in {row[0] for row in rows}:
+        conn.execute(
+            "DELETE FROM manufacturer_cutting_conditions WHERE manufacturer = ?",
+            (manufacturer,),
+        )
     conn.executemany(
         """
         INSERT OR REPLACE INTO manufacturer_cutting_conditions
@@ -822,6 +889,8 @@ class Feature:
     cutting_condition: str = ""
     path_plan: str = ""
     selection_reason: str = ""
+    reachability: str = ""
+    feature_key: str = ""
 
 
 def fmt_number(value: Any, digits: int = 2) -> str:
@@ -864,6 +933,76 @@ def tool_limit_summary(max_tool_diameter_mm: float | None) -> str:
     if max_tool_diameter_mm is None or max_tool_diameter_mm <= 0:
         return "最大工具径制限なし"
     return f"最大工具径 {fmt_number(max_tool_diameter_mm)} mm 以下"
+
+
+def tool_diameter(tool: sqlite3.Row | dict[str, Any] | None) -> float | None:
+    if tool is None:
+        return None
+    for key in ("diameter_mm", "outside_diameter_mm"):
+        try:
+            value = tool[key]  # type: ignore[index]
+        except (KeyError, IndexError):
+            continue
+        if value is not None:
+            return float(value)
+    return None
+
+
+def tool_effective_length(tool: sqlite3.Row | dict[str, Any] | None) -> float | None:
+    if tool is None:
+        return None
+    for key in ("max_depth_mm", "effective_length_mm"):
+        try:
+            value = tool[key]  # type: ignore[index]
+        except (KeyError, IndexError):
+            continue
+        if value is not None:
+            return float(value)
+    return None
+
+
+def reachability_assessment(
+    *,
+    tool_diameter_mm: float,
+    available_width_mm: float | None = None,
+    required_depth_mm: float | None = None,
+    effective_length_mm: float | None = None,
+    corner_radius_mm: float | None = None,
+    context: str = "",
+) -> tuple[str, float]:
+    notes: list[str] = []
+    factor = 1.0
+    label = f"{context}: " if context else ""
+
+    if available_width_mm is not None and available_width_mm > 0:
+        width = float(available_width_mm)
+        if tool_diameter_mm > width:
+            notes.append(f"{label}工具径φ{fmt_number(tool_diameter_mm)}が幅{fmt_number(width)}mmを超過")
+            factor = max(factor, 1.55)
+        elif tool_diameter_mm > width * 0.9:
+            notes.append(f"{label}工具径φ{fmt_number(tool_diameter_mm)}に対して幅{fmt_number(width)}mmで逃げが小さい")
+            factor = max(factor, 1.18)
+
+    if corner_radius_mm is not None and corner_radius_mm > 0:
+        allowed = float(corner_radius_mm) * 2.0
+        if tool_diameter_mm > allowed:
+            notes.append(f"{label}R{fmt_number(corner_radius_mm)}に対して工具径φ{fmt_number(tool_diameter_mm)}が大きい")
+            factor = max(factor, 1.6)
+        elif tool_diameter_mm > allowed * 0.9:
+            notes.append(f"{label}R{fmt_number(corner_radius_mm)}に対して工具径余裕が小さい")
+            factor = max(factor, 1.2)
+
+    if required_depth_mm is not None and required_depth_mm > 0 and effective_length_mm is not None:
+        depth = float(required_depth_mm)
+        effective = float(effective_length_mm)
+        if effective < depth:
+            notes.append(f"{label}必要深さ{fmt_number(depth)}mmに対して有効長{fmt_number(effective)}mmが不足")
+            factor = max(factor, 1.65)
+        elif effective < depth * 1.15:
+            notes.append(f"{label}必要深さ{fmt_number(depth)}mmに対して有効長余裕が小さい")
+            factor = max(factor, 1.22)
+
+    return " / ".join(notes), factor
 
 
 def internal_tool_selection_reason(
@@ -973,6 +1112,10 @@ def axial_depth_for_plan(depth_mm: float, tool_diameter_mm: float, required_dept
     required = max(0.5, float(required_depth_mm))
     diameter = max(0.1, float(tool_diameter_mm))
     planned = max(float(depth_mm), min(required, diameter * ratio), 0.5)
+    # 微細用条件（ap<0.3mm）は工具剛性の制約が強く、工具径基準への引き上げは
+    # 非現実的な除去レートになるため3倍までに制限する
+    if 0 < float(depth_mm) < 0.3:
+        planned = min(planned, max(float(depth_mm) * 3.0, 0.5))
     return min(planned, required)
 
 
@@ -1081,6 +1224,120 @@ def safety_allowance_feature(
     )
 
 
+DEFAULT_EDM_POLICY = {
+    "enabled": True,
+    "max_width_mm": 3.0,
+    "min_depth_mm": 10.0,
+    "min_aspect": 6.0,
+    "min_taper_deg": 2.0,
+}
+
+# 放電加工の参考レート。放電条件・電極段数で大きく変動するため参考値扱い。
+EDM_SINKER_BURN_RATE_MM3_MIN = {"アルミ": 12.0, "銅": 10.0}
+EDM_SINKER_BURN_RATE_DEFAULT = 8.0
+EDM_FINE_HOLE_FEED_MM_MIN = 3.0
+EDM_SETUP_SEC_PER_SHAPE = 15 * 60
+
+
+def edm_policy_from_form(form: Any) -> dict[str, Any]:
+    def value(name: str, default: float) -> float:
+        try:
+            return float(form.get(name, str(default)) or default)
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "enabled": form.get("edm_enabled", "on") == "on",
+        "max_width_mm": max(0.0, value("edm_max_width_mm", DEFAULT_EDM_POLICY["max_width_mm"])),
+        "min_depth_mm": max(0.0, value("edm_min_depth_mm", DEFAULT_EDM_POLICY["min_depth_mm"])),
+        "min_aspect": max(0.0, value("edm_min_aspect", DEFAULT_EDM_POLICY["min_aspect"])),
+        "min_taper_deg": max(0.0, value("edm_min_taper_deg", DEFAULT_EDM_POLICY["min_taper_deg"])),
+    }
+
+
+def milling_tool_available(
+    conn: sqlite3.Connection,
+    required_diameter_mm: float,
+    required_depth_mm: float,
+) -> bool:
+    """径・深さの制約を満たす切削工具が社内マスタまたはメーカー条件に存在するか。"""
+    if required_diameter_mm <= 0:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM tools WHERE tool_type = 'EM' AND diameter_mm <= ? AND max_depth_mm >= ? LIMIT 1",
+        (required_diameter_mm, required_depth_mm),
+    ).fetchone()
+    if row:
+        return True
+    row = conn.execute(
+        """
+        SELECT 1 FROM manufacturer_cutting_conditions
+        WHERE outside_diameter_mm <= ? AND effective_length_mm >= ?
+        LIMIT 1
+        """,
+        (required_diameter_mm, required_depth_mm),
+    ).fetchone()
+    return row is not None
+
+
+def edm_replacement_reason(
+    width_mm: float,
+    depth_mm: float,
+    policy: dict[str, Any],
+    *,
+    tool_available: bool = True,
+    taper_deg: float = 0.0,
+) -> str | None:
+    """放電加工へ置き換えるべき場合はその理由を返す。切削で続行するならNone。"""
+    if not policy.get("enabled", True):
+        return None
+    width = max(0.0, float(width_mm))
+    depth = max(0.0, float(depth_mm))
+    taper = max(0.0, float(taper_deg))
+    aspect = depth / width if width > 0 else 0.0
+    if width > 0 and width <= policy["max_width_mm"] and depth >= policy["min_depth_mm"]:
+        return (
+            f"指定条件該当: 幅{fmt_number(width)}mm ≤ {fmt_number(policy['max_width_mm'])}mm "
+            f"かつ 深さ{fmt_number(depth)}mm ≥ {fmt_number(policy['min_depth_mm'])}mm"
+        )
+    min_taper = float(policy.get("min_taper_deg", 0.0) or 0.0)
+    if min_taper > 0 and taper >= min_taper:
+        return (
+            f"テーパ角 {fmt_number(taper, 1)}° ≥ {fmt_number(min_taper, 1)}°"
+            "（抜き勾配付きの壁は型彫り放電向き）"
+        )
+    if (
+        policy["min_aspect"] > 0
+        and width > 0
+        and aspect >= policy["min_aspect"]
+        and width <= policy["max_width_mm"] * 2
+    ):
+        return f"深さ/幅比 {fmt_number(aspect, 1)} ≥ {fmt_number(policy['min_aspect'], 1)}（細長形状）"
+    if not tool_available:
+        return "径と深さを満たす切削工具が工具マスタ・メーカー条件に存在しない"
+    return None
+
+
+def edm_reference_sec(
+    edm_type: str,
+    *,
+    volume_mm3: float = 0.0,
+    depth_mm: float = 0.0,
+    count: int = 1,
+    material_type: str = "鉄",
+) -> float:
+    """放電加工時間の参考値（電極製作・段取り替えの詳細は含まない）。"""
+    if edm_type == "細穴放電":
+        burn_sec = depth_mm / EDM_FINE_HOLE_FEED_MM_MIN * 60 * max(1, count)
+        return burn_sec + EDM_SETUP_SEC_PER_SHAPE
+    rate = EDM_SINKER_BURN_RATE_DEFAULT
+    for key, value in EDM_SINKER_BURN_RATE_MM3_MIN.items():
+        if key in material_type:
+            rate = value
+            break
+    return volume_mm3 / rate * 60 + EDM_SETUP_SEC_PER_SHAPE
+
+
 def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     entity_count = len(re.findall(r"^#\d+\s*=", text, flags=re.MULTILINE))
@@ -1170,6 +1427,7 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
         cylindrical_faces: list[dict[str, Any]] = []
         conical_faces: list[dict[str, Any]] = []
         torus_faces: list[dict[str, Any]] = []
+        planar_wall_faces: list[dict[str, Any]] = []
         face_type_counts: dict[str, int] = {}
         for face in faces:
             try:
@@ -1185,11 +1443,22 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
                     axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
                     center = tuple(float(value) for value in face.Center().toTuple())
                     area = float(face.Area())
+                    face_bbox = face.BoundingBox()
+                    bbox_lengths = {
+                        "x": float(face_bbox.xlen),
+                        "y": float(face_bbox.ylen),
+                        "z": float(face_bbox.zlen),
+                    }
                 except Exception:
                     continue
                 if radius <= 0:
                     continue
                 estimated_depth = area / max(0.000001, 2 * math.pi * radius)
+                axis_name = axis_label(axis)
+                axis_extent = bbox_lengths[axis_name.lower()]
+                # 全周円筒(穴)なら面積 ≒ 2πr×軸長。部分円筒(隅Rなど)は円弧率が下がる。
+                full_area = 2 * math.pi * radius * max(axis_extent, 0.000001)
+                arc_ratio = min(1.2, area / max(full_area, 0.000001))
                 cylindrical_faces.append(
                     {
                         "radius": radius,
@@ -1197,9 +1466,43 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
                         "area": area,
                         "estimated_depth": estimated_depth,
                         "axis": axis,
+                        "axis_label": axis_name,
+                        "axis_extent": axis_extent,
+                        "arc_ratio": arc_ratio,
                         "center": center,
                     }
                 )
+            elif geom_type == "PLANE":
+                if len(planar_wall_faces) >= 400:
+                    continue
+                try:
+                    normal_vec = face.normalAt()
+                    normal = (float(normal_vec.x), float(normal_vec.y), float(normal_vec.z))
+                    center = tuple(float(value) for value in face.Center().toTuple())
+                    area = float(face.Area())
+                    face_bbox = face.BoundingBox()
+                    face_bounds = {
+                        "xmin": float(face_bbox.xmin),
+                        "xmax": float(face_bbox.xmax),
+                        "ymin": float(face_bbox.ymin),
+                        "ymax": float(face_bbox.ymax),
+                        "zmin": float(face_bbox.zmin),
+                        "zmax": float(face_bbox.zmax),
+                    }
+                except Exception:
+                    continue
+                # 狭溝検出用に垂直壁（法線がほぼ水平）のみ保持。
+                # 抜き勾配付きの壁も対象にするため、鉛直からの傾き（テーパ角）を記録する。
+                if abs(normal[2]) <= 0.2 and area >= 1.0:
+                    planar_wall_faces.append(
+                        {
+                            "normal": normal,
+                            "center": center,
+                            "area": area,
+                            "bounds": face_bounds,
+                            "tilt_deg": math.degrees(math.asin(min(1.0, abs(normal[2])))),
+                        }
+                    )
             elif geom_type == "CONE":
                 try:
                     cone = face._geomAdaptor().Cone()
@@ -1271,6 +1574,7 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             {"x": raw_x, "y": raw_y, "z": raw_z},
             internal_removal_volume,
             face_type_counts,
+            planar_wall_faces=planar_wall_faces,
         )
 
         return {
@@ -1305,6 +1609,11 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
 
 def axis_label(axis: tuple[float, float, float] | list[float]) -> str:
     return max((("X", abs(axis[0])), ("Y", abs(axis[1])), ("Z", abs(axis[2]))), key=lambda item: item[1])[0]
+
+
+def feature_group_key(*parts: Any) -> str:
+    """フィーチャグループ・工具パス表示・除外指定を紐付ける識別子。"""
+    return "|".join(f"{part:g}" if isinstance(part, (int, float)) else str(part) for part in parts)
 
 
 def group_feature_rows(rows: list[dict[str, Any]], keys: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1383,18 +1692,72 @@ def classify_brep_machining_features(
     raw_bbox: dict[str, float],
     removal_volume: float,
     face_type_counts: dict[str, int],
+    planar_wall_faces: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     vertical: list[dict[str, Any]] = []
     side: list[dict[str, Any]] = []
+    fine_holes: list[dict[str, Any]] = []
+    corner_fillets: list[dict[str, Any]] = []
     consumed: set[int] = set()
 
     for index, item in enumerate(cylindrical_faces):
-        diameter = round(float(item["diameter"]), 1)
+        diameter = round(float(item["diameter"]), 2)
         depth = float(item["estimated_depth"])
-        if not (1.5 <= float(item["radius"]) <= 20.0 and depth >= 1.0):
+        radius = float(item["radius"])
+        label = str(item.get("axis_label") or axis_label(item["axis"]))
+        arc_ratio = float(item.get("arc_ratio", 1.0))
+        axis_extent = float(item.get("axis_extent", depth))
+
+        # 微細形状: 従来は半径1.5mm未満を切り捨てていたが、小径穴と縦隅Rとして拾う
+        if label == "Z" and radius < 1.5:
+            fine_depth = max(depth, axis_extent)
+            if fine_depth < 0.5:
+                continue
+            if arc_ratio >= 0.7:
+                fine_holes.append(
+                    {
+                        "diameter": diameter,
+                        "axis": "Z",
+                        "depth": fine_depth,
+                        "depth_ratio": fine_depth / max(diameter, 0.01),
+                        "count": 1,
+                        "volume": math.pi * (diameter / 2) ** 2 * fine_depth,
+                        "center": item["center"],
+                    }
+                )
+            else:
+                corner_fillets.append(
+                    {
+                        "radius": round(radius, 2),
+                        "width": diameter,
+                        "depth": axis_extent if axis_extent >= 0.5 else fine_depth,
+                        "arc_ratio": arc_ratio,
+                        "count": 1,
+                        "edge_length": max(0.1, arc_ratio * 2 * math.pi * radius),
+                        "center": item["center"],
+                    }
+                )
             continue
+
+        # ポケット縦壁の隅R: 1/4円弧程度の部分円筒（スロット端の半円 arc_ratio≒0.5 とは区別）
+        if label == "Z" and radius <= 4.0 and arc_ratio < 0.4 and axis_extent >= 1.0:
+            corner_fillets.append(
+                {
+                    "radius": round(radius, 2),
+                    "width": diameter,
+                    "depth": axis_extent,
+                    "arc_ratio": arc_ratio,
+                    "count": 1,
+                    "edge_length": max(0.1, arc_ratio * 2 * math.pi * radius),
+                    "center": item["center"],
+                }
+            )
+            continue
+
+        if not (1.5 <= radius <= 20.0 and depth >= 1.0):
+            continue
+        diameter = round(float(item["diameter"]), 1)
         center = item["center"]
-        label = axis_label(item["axis"])
         row = {
             **item,
             "index": index,
@@ -1447,6 +1810,7 @@ def classify_brep_machining_features(
                 "center_y": center_key[1],
                 "count": 1,
                 "volume": volume,
+                "z_top": round(float(large["center"][2]) + float(large["depth"]) / 2, 2),
             }
         )
 
@@ -1482,6 +1846,8 @@ def classify_brep_machining_features(
             depth = (row["depth"] + other["depth"]) / 2
             length = pair_distance + diameter
             area = max(0.0, (length - diameter) * diameter + math.pi * (diameter / 2) ** 2)
+            cx1, cy1, cz1 = row["center"]
+            cx2, cy2, _cz2 = other["center"]
             slots.append(
                 {
                     "width": diameter,
@@ -1489,8 +1855,83 @@ def classify_brep_machining_features(
                     "depth": depth,
                     "count": 1,
                     "volume": area * depth,
+                    "seg": [round(float(cx1), 2), round(float(cy1), 2), round(float(cx2), 2), round(float(cy2), 2)],
+                    "z_top": round(float(cz1) + depth / 2, 2),
                 }
             )
+
+    # 平面ペアからの狭溝（角スリット）検出: 対向する垂直壁の隙間を溝候補として拾う
+    walls = list(planar_wall_faces or [])[:300]
+    used_walls: set[int] = set()
+    for i, wall in enumerate(walls):
+        if i in used_walls:
+            continue
+        best: tuple[float, int, float, float] | None = None
+        for j in range(i + 1, len(walls)):
+            if j in used_walls:
+                continue
+            other = walls[j]
+            dot = sum(a * b for a, b in zip(wall["normal"], other["normal"]))
+            if dot > -0.98:
+                continue
+            delta = [other["center"][k] - wall["center"][k] for k in range(3)]
+            gap = sum(d * n for d, n in zip(delta, wall["normal"]))
+            # 法線が互いの面を向いている（間が空隙）かつ隙間が狭いペアのみ
+            if not (0.1 <= gap <= 8.0):
+                continue
+            z_overlap = min(wall["bounds"]["zmax"], other["bounds"]["zmax"]) - max(
+                wall["bounds"]["zmin"], other["bounds"]["zmin"]
+            )
+            if z_overlap < 1.0:
+                continue
+            x_overlap = min(wall["bounds"]["xmax"], other["bounds"]["xmax"]) - max(
+                wall["bounds"]["xmin"], other["bounds"]["xmin"]
+            )
+            y_overlap = min(wall["bounds"]["ymax"], other["bounds"]["ymax"]) - max(
+                wall["bounds"]["ymin"], other["bounds"]["ymin"]
+            )
+            lateral_overlap = max(x_overlap, y_overlap)
+            if lateral_overlap < max(gap, 1.0):
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, j, z_overlap, lateral_overlap)
+        if best is None:
+            continue
+        gap, j, z_overlap, lateral_overlap = best
+        # 丸端スロット（円筒ペア検出済み）と同幅なら二重計上を避ける
+        if any(abs(float(slot["width"]) - gap) <= 0.3 for slot in slots):
+            continue
+        if z_overlap / max(gap, 0.01) < 1.5:
+            continue
+        used_walls.add(i)
+        used_walls.add(j)
+        other = walls[j]
+        taper_deg = (float(wall.get("tilt_deg", 0.0)) + float(other.get("tilt_deg", 0.0))) / 2.0
+        mid_x = (float(wall["center"][0]) + float(other["center"][0])) / 2.0
+        mid_y = (float(wall["center"][1]) + float(other["center"][1])) / 2.0
+        # 溝の長手方向 = 壁法線と直交する水平方向
+        dir_x, dir_y = -float(wall["normal"][1]), float(wall["normal"][0])
+        norm = math.hypot(dir_x, dir_y) or 1.0
+        dir_x, dir_y = dir_x / norm, dir_y / norm
+        half = lateral_overlap / 2.0
+        slots.append(
+            {
+                "width": round(gap, 2),
+                "length": round(lateral_overlap, 1),
+                "depth": z_overlap,
+                "count": 1,
+                "volume": gap * lateral_overlap * z_overlap,
+                "taper_deg": round(taper_deg, 2),
+                "source": "平面ペア",
+                "seg": [
+                    round(mid_x - dir_x * half, 2),
+                    round(mid_y - dir_y * half, 2),
+                    round(mid_x + dir_x * half, 2),
+                    round(mid_y + dir_y * half, 2),
+                ],
+                "z_top": round(min(wall["bounds"]["zmax"], other["bounds"]["zmax"]), 2),
+            }
+        )
 
     holes = []
     for row in remaining_vertical:
@@ -1507,6 +1948,7 @@ def classify_brep_machining_features(
                 "center_y": float(row["center"][1]),
                 "count": 1,
                 "volume": volume,
+                "z_top": round(float(row["center"][2]) + float(row["depth"]) / 2, 2),
             }
         )
 
@@ -1538,6 +1980,7 @@ def classify_brep_machining_features(
 
     countersinks = []
     chamfers = []
+    tapered_walls: list[dict[str, Any]] = []
     for item in conical_faces:
         diameter = round(float(item.get("diameter", 0.0)), 1)
         depth = float(item.get("depth", 0.0))
@@ -1575,6 +2018,7 @@ def classify_brep_machining_features(
                     "edge_length": edge_length,
                     "count": 1,
                     "volume": sink_volume,
+                    "center": center,
                 }
             )
         elif depth <= max(6.0, raw_bbox["z"] * 0.25):
@@ -1586,6 +2030,25 @@ def classify_brep_machining_features(
                     "edge_length": edge_length,
                     "area": float(item.get("area", 0.0)),
                     "count": 1,
+                }
+            )
+        elif axis == "Z" and math.degrees(float(item.get("semi_angle", 0.0))) <= 35.0 and depth >= 2.0:
+            # 皿もみ・面取りに該当しない深い円錐面 = 抜き勾配付きのテーパ壁キャビティ
+            semi_angle_rad = float(item.get("semi_angle", 0.0))
+            top_radius = diameter / 2.0
+            bottom_radius = max(0.0, top_radius - depth * math.tan(semi_angle_rad))
+            frustum_volume = math.pi * depth / 3.0 * (
+                top_radius ** 2 + top_radius * bottom_radius + bottom_radius ** 2
+            )
+            tapered_walls.append(
+                {
+                    "taper_deg": round(math.degrees(semi_angle_rad), 1),
+                    "width": diameter,
+                    "depth": depth,
+                    "count": 1,
+                    "volume": frustum_volume,
+                    "area": float(item.get("area", 0.0)),
+                    "center": center,
                 }
             )
 
@@ -1609,6 +2072,9 @@ def classify_brep_machining_features(
         )
 
     hole_groups = group_feature_rows(holes, ("diameter", "axis"))
+    fine_hole_groups = group_feature_rows(fine_holes, ("diameter", "axis"))
+    corner_fillet_groups = group_surface_rows(corner_fillets, ("radius",))
+    tapered_wall_groups = group_feature_rows(tapered_walls, ("taper_deg",))
     side_hole_groups = group_feature_rows(side_holes, ("diameter", "axis"))
     counterbore_groups = group_feature_rows(counterbores, ("through_diameter", "counterbore_diameter"))
     countersink_groups = group_feature_rows(countersinks, ("hole_diameter", "sink_diameter", "axis"))
@@ -1619,9 +2085,123 @@ def classify_brep_machining_features(
     )
     chamfer_groups = group_surface_rows(chamfers, ("axis",))
     corner_radius_groups = group_surface_rows(corner_radii, ("radius", "axis"))
+    # 3Dプレビュー用の簡易工具パス。keyでフィーチャグループ・除外指定と紐付く。
+    overlays: list[dict[str, Any]] = []
+
+    def add_overlay(entry: dict[str, Any]) -> None:
+        if len(overlays) < 400:
+            overlays.append(entry)
+
+    for row in holes:
+        add_overlay(
+            {
+                "key": feature_group_key("hole", row["diameter"], "Z"),
+                "kind": "drill",
+                "x": round(float(row["center_x"]), 2),
+                "y": round(float(row["center_y"]), 2),
+                "z": float(row.get("z_top", 0.0)),
+                "depth": round(float(row["depth"]), 2),
+                "d": float(row["diameter"]),
+            }
+        )
+    for row in fine_holes:
+        cx, cy, cz = row["center"]
+        add_overlay(
+            {
+                "key": feature_group_key("fine_hole", row["diameter"], "Z"),
+                "kind": "helix",
+                "x": round(float(cx), 2),
+                "y": round(float(cy), 2),
+                "z": round(float(cz) + float(row["depth"]) / 2, 2),
+                "depth": round(float(row["depth"]), 2),
+                "d": float(row["diameter"]),
+            }
+        )
+    for row in corner_fillets:
+        cx, cy, cz = row["center"]
+        add_overlay(
+            {
+                "key": feature_group_key("corner_fillet", row["radius"]),
+                "kind": "vline",
+                "x": round(float(cx), 2),
+                "y": round(float(cy), 2),
+                "z": round(float(cz) + float(row["depth"]) / 2, 2),
+                "depth": round(float(row["depth"]), 2),
+                "d": float(row["radius"]) * 2,
+            }
+        )
+    for row in slots:
+        if "seg" not in row:
+            continue
+        add_overlay(
+            {
+                "key": feature_group_key("slot", row["width"], row["length"]),
+                "kind": "slot",
+                "seg": row["seg"],
+                "z": float(row.get("z_top", 0.0)),
+                "depth": round(float(row["depth"]), 2),
+                "w": float(row["width"]),
+            }
+        )
+    for row in counterbores:
+        add_overlay(
+            {
+                "key": feature_group_key("counterbore", row["through_diameter"], row["counterbore_diameter"]),
+                "kind": "circle",
+                "x": round(float(row["center_x"]), 2),
+                "y": round(float(row["center_y"]), 2),
+                "z": float(row.get("z_top", 0.0)),
+                "depth": round(float(row["counterbore_depth"]), 2),
+                "d": float(row["counterbore_diameter"]),
+            }
+        )
+    for row in countersinks:
+        cx, cy, cz = row.get("center", (0.0, 0.0, 0.0))
+        add_overlay(
+            {
+                "key": feature_group_key("countersink", row["hole_diameter"], row["sink_diameter"], row["axis"]),
+                "kind": "circle",
+                "x": round(float(cx), 2),
+                "y": round(float(cy), 2),
+                "z": round(float(cz) + float(row["depth"]) / 2, 2),
+                "depth": round(float(row["depth"]), 2),
+                "d": float(row["sink_diameter"]),
+            }
+        )
+    for row in side:
+        cx, cy, cz = row["center"]
+        axis_vec = row["axis"]
+        axis_len = math.sqrt(sum(a * a for a in axis_vec)) or 1.0
+        ux, uy, uz = (a / axis_len for a in axis_vec)
+        half = float(row["depth"]) / 2
+        add_overlay(
+            {
+                "key": feature_group_key("side_hole", row["diameter"], row["axis_label"]),
+                "kind": "hline",
+                "seg3": [
+                    round(float(cx) - ux * half, 2), round(float(cy) - uy * half, 2), round(float(cz) - uz * half, 2),
+                    round(float(cx) + ux * half, 2), round(float(cy) + uy * half, 2), round(float(cz) + uz * half, 2),
+                ],
+                "d": float(row["diameter"]),
+            }
+        )
+    for row in tapered_walls:
+        cx, cy, cz = row["center"]
+        add_overlay(
+            {
+                "key": feature_group_key("tapered_wall", row["taper_deg"]),
+                "kind": "circle",
+                "x": round(float(cx), 2),
+                "y": round(float(cy), 2),
+                "z": round(float(cz) + float(row["depth"]) / 2, 2),
+                "depth": round(float(row["depth"]), 2),
+                "d": float(row["width"]),
+            }
+        )
+
     classified_volume = sum(
         item.get("total_volume", 0.0)
-        for group in (hole_groups, side_hole_groups, counterbore_groups, countersink_groups, slot_groups)
+        for group in (hole_groups, fine_hole_groups, side_hole_groups, counterbore_groups, countersink_groups, slot_groups)
         for item in group
     )
     roughing_volume = max(0.0, removal_volume - classified_volume)
@@ -1629,6 +2209,10 @@ def classify_brep_machining_features(
 
     return {
         "holes": hole_groups,
+        "fine_holes": fine_hole_groups,
+        "corner_fillets": corner_fillet_groups,
+        "tapered_walls": tapered_wall_groups,
+        "overlays": overlays,
         "side_holes": side_hole_groups,
         "counterbores": counterbore_groups,
         "countersinks": countersink_groups,
@@ -1649,6 +2233,9 @@ def pick_tool(
     tool_type: str,
     target_diameter: float | None = None,
     max_tool_diameter_mm: float | None = None,
+    max_fit_diameter_mm: float | None = None,
+    required_depth_mm: float | None = None,
+    prefer_largest_fit: bool = False,
 ) -> sqlite3.Row:
     rows = conn.execute("SELECT * FROM tools WHERE tool_type = ? ORDER BY diameter_mm", (tool_type,)).fetchall()
     if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
@@ -1660,9 +2247,22 @@ def pick_tool(
     if not rows:
         limit = f"（最大工具径 {max_tool_diameter_mm:g} mm 以下）" if max_tool_diameter_mm else ""
         raise RuntimeError(f"使用可能な工具マスタが未登録です{limit}。")
+
+    fit_rows = rows
+    if max_fit_diameter_mm is not None and max_fit_diameter_mm > 0:
+        diameter_fit_rows = [row for row in fit_rows if float(row["diameter_mm"]) <= max_fit_diameter_mm]
+        if diameter_fit_rows:
+            fit_rows = diameter_fit_rows
+    if required_depth_mm is not None and required_depth_mm > 0:
+        depth_fit_rows = [row for row in fit_rows if float(row["max_depth_mm"]) >= required_depth_mm]
+        if depth_fit_rows:
+            fit_rows = depth_fit_rows
+
     if target_diameter is None:
-        return rows[-1]
-    return min(rows, key=lambda row: abs(float(row["diameter_mm"]) - target_diameter))
+        return fit_rows[-1]
+    if prefer_largest_fit:
+        return max(fit_rows, key=lambda row: float(row["diameter_mm"]))
+    return min(fit_rows, key=lambda row: abs(float(row["diameter_mm"]) - target_diameter))
 
 
 def condition_for(conn: sqlite3.Connection, tool_id: int, material_type: str, process_hint: str) -> sqlite3.Row:
@@ -1786,12 +2386,23 @@ def auto_manufacturer_condition_for(
     required_depth: float,
     process_hint: str,
     max_tool_diameter_mm: float | None = None,
+    max_fit_diameter_mm: float | None = None,
+    require_depth_fit: bool = False,
 ) -> sqlite3.Row | None:
     rows = conn.execute("SELECT * FROM manufacturer_cutting_conditions").fetchall()
     if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
         rows = [row for row in rows if float(row["outside_diameter_mm"]) <= max_tool_diameter_mm]
     if not rows:
         return None
+    if max_fit_diameter_mm is not None and max_fit_diameter_mm > 0:
+        fit_rows = [row for row in rows if float(row["outside_diameter_mm"]) <= max_fit_diameter_mm]
+        if fit_rows:
+            rows = fit_rows
+    if require_depth_fit and required_depth > 0:
+        # 微細形状など、リーチが必須制約になる場合のみ有効長で絞り込む
+        depth_rows = [row for row in rows if float(row["effective_length_mm"]) >= required_depth]
+        if depth_rows:
+            rows = depth_rows
 
     keywords = material_keywords(material_type)
     process_text = process_hint.upper()
@@ -1831,6 +2442,19 @@ def auto_manufacturer_condition_for(
 
         diameter = float(row["outside_diameter_mm"])
         effective_length = float(row["effective_length_mm"])
+        if not require_depth_fit:
+            # 汎用パス（側面・ポケット・仕上げ）では深リブ・微細用条件を避ける。
+            # 微細条件のapは工具剛性由来で、汎用形状に適用すると非現実的な見積もりになる。
+            axial_depth = float(row["axial_depth_mm"])
+            radial_depth = float(row["radial_depth_mm"])
+            if axial_depth < 0.3:
+                value -= 300
+            if diameter > 0 and radial_depth < diameter * 0.08:
+                # 深壁仕上げ用の極小ae条件。汎用パスでは径方向切込みを増幅できない
+                value -= 250
+            if diameter > 0 and effective_length / diameter >= 3:
+                # ロングネック（深リブ用）条件。汎用の荒取り・側面には標準工具を優先する
+                value -= 350
         value -= abs(diameter - target_diameter) * 18
         value -= max(0.0, required_depth - effective_length) * 22
         value -= max(0.0, effective_length - required_depth) * 0.3
@@ -1848,12 +2472,18 @@ def estimate(
     machine_id: int,
     use_manufacturer_conditions: bool = True,
     estimate_mode: str = "cautious",
+    edm_policy: dict[str, Any] | None = None,
+    excluded_keys: set[str] | list[str] | None = None,
 ) -> dict[str, Any]:
     analysis = parse_step_file(path, blank_allowance_mm)
     bbox = analysis["bbox"]
+    policy = edm_policy or dict(DEFAULT_EDM_POLICY)
+    edm_candidates: list[dict[str, Any]] = []
+    # ユーザーが「穴埋め・加工対象外」に指定したフィーチャキー
+    excluded_set = {str(key) for key in (excluded_keys or [])}
+    excluded_features: list[dict[str, Any]] = []
 
     with db() as conn:
-        ensure_operational_master(conn)
         ensure_catalog_tool_master(conn)
         ensure_operational_master(conn)
         machine = conn.execute("SELECT * FROM machines WHERE machine_id = ?", (machine_id,)).fetchone()
@@ -1894,6 +2524,7 @@ def estimate(
                 master_condition_summary(face_cond),
                 path_plan_summary(top_cutting_length, face_passes, face_passes * 2, method="面走査"),
                 face_selection_reason,
+                feature_key="face_top",
             )
         )
 
@@ -1913,6 +2544,7 @@ def estimate(
         side_area = 2 * (bbox["x"] + bbox["y"]) * bbox["z"]
         if side_catalog_cond is not None:
             side_diameter = float(side_catalog_cond["outside_diameter_mm"])
+            side_effective_length = float(side_catalog_cond["effective_length_mm"])
             side_feed, side_ap, side_pick = condition_params(side_catalog_cond, catalog=True)
             side_tool_name = (
                 f'{side_catalog_cond["manufacturer"]} {side_catalog_cond["series_code"]} '
@@ -1935,6 +2567,7 @@ def estimate(
             )
         else:
             side_diameter = float(side_tool["diameter_mm"])
+            side_effective_length = float(side_tool["max_depth_mm"])
             side_feed, side_ap, side_ae = condition_params(side_cond, fallback_ae=max(1.0, side_diameter * 0.35))
             side_pick = max(1.0, side_ae)
             side_tool_name = side_tool["tool_name"]
@@ -1950,13 +2583,19 @@ def estimate(
         side_radial_passes = max(1, math.ceil(side_radial_stock / max(0.001, side_plan_pick)))
         side_passes = side_axial_passes * side_radial_passes
         side_cutting_length = side_perimeter * side_passes
+        side_reachability, side_reachability_factor = reachability_assessment(
+            tool_diameter_mm=side_diameter,
+            required_depth_mm=bbox["z"],
+            effective_length_mm=side_effective_length,
+            context="側面",
+        )
         side_sec = path_time_sec(
             side_cutting_length,
             side_feed,
             approach_count=side_passes * 2,
             rapid_feed_mm_min=rapid_feed,
             efficiency=0.78,
-        )
+        ) * side_reachability_factor
         features.append(
             Feature(
                 "平面加工（側面）",
@@ -1976,6 +2615,8 @@ def estimate(
                     extra=f"Z {side_axial_passes}段 x 径 {side_radial_passes}回",
                 ),
                 side_selection_reason,
+                side_reachability,
+                feature_key="side_walls",
             )
         )
 
@@ -2005,10 +2646,32 @@ def estimate(
         for group in hole_groups:
             diameter = float(group["diameter"])
             count = int(group["count"])
+            hole_key = feature_group_key("hole", diameter, str(group.get("axis", "Z")))
+            hole_depth = max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75)))
+            hole_edm_reason = edm_replacement_reason(diameter, hole_depth, policy)
+            if hole_edm_reason:
+                reference_sec = edm_reference_sec(
+                    "細穴放電", depth_mm=hole_depth, count=count, material_type=material_type
+                )
+                edm_candidates.append(
+                    {
+                        "feature_key": hole_key,
+                        "feature_type": "穴加工",
+                        "edm_type": "細穴放電",
+                        "dimensions": f"φ{diameter:.2f} / 深さ {hole_depth:.1f} mm",
+                        "width_mm": diameter,
+                        "depth_mm": hole_depth,
+                        "count": count,
+                        "volume_mm3": float(group.get("total_volume", 0.0)),
+                        "reason": hole_edm_reason,
+                        "reference_sec": reference_sec,
+                    }
+                )
+                continue
             drill = pick_tool(conn, "DRILL", diameter, max_tool_diameter)
             cond = condition_for(conn, drill["tool_id"], material_type, "穴")
             drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "穴加工")
-            depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75))))
+            depth = max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75)))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
             depth_ratio = float(group.get("depth_ratio", depth / max(diameter, 0.1)))
             deep_hole = depth_ratio >= 5.0 or depth >= 30.0
@@ -2016,6 +2679,22 @@ def estimate(
             peck_extra = 0.28 if deep_hole else 0.18
             approach_count = count * (peck_passes + (2 if deep_hole else 1))
             drill_cutting_length = depth * count * (1.0 + peck_extra * max(0, peck_passes - 1))
+            drill_reachability, drill_reachability_factor = reachability_assessment(
+                tool_diameter_mm=float(drill["diameter_mm"]),
+                required_depth_mm=depth,
+                effective_length_mm=float(drill["max_depth_mm"]),
+                context="穴",
+            )
+            if drill["tool_type"] != "DRILL":
+                drill_reachability = " / ".join(
+                    item
+                    for item in (
+                        "穴: DRILL工具がなく代替工具で計算",
+                        drill_reachability,
+                    )
+                    if item
+                )
+                drill_reachability_factor = max(drill_reachability_factor, 1.25)
             hole_sec = path_time_sec(
                 drill_cutting_length,
                 drill_feed,
@@ -2023,7 +2702,7 @@ def estimate(
                 approach_mm=min(depth + 5.0, 60.0),
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.82 if deep_hole else 0.9,
-            )
+            ) * drill_reachability_factor
             features.append(
                 Feature(
                     "穴加工（ドリル）",
@@ -2049,16 +2728,19 @@ def estimate(
                         extra=f"{count}穴" + (f" / L/D {depth_ratio:.1f}" if deep_hole else ""),
                     ),
                     drill_selection_reason,
+                    drill_reachability,
+                    feature_key=hole_key,
                 )
             )
 
         for group in machining_features.get("side_holes") or []:
             diameter = float(group["diameter"])
             count = int(group["count"])
+            side_hole_key = feature_group_key("side_hole", diameter, str(group.get("axis", "-")))
             drill = pick_tool(conn, "DRILL", diameter, max_tool_diameter)
             cond = condition_for(conn, drill["tool_id"], material_type, "穴")
             drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "横穴加工")
-            depth = min(float(drill["max_depth_mm"]), max(3.0, float(group.get("avg_depth", bbox["x"] * 0.5))))
+            depth = max(3.0, float(group.get("avg_depth", bbox["x"] * 0.5)))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
             depth_ratio = float(group.get("depth_ratio", depth / max(diameter, 0.1)))
             deep_hole = depth_ratio >= 5.0 or depth >= 30.0
@@ -2066,6 +2748,22 @@ def estimate(
             peck_extra = 0.3 if deep_hole else 0.18
             approach_count = count * (peck_passes + (2 if deep_hole else 1))
             side_hole_cutting_length = depth * count * (1.0 + peck_extra * max(0, peck_passes - 1))
+            side_hole_reachability, side_hole_reachability_factor = reachability_assessment(
+                tool_diameter_mm=float(drill["diameter_mm"]),
+                required_depth_mm=depth,
+                effective_length_mm=float(drill["max_depth_mm"]),
+                context="横穴",
+            )
+            if drill["tool_type"] != "DRILL":
+                side_hole_reachability = " / ".join(
+                    item
+                    for item in (
+                        "横穴: DRILL工具がなく代替工具で計算",
+                        side_hole_reachability,
+                    )
+                    if item
+                )
+                side_hole_reachability_factor = max(side_hole_reachability_factor, 1.25)
             side_hole_sec = path_time_sec(
                 side_hole_cutting_length,
                 drill_feed,
@@ -2073,7 +2771,7 @@ def estimate(
                 approach_mm=min(depth + 5.0, 80.0),
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.8 if deep_hole else 0.88,
-            )
+            ) * side_hole_reachability_factor
             features.append(
                 Feature(
                     "横穴加工（ドリル）",
@@ -2093,6 +2791,8 @@ def estimate(
                         extra=f"{count}穴" + (f" / L/D {depth_ratio:.1f}" if deep_hole else ""),
                     ),
                     drill_selection_reason,
+                    side_hole_reachability,
+                    feature_key=side_hole_key,
                 )
             )
 
@@ -2100,8 +2800,19 @@ def estimate(
             through_diameter = float(group["through_diameter"])
             counterbore_diameter = float(group["counterbore_diameter"])
             count = int(group["count"])
-            drill = pick_tool(conn, "DRILL", through_diameter, max_tool_diameter)
-            counterbore_tool = pick_tool(conn, "EM", counterbore_diameter, max_tool_diameter)
+            counterbore_key = feature_group_key("counterbore", through_diameter, counterbore_diameter)
+            through_depth = max(3.0, float(group.get("through_depth", group.get("avg_depth", bbox["z"] * 0.75))))
+            counterbore_depth = max(0.5, float(group.get("counterbore_depth", group.get("avg_depth", 2.0))))
+            drill = pick_tool(conn, "DRILL", through_diameter, max_tool_diameter, required_depth_mm=through_depth)
+            counterbore_tool = pick_tool(
+                conn,
+                "EM",
+                min(counterbore_diameter * 0.55, counterbore_diameter - 0.2),
+                max_tool_diameter,
+                max_fit_diameter_mm=counterbore_diameter * 0.82,
+                required_depth_mm=counterbore_depth,
+                prefer_largest_fit=True,
+            )
             drill_cond = condition_for(conn, drill["tool_id"], material_type, "穴")
             counterbore_cond = condition_for(conn, counterbore_tool["tool_id"], material_type, "ポケット")
             counterbore_selection_reason = (
@@ -2109,11 +2820,6 @@ def estimate(
                 + " / "
                 + internal_tool_selection_reason(counterbore_tool, counterbore_diameter, max_tool_diameter, "座ぐり加工")
             )
-            through_depth = min(
-                float(drill["max_depth_mm"]),
-                max(3.0, float(group.get("through_depth", group.get("avg_depth", bbox["z"] * 0.75)))),
-            )
-            counterbore_depth = max(0.5, float(group.get("counterbore_depth", group.get("avg_depth", 2.0))))
             drill_feed, _drill_ap, _drill_ae = condition_params(drill_cond)
             counterbore_feed, counterbore_ap, counterbore_ae = condition_params(counterbore_cond)
             counterbore_tool_diameter = float(counterbore_tool["diameter_mm"])
@@ -2129,6 +2835,22 @@ def estimate(
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.9,
             )
+            drill_reachability, drill_reachability_factor = reachability_assessment(
+                tool_diameter_mm=float(drill["diameter_mm"]),
+                required_depth_mm=through_depth,
+                effective_length_mm=float(drill["max_depth_mm"]),
+                context="座ぐり下穴",
+            )
+            if drill["tool_type"] != "DRILL":
+                drill_reachability = " / ".join(
+                    item
+                    for item in (
+                        "座ぐり下穴: DRILL工具がなく代替工具で計算",
+                        drill_reachability,
+                    )
+                    if item
+                )
+                drill_reachability_factor = max(drill_reachability_factor, 1.25)
             counterbore_volume = math.pi * (counterbore_diameter / 2) ** 2 * counterbore_depth * count
             counterbore_depth_passes = max(1, math.ceil(counterbore_depth / max(0.001, counterbore_plan_ap)))
             counterbore_radial_width = max(0.0, (counterbore_diameter - through_diameter) / 2)
@@ -2143,6 +2865,16 @@ def estimate(
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.8,
             )
+            counterbore_reachability, counterbore_reachability_factor = reachability_assessment(
+                tool_diameter_mm=counterbore_tool_diameter,
+                available_width_mm=counterbore_diameter,
+                required_depth_mm=counterbore_depth,
+                effective_length_mm=float(counterbore_tool["max_depth_mm"]),
+                context="座ぐり",
+            )
+            counterbore_reachability_text = " / ".join(
+                item for item in (drill_reachability, counterbore_reachability) if item
+            )
             features.append(
                 Feature(
                     "座ぐり穴加工",
@@ -2154,7 +2886,7 @@ def estimate(
                     None,
                     f'{drill["tool_name"]} + {counterbore_tool["tool_name"]}',
                     "穴",
-                    drill_sec + counterbore_sec,
+                    drill_sec * drill_reachability_factor + counterbore_sec * counterbore_reachability_factor,
                     "B-Rep円筒面の同芯径違いから座ぐり候補を抽出",
                     f"下穴: {master_condition_summary(drill_cond)} / 座ぐり: {master_condition_summary(counterbore_cond)}",
                     path_plan_summary(
@@ -2165,6 +2897,8 @@ def estimate(
                         extra=f"{count}か所",
                     ),
                     counterbore_selection_reason,
+                    counterbore_reachability_text,
+                    feature_key=counterbore_key,
                 )
             )
 
@@ -2172,13 +2906,30 @@ def estimate(
             hole_diameter = float(group["hole_diameter"])
             sink_diameter = float(group["sink_diameter"])
             count = int(group["count"])
+            countersink_key = feature_group_key(
+                "countersink", hole_diameter, sink_diameter, str(group.get("axis", "Z"))
+            )
             sink_depth = max(0.1, float(group.get("avg_depth", 0.8)))
-            chamfer_tool = pick_tool(conn, "EM", min(max(sink_diameter * 0.45, 3.0), 8.0), max_tool_diameter)
+            chamfer_tool = pick_tool(
+                conn,
+                "EM",
+                min(max(sink_diameter * 0.35, 1.0), 8.0),
+                max_tool_diameter,
+                max_fit_diameter_mm=sink_diameter * 0.85,
+                required_depth_mm=sink_depth,
+            )
             chamfer_cond = condition_for(conn, chamfer_tool["tool_id"], material_type, "ポケット")
             chamfer_feed, _chamfer_ap, _chamfer_ae = condition_params(chamfer_cond)
             cutting_length = max(
                 math.pi * sink_diameter * count,
                 float(group.get("edge_length", math.pi * sink_diameter)) * count,
+            )
+            countersink_reachability, countersink_reachability_factor = reachability_assessment(
+                tool_diameter_mm=float(chamfer_tool["diameter_mm"]),
+                available_width_mm=sink_diameter,
+                required_depth_mm=sink_depth,
+                effective_length_mm=float(chamfer_tool["max_depth_mm"]),
+                context="皿もみ",
             )
             countersink_sec = path_time_sec(
                 cutting_length,
@@ -2187,7 +2938,7 @@ def estimate(
                 approach_mm=min(sink_depth + 4.0, 12.0),
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.68,
-            )
+            ) * countersink_reachability_factor
             features.append(
                 Feature(
                     "皿もみ・穴口面取り",
@@ -2206,6 +2957,8 @@ def estimate(
                         method="円錐面取り",
                     ),
                     internal_tool_selection_reason(chamfer_tool, sink_diameter, max_tool_diameter, "皿もみ・穴口面取り"),
+                    countersink_reachability,
+                    feature_key=countersink_key,
                 )
             )
 
@@ -2213,15 +2966,62 @@ def estimate(
             width = float(group["width"])
             length = float(group["length"])
             count = int(group["count"])
+            slot_key = feature_group_key("slot", width, length)
             depth = max(0.5, float(group.get("avg_depth", bbox["z"] * 0.25)))
-            slot_tool = pick_tool(conn, "EM", width, max_tool_diameter)
+            slot_fit_diameter = max(0.1, width * 0.92)
+            slot_volume = float(group.get("total_volume", max(0.0, length * width * depth * count)))
+            slot_taper_deg = float(group.get("taper_deg", 0.0) or 0.0)
+            slot_taper_label = f" / テーパ {slot_taper_deg:.1f}°" if slot_taper_deg >= 0.3 else ""
+            slot_edm_reason = edm_replacement_reason(
+                width,
+                depth,
+                policy,
+                tool_available=milling_tool_available(conn, slot_fit_diameter, depth),
+                taper_deg=slot_taper_deg,
+            )
+            if slot_edm_reason:
+                edm_candidates.append(
+                    {
+                        "feature_key": slot_key,
+                        "feature_type": "溝加工",
+                        "edm_type": "型彫り放電",
+                        "dimensions": f"幅 {width:.1f} / 長さ {length:.1f} / 深さ {depth:.1f} mm{slot_taper_label}",
+                        "width_mm": width,
+                        "depth_mm": depth,
+                        "count": count,
+                        "volume_mm3": slot_volume,
+                        "reason": slot_edm_reason,
+                        "reference_sec": edm_reference_sec(
+                            "型彫り放電", volume_mm3=slot_volume, material_type=material_type
+                        ),
+                    }
+                )
+                continue
+            slot_tool = pick_tool(
+                conn,
+                "EM",
+                min(width * 0.75, width),
+                max_tool_diameter,
+                max_fit_diameter_mm=slot_fit_diameter,
+                required_depth_mm=depth,
+                prefer_largest_fit=True,
+            )
             slot_cond = condition_for(conn, slot_tool["tool_id"], material_type, "ポケット")
             slot_catalog_cond = None
             if use_manufacturer_conditions:
-                slot_catalog_cond = auto_manufacturer_condition_for(conn, material_type, width, depth, "ポケット", max_tool_diameter)
+                slot_catalog_cond = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    width,
+                    depth,
+                    "ポケット",
+                    max_tool_diameter,
+                    max_fit_diameter_mm=slot_fit_diameter,
+                )
             volume = float(group.get("total_volume", max(0.0, length * width * depth * count)))
             if slot_catalog_cond is not None:
                 slot_diameter = float(slot_catalog_cond["outside_diameter_mm"])
+                slot_effective_length = float(slot_catalog_cond["effective_length_mm"])
                 slot_feed, slot_ap, slot_ae = condition_params(slot_catalog_cond, catalog=True)
                 slot_tool_name = (
                     f'{slot_catalog_cond["manufacturer"]} {slot_catalog_cond["series_code"]} '
@@ -2245,6 +3045,7 @@ def estimate(
                 )
             else:
                 slot_diameter = float(slot_tool["diameter_mm"])
+                slot_effective_length = float(slot_tool["max_depth_mm"])
                 slot_feed, slot_ap, slot_ae = condition_params(slot_cond)
                 slot_tool_name = slot_tool["tool_name"]
                 slot_tool_id = slot_tool["tool_id"]
@@ -2260,6 +3061,13 @@ def estimate(
                 volume / max(0.001, slot_plan_ap * slot_plan_ae),
                 (length + math.pi * width / 2) * slot_passes * count,
             )
+            slot_reachability, slot_reachability_factor = reachability_assessment(
+                tool_diameter_mm=slot_diameter,
+                available_width_mm=width,
+                required_depth_mm=depth,
+                effective_length_mm=slot_effective_length,
+                context="溝",
+            )
             slot_sec = path_time_sec(
                 slot_cutting_length,
                 slot_feed,
@@ -2267,11 +3075,11 @@ def estimate(
                 approach_mm=min(depth + 5.0, 45.0),
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.78,
-            )
+            ) * slot_reachability_factor
             features.append(
                 Feature(
                     "溝加工（スロット）",
-                    f"幅 {width:.1f} / 長さ {length:.1f} / 深さ {depth:.1f} mm",
+                    f"幅 {width:.1f} / 長さ {length:.1f} / 深さ {depth:.1f} mm{slot_taper_label}",
                     count,
                     slot_tool_id,
                     slot_tool_name,
@@ -2287,8 +3095,271 @@ def estimate(
                         extra=f"Z {slot_depth_passes}段 x 幅 {slot_radial_passes}回",
                     ),
                     slot_selection_reason,
+                    slot_reachability,
+                    feature_key=slot_key,
                 )
             )
+
+        for group in machining_features.get("fine_holes") or []:
+            diameter = float(group["diameter"])
+            count = int(group["count"])
+            fine_hole_key = feature_group_key("fine_hole", diameter, str(group.get("axis", "Z")))
+            depth = max(0.5, float(group.get("avg_depth", bbox["z"] * 0.5)))
+            fine_fit_diameter = max(0.05, diameter * 0.85)
+            fine_edm_reason = edm_replacement_reason(
+                diameter,
+                depth,
+                policy,
+                tool_available=milling_tool_available(conn, fine_fit_diameter, depth),
+            )
+            if fine_edm_reason:
+                edm_candidates.append(
+                    {
+                        "feature_key": fine_hole_key,
+                        "feature_type": "微細穴加工",
+                        "edm_type": "細穴放電",
+                        "dimensions": f"φ{diameter:.2f} / 深さ {depth:.1f} mm",
+                        "width_mm": diameter,
+                        "depth_mm": depth,
+                        "count": count,
+                        "volume_mm3": float(group.get("total_volume", 0.0)),
+                        "reason": fine_edm_reason,
+                        "reference_sec": edm_reference_sec(
+                            "細穴放電", depth_mm=depth, count=count, material_type=material_type
+                        ),
+                    }
+                )
+                continue
+            fine_catalog_cond = None
+            if use_manufacturer_conditions:
+                fine_catalog_cond = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    fine_fit_diameter,
+                    depth,
+                    "ポケット",
+                    max_tool_diameter,
+                    max_fit_diameter_mm=fine_fit_diameter,
+                    require_depth_fit=True,
+                )
+            if fine_catalog_cond is not None:
+                fine_tool_diameter = float(fine_catalog_cond["outside_diameter_mm"])
+                fine_effective_length = float(fine_catalog_cond["effective_length_mm"])
+                fine_feed, fine_ap, _fine_ae = condition_params(fine_catalog_cond, catalog=True)
+                fine_tool_name = (
+                    f'{fine_catalog_cond["manufacturer"]} {fine_catalog_cond["series_code"]} '
+                    f'φ{fine_tool_diameter:g} {fine_catalog_cond["corner_radius_label"]}'
+                )
+                fine_tool_id = None
+                fine_condition_text = catalog_condition_summary(fine_catalog_cond)
+                fine_selection_reason = catalog_tool_selection_reason(
+                    fine_catalog_cond, fine_fit_diameter, depth, max_tool_diameter, "微細穴加工"
+                )
+            else:
+                fine_tool = pick_tool(
+                    conn, "EM", fine_fit_diameter, max_tool_diameter,
+                    max_fit_diameter_mm=fine_fit_diameter, required_depth_mm=depth,
+                )
+                fine_cond = condition_for(conn, fine_tool["tool_id"], material_type, "ポケット")
+                fine_tool_diameter = float(fine_tool["diameter_mm"])
+                fine_effective_length = float(fine_tool["max_depth_mm"])
+                fine_feed, fine_ap, _fine_ae = condition_params(fine_cond)
+                fine_tool_name = fine_tool["tool_name"]
+                fine_tool_id = fine_tool["tool_id"]
+                fine_condition_text = master_condition_summary(fine_cond)
+                fine_selection_reason = internal_tool_selection_reason(
+                    fine_tool, fine_fit_diameter, max_tool_diameter, "微細穴加工"
+                )
+            helical_pitch = max(0.02, min(fine_ap, fine_tool_diameter * 0.3, 0.5))
+            helical_revolutions = max(1, math.ceil(depth / helical_pitch))
+            helical_circle = math.pi * max(0.1, diameter - fine_tool_diameter)
+            fine_cutting_length = helical_circle * helical_revolutions * count + helical_circle * count
+            fine_reachability, fine_reachability_factor = reachability_assessment(
+                tool_diameter_mm=fine_tool_diameter,
+                available_width_mm=diameter,
+                required_depth_mm=depth,
+                effective_length_mm=fine_effective_length,
+                context="微細穴",
+            )
+            fine_sec = path_time_sec(
+                fine_cutting_length,
+                fine_feed,
+                approach_count=count * 2,
+                approach_mm=min(depth + 3.0, 20.0),
+                rapid_feed_mm_min=rapid_feed,
+                efficiency=0.7,
+            ) * fine_reachability_factor
+            features.append(
+                Feature(
+                    "微細穴加工（ヘリカル）",
+                    f"φ{diameter:.2f} / 深さ {depth:.1f} mm",
+                    count,
+                    fine_tool_id,
+                    fine_tool_name,
+                    "穴",
+                    fine_sec,
+                    "B-Rep微細円筒面（φ3未満）から小径穴を抽出し、小径EMヘリカル加工として算出",
+                    fine_condition_text,
+                    path_plan_summary(
+                        fine_cutting_length,
+                        helical_revolutions,
+                        count * 2,
+                        method="ヘリカル補間",
+                        extra=f"{count}穴 / ピッチ {fmt_number(helical_pitch, 2)} mm",
+                    ),
+                    fine_selection_reason,
+                    fine_reachability,
+                    feature_key=fine_hole_key,
+                )
+            )
+
+        for group in machining_features.get("corner_fillets") or []:
+            radius = float(group["radius"])
+            count = int(group["count"])
+            corner_key = feature_group_key("corner_fillet", radius)
+            depth = max(0.5, float(group.get("max_depth", group.get("avg_depth", bbox["z"] * 0.5))))
+            required_diameter = max(0.1, radius * 2.0)
+            corner_edm_reason = edm_replacement_reason(
+                required_diameter,
+                depth,
+                policy,
+                tool_available=milling_tool_available(conn, required_diameter, depth),
+            )
+            fillet_contour_length = max(
+                float(group.get("total_length", 0.0)),
+                (math.pi / 2.0) * radius * count,
+            )
+            if corner_edm_reason:
+                # 隅Rを残す場合の除去体積: (1 - π/4)r^2 × 深さ を放電で立てる想定
+                fillet_volume = max(0.0, (1 - math.pi / 4.0) * radius * radius * depth * count)
+                edm_candidates.append(
+                    {
+                        "feature_key": corner_key,
+                        "feature_type": "縦隅R（ポケットコーナー）",
+                        "edm_type": "型彫り放電",
+                        "dimensions": f"R{radius:.2f} / 深さ {depth:.1f} mm",
+                        "width_mm": required_diameter,
+                        "depth_mm": depth,
+                        "count": count,
+                        "volume_mm3": fillet_volume,
+                        "reason": corner_edm_reason,
+                        "reference_sec": edm_reference_sec(
+                            "型彫り放電", volume_mm3=fillet_volume, material_type=material_type
+                        ),
+                    }
+                )
+                continue
+            corner_catalog_cond = None
+            if use_manufacturer_conditions:
+                corner_catalog_cond = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    required_diameter,
+                    depth,
+                    "側面",
+                    max_tool_diameter,
+                    max_fit_diameter_mm=required_diameter,
+                    require_depth_fit=True,
+                )
+            if corner_catalog_cond is not None:
+                fillet_tool_diameter = float(corner_catalog_cond["outside_diameter_mm"])
+                fillet_effective_length = float(corner_catalog_cond["effective_length_mm"])
+                fillet_feed, fillet_ap, _fillet_ae = condition_params(corner_catalog_cond, catalog=True)
+                fillet_tool_name = (
+                    f'{corner_catalog_cond["manufacturer"]} {corner_catalog_cond["series_code"]} '
+                    f'φ{fillet_tool_diameter:g} {corner_catalog_cond["corner_radius_label"]}'
+                )
+                fillet_tool_id = None
+                fillet_condition_text = catalog_condition_summary(corner_catalog_cond)
+                fillet_selection_reason = catalog_tool_selection_reason(
+                    corner_catalog_cond, required_diameter, depth, max_tool_diameter, "縦隅R仕上げ"
+                )
+            else:
+                fillet_tool = pick_tool(
+                    conn, "EM", required_diameter, max_tool_diameter,
+                    max_fit_diameter_mm=required_diameter, required_depth_mm=depth,
+                )
+                fillet_cond = condition_for(conn, fillet_tool["tool_id"], material_type, "ポケット")
+                fillet_tool_diameter = float(fillet_tool["diameter_mm"])
+                fillet_effective_length = float(fillet_tool["max_depth_mm"])
+                fillet_feed, fillet_ap, _fillet_ae = condition_params(fillet_cond)
+                fillet_tool_name = fillet_tool["tool_name"]
+                fillet_tool_id = fillet_tool["tool_id"]
+                fillet_condition_text = master_condition_summary(fillet_cond)
+                fillet_selection_reason = internal_tool_selection_reason(
+                    fillet_tool, required_diameter, max_tool_diameter, "縦隅R仕上げ"
+                )
+            fillet_step = max(0.01, min(fillet_ap, 2.0))
+            fillet_z_passes = min(2000, max(1, math.ceil(depth / fillet_step)))
+            fillet_cutting_length = fillet_contour_length * fillet_z_passes
+            fillet_reachability, fillet_reachability_factor = reachability_assessment(
+                tool_diameter_mm=fillet_tool_diameter,
+                corner_radius_mm=radius,
+                required_depth_mm=depth,
+                effective_length_mm=fillet_effective_length,
+                context="縦隅R",
+            )
+            fillet_sec = path_time_sec(
+                fillet_cutting_length,
+                fillet_feed,
+                approach_count=count * 2,
+                approach_mm=min(depth + 3.0, 25.0),
+                rapid_feed_mm_min=rapid_feed,
+                efficiency=0.68,
+            ) * fillet_reachability_factor
+            features.append(
+                Feature(
+                    "縦隅R仕上げ（小径EM）",
+                    f"R{radius:.2f} / 深さ {depth:.1f} mm / {count}か所",
+                    count,
+                    fillet_tool_id,
+                    fillet_tool_name,
+                    "仕上げ",
+                    fillet_sec,
+                    "B-Rep部分円筒面からポケット縦壁の隅Rを抽出し、小径EMの等高線仕上げとして算出",
+                    fillet_condition_text,
+                    path_plan_summary(
+                        fillet_cutting_length,
+                        fillet_z_passes,
+                        count * 2,
+                        method="等高線仕上げ",
+                        extra=f"Z {fillet_z_passes}段 x {count}か所",
+                    ),
+                    fillet_selection_reason,
+                    fillet_reachability,
+                    feature_key=corner_key,
+                )
+            )
+
+        for group in machining_features.get("tapered_walls") or []:
+            taper_deg = float(group.get("taper_deg", 0.0) or 0.0)
+            count = int(group["count"])
+            depth = max(0.5, float(group.get("max_depth", group.get("avg_depth", bbox["z"] * 0.5))))
+            wall_width = float(group.get("width", 0.0) or 0.0)
+            taper_edm_reason = edm_replacement_reason(
+                wall_width,
+                depth,
+                policy,
+                taper_deg=taper_deg,
+            )
+            if taper_edm_reason:
+                taper_volume = float(group.get("total_volume", 0.0))
+                edm_candidates.append(
+                    {
+                        "feature_key": feature_group_key("tapered_wall", taper_deg),
+                        "feature_type": "テーパ壁（抜き勾配キャビティ）",
+                        "edm_type": "型彫り放電",
+                        "dimensions": f"テーパ {taper_deg:.1f}° / 上部φ{wall_width:.1f} / 深さ {depth:.1f} mm",
+                        "width_mm": wall_width,
+                        "depth_mm": depth,
+                        "count": count,
+                        "volume_mm3": taper_volume,
+                        "reason": taper_edm_reason,
+                        "reference_sec": edm_reference_sec(
+                            "型彫り放電", volume_mm3=taper_volume, material_type=material_type
+                        ),
+                    }
+                )
 
         if machining_features.get("roughing_volume_mm3") is not None:
             pocket_volume = max(0.0, float(machining_features["roughing_volume_mm3"]))
@@ -2316,6 +3387,7 @@ def estimate(
             volume = pocket_volume
             if pocket_catalog_cond is not None:
                 pocket_diameter = float(pocket_catalog_cond["outside_diameter_mm"])
+                pocket_effective_length = float(pocket_catalog_cond["effective_length_mm"])
                 pocket_feed, pocket_ap, pocket_ae = condition_params(pocket_catalog_cond, catalog=True)
                 pocket_tool_name = (
                     f'{pocket_catalog_cond["manufacturer"]} {pocket_catalog_cond["series_code"]} '
@@ -2339,6 +3411,7 @@ def estimate(
                 )
             else:
                 pocket_diameter = float(pocket_tool["diameter_mm"])
+                pocket_effective_length = float(pocket_tool["max_depth_mm"])
                 pocket_feed, pocket_ap, pocket_ae = condition_params(pocket_cond)
                 pocket_tool_name = pocket_tool["tool_name"]
                 pocket_note = "B-Rep内部体積差から除去量を算出" if analysis.get("brep_available") else "面数からポケット相当の除去量を概算"
@@ -2354,6 +3427,12 @@ def estimate(
             pocket_scan_path = max(bbox["x"], bbox["y"]) * pocket_lanes * pocket_depth_passes
             pocket_cutting_length = max(pocket_volume_path, pocket_scan_path)
             pocket_passes = pocket_depth_passes * pocket_lanes
+            pocket_reachability, pocket_reachability_factor = reachability_assessment(
+                tool_diameter_mm=pocket_diameter,
+                required_depth_mm=pocket_depth,
+                effective_length_mm=pocket_effective_length,
+                context="ポケット",
+            )
             pocket_sec = path_time_sec(
                 pocket_cutting_length,
                 pocket_feed,
@@ -2361,7 +3440,7 @@ def estimate(
                 approach_mm=min(pocket_depth + 5.0, 60.0),
                 rapid_feed_mm_min=rapid_feed,
                 efficiency=0.74,
-            )
+            ) * pocket_reachability_factor
             features.append(
                 Feature(
                     "荒取り・ポケット加工",
@@ -2381,6 +3460,8 @@ def estimate(
                         extra=f"Z {pocket_depth_passes}段 x レーン {pocket_lanes}",
                     ),
                     pocket_selection_reason,
+                    pocket_reachability,
+                    feature_key="pocket_rough",
                 )
             )
 
@@ -2475,6 +3556,7 @@ def estimate(
                         extra=f"ピッチ {fmt_number(finish_pitch, 2)} mm",
                     ),
                     finish_selection_reason,
+                    feature_key="floor_finish",
                 )
             )
 
@@ -2516,6 +3598,7 @@ def estimate(
                         extra=f"Z {wall_finish_z_passes}段",
                     ),
                     finish_selection_reason,
+                    feature_key="wall_finish",
                 )
             )
 
@@ -2568,6 +3651,7 @@ def estimate(
                         method="面取り輪郭",
                     ),
                     chamfer_selection_reason,
+                    feature_key="chamfer_deburr",
                 )
             )
 
@@ -2578,13 +3662,25 @@ def estimate(
             total_corner_count = sum(int(group.get("count", 0)) for group in corner_radius_groups)
             smallest_radius = min(float(group.get("radius", 0.0)) for group in corner_radius_groups)
             if total_corner_area > 0 and smallest_radius > 0:
-                corner_tool_target = min(6.0, max(3.0, smallest_radius * 2.0))
-                corner_tool = pick_tool(conn, "EM", corner_tool_target, max_tool_diameter)
+                corner_tool_target = min(6.0, max(0.5, smallest_radius * 1.6))
+                corner_tool = pick_tool(
+                    conn,
+                    "EM",
+                    corner_tool_target,
+                    max_tool_diameter,
+                    max_fit_diameter_mm=smallest_radius * 2.0,
+                )
                 corner_cond = condition_for(conn, corner_tool["tool_id"], material_type, "ポケット")
                 corner_feed, _corner_ap, corner_ae = condition_params(corner_cond)
                 corner_stepover = max(0.08, min(max(corner_ae * 0.35, smallest_radius * 0.35), 0.6))
                 corner_cutting_length = max(total_corner_length, total_corner_area / corner_stepover)
                 corner_approaches = max(total_corner_count, math.ceil(corner_cutting_length / 120.0))
+                corner_reachability, corner_reachability_factor = reachability_assessment(
+                    tool_diameter_mm=float(corner_tool["diameter_mm"]),
+                    corner_radius_mm=smallest_radius,
+                    effective_length_mm=float(corner_tool["max_depth_mm"]),
+                    context="小R",
+                )
                 corner_sec = path_time_sec(
                     corner_cutting_length,
                     corner_feed * 0.55,
@@ -2592,7 +3688,7 @@ def estimate(
                     approach_mm=6.0,
                     rapid_feed_mm_min=rapid_feed,
                     efficiency=0.66,
-                )
+                ) * corner_reachability_factor
                 features.append(
                     Feature(
                         "小R・フィレット仕上げ",
@@ -2612,12 +3708,56 @@ def estimate(
                             extra=f"ピッチ {fmt_number(corner_stepover, 2)} mm",
                         ),
                         internal_tool_selection_reason(corner_tool, corner_tool_target, max_tool_diameter, "小R・フィレット仕上げ"),
+                        corner_reachability,
+                        feature_key="fillet_finish",
                     )
                 )
+
+        # 「穴埋め・加工対象外」指定されたフィーチャをMC時間・放電候補から除外する
+        if excluded_set:
+            kept_features: list[Feature] = []
+            for feature in features:
+                if feature.feature_key and feature.feature_key in excluded_set:
+                    excluded_features.append(
+                        {
+                            "feature_key": feature.feature_key,
+                            "label": f"{feature.feature_type} / {feature.dimensions}",
+                            "count": feature.quantity,
+                            "kind": "feature",
+                        }
+                    )
+                else:
+                    kept_features.append(feature)
+            features = kept_features
+            kept_candidates: list[dict[str, Any]] = []
+            for candidate in edm_candidates:
+                if candidate.get("feature_key") in excluded_set:
+                    excluded_features.append(
+                        {
+                            "feature_key": candidate.get("feature_key"),
+                            "label": f'{candidate["feature_type"]} / {candidate["dimensions"]}',
+                            "count": candidate.get("count", 1),
+                            "kind": "edm",
+                        }
+                    )
+                else:
+                    kept_candidates.append(candidate)
+            edm_candidates = kept_candidates
 
         safety_feature = safety_allowance_feature(features, estimate_mode, machining_features, max_tool_diameter)
         if safety_feature is not None:
             features.append(safety_feature)
+
+        reachability_issues = [
+            {
+                "feature_type": feature.feature_type,
+                "tool_name": feature.tool_name,
+                "message": feature.reachability,
+            }
+            for feature in features
+            if feature.reachability
+        ]
+        analysis["reachability_issues"] = reachability_issues
 
         machining_sec = sum(feature.machining_sec for feature in features)
         unique_tools = {tool_name for feature in features for tool_name in feature_tool_change_names(feature)}
@@ -2634,6 +3774,8 @@ def estimate(
             confidence -= 0.12
         if len(features) <= 2:
             confidence -= 0.08
+        if reachability_issues:
+            confidence -= min(0.18, 0.04 * len(reachability_issues))
         confidence = max(0.35, min(0.9, confidence))
 
         tool_usage: dict[str, dict[str, Any]] = {}
@@ -2660,6 +3802,56 @@ def estimate(
                 }
             )
 
+        # 3Dプレビュー用の工具パス: フィーチャ由来 + 外形基準のパス（上面走査・外周輪郭）
+        overlay_list = list(machining_features.pop("overlays", []) or []) if machining_features else []
+        raw_bounds = analysis.get("raw_bounds")
+        if raw_bounds:
+            overlay_list.append(
+                {
+                    "key": "face_top",
+                    "kind": "raster",
+                    "xmin": raw_bounds["xmin"],
+                    "xmax": raw_bounds["xmax"],
+                    "ymin": raw_bounds["ymin"],
+                    "ymax": raw_bounds["ymax"],
+                    "z": raw_bounds["zmax"] + 0.5,
+                    "pitch": max(face_pick, (raw_bounds["ymax"] - raw_bounds["ymin"]) / 40, 1.0),
+                }
+            )
+            overlay_list.append(
+                {
+                    "key": "side_walls",
+                    "kind": "loops",
+                    "xmin": raw_bounds["xmin"] - 1.0,
+                    "xmax": raw_bounds["xmax"] + 1.0,
+                    "ymin": raw_bounds["ymin"] - 1.0,
+                    "ymax": raw_bounds["ymax"] + 1.0,
+                    "z_top": raw_bounds["zmax"],
+                    "z_bottom": raw_bounds["zmin"],
+                    "loops": int(min(10, side_axial_passes)),
+                }
+            )
+            try:
+                finish_loop_count = int(min(6, wall_finish_z_passes))
+            except NameError:
+                finish_loop_count = 0
+            if finish_loop_count:
+                overlay_list.append(
+                    {
+                        "key": "wall_finish",
+                        "kind": "loops",
+                        "xmin": raw_bounds["xmin"] - 0.2,
+                        "xmax": raw_bounds["xmax"] + 0.2,
+                        "ymin": raw_bounds["ymin"] - 0.2,
+                        "ymax": raw_bounds["ymax"] + 0.2,
+                        "z_top": raw_bounds["zmax"],
+                        "z_bottom": raw_bounds["zmin"],
+                        "loops": finish_loop_count,
+                    }
+                )
+        analysis["toolpath_overlays"] = overlay_list
+
+        edm_reference_total_sec = sum(float(item["reference_sec"]) for item in edm_candidates)
         result = {
             "file_name": file_name,
             "material_type": material_type,
@@ -2668,12 +3860,17 @@ def estimate(
             "analysis": analysis,
             "features": [asdict(feature) for feature in features],
             "tool_usage": tool_usage_rows,
+            "edm_candidates": edm_candidates,
+            "edm_policy": policy,
+            "excluded_features": excluded_features,
+            "excluded_keys": sorted(excluded_set),
             "breakdown": {
                 "setup_sec": setup_sec,
                 "machining_sec": machining_sec,
                 "tool_change_sec": tool_change_sec,
                 "rapid_sec": rapid_sec,
                 "total_sec": total_sec,
+                "edm_reference_sec": edm_reference_total_sec,
             },
             "confidence": confidence,
             "estimate_mode": estimate_mode if estimate_mode in SAFETY_PROFILES else "cautious",
@@ -2793,6 +3990,12 @@ def api_analyze() -> Response:
     machine_id = int(request.form.get("machine_id", "1") or 1)
     use_manufacturer_conditions = request.form.get("use_manufacturer_conditions", "on") == "on"
     estimate_mode = request.form.get("estimate_mode", "cautious")
+    edm_policy = edm_policy_from_form(request.form)
+    excluded_raw = request.form.get("excluded_features", "")
+    try:
+        excluded_keys = {str(key) for key in json.loads(excluded_raw)} if excluded_raw else set()
+    except (ValueError, TypeError):
+        excluded_keys = set()
 
     cleanup_old_uploads()
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
@@ -2807,6 +4010,8 @@ def api_analyze() -> Response:
             machine_id,
             use_manufacturer_conditions=use_manufacturer_conditions,
             estimate_mode=estimate_mode,
+            edm_policy=edm_policy,
+            excluded_keys=excluded_keys,
         )
         result["time_label"] = seconds_label(result["breakdown"]["total_sec"])
         return jsonify(result)
@@ -2859,7 +4064,7 @@ def api_history_csv(history_id: int) -> Response:
     writer.writerow(["見積安全率", payload.get("estimate_mode_label", "-")])
     writer.writerow(["合計時間", seconds_label(payload["breakdown"]["total_sec"])])
     writer.writerow([])
-    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "工具選定理由", "加工パス", "加工時間秒", "備考"])
+    writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "工具選定理由", "到達性", "加工パス", "加工時間秒", "備考"])
     for feature in payload["features"]:
         writer.writerow(
             [
@@ -2870,6 +4075,7 @@ def api_history_csv(history_id: int) -> Response:
                 feature["process_type"],
                 feature.get("cutting_condition", ""),
                 feature.get("selection_reason", ""),
+                feature.get("reachability", ""),
                 feature.get("path_plan", ""),
                 round(feature["machining_sec"], 2),
                 feature["note"],
