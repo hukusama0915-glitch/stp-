@@ -26,7 +26,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
-APP_VERSION = "2026-09-26-viewer-ux"
+APP_VERSION = "2026-09-26-standard-machines"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -257,11 +257,6 @@ DEFAULT_TOOLS = [
         ("M6 タップ", "TAP", 6, 3, 25, "アルミ/鉄/SUS", 0, 1, "ねじ穴概算"),
     ]
 
-DEFAULT_MACHINES = [
-    ("標準 3軸MC", 3, 15000, 8, 12000, 16, 30, "概算用デフォルト"),
-    ("高速 5軸MC", 5, 30000, 5, 20000, 20, 45, "5軸案件の概算"),
-]
-
 # 社内の標準機（2026-09-26 登録依頼）。仕様は公開情報から取った値で、確認できなかった項目は
 # memo に「仮」と明記している。段取り時間は社内実績で見直すこと。
 STANDARD_MACHINES = [
@@ -300,11 +295,11 @@ def seed_master(conn: sqlite3.Connection) -> None:
 
 
 def seed_default_machines(conn: sqlite3.Connection) -> None:
-    # 機械マスタが空のときだけ初期値を入れる。
+    # 機械マスタが空のときだけ社内標準機を入れる。
     # 既存行がある場合に補完すると、利用者が削除した既定機械が即座に復活してしまう。
     if conn.execute("SELECT COUNT(*) FROM machines").fetchone()[0] > 0:
         return
-    rows = DEFAULT_MACHINES
+    rows = STANDARD_MACHINES
     conn.executemany(
         """
         INSERT INTO machines

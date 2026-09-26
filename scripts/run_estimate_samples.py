@@ -28,6 +28,19 @@ os.environ["STP_TOOL_DB_PATH"] = str(Path(_tmpdir) / "harness.sqlite3")
 
 import app as app_module  # noqa: E402
 
+# 基準値を機械マスタの変更に左右されないよう、検証専用の機械を登録して使う
+# （2026-09-26まで既定機だった「標準 3軸MC」と同じ仕様）
+BENCHMARK_MACHINE = ("検証用 3軸MC", 3, 15000, 8, 12000, 16, 30, "回帰ハーネス専用")
+with app_module.db() as _conn:
+    BENCHMARK_MACHINE_ID = _conn.execute(
+        """
+        INSERT INTO machines
+        (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec, max_spindle_rpm, max_tool_diameter_mm, setup_time_min, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        BENCHMARK_MACHINE,
+    ).lastrowid
+
 # 形状を埋めて（MCのみで）算出するケースも回すサンプル
 FILL_SAMPLES = ("wire_cut_test_plate.stp", "mixed_feature_test_part.stp")
 
@@ -106,7 +119,7 @@ def main() -> int:
                     sample.name,
                     material,
                     5.0,
-                    1,
+                    BENCHMARK_MACHINE_ID,
                     use_manufacturer_conditions=True,
                     estimate_mode="cautious",
                 )
@@ -128,12 +141,12 @@ def main() -> int:
                 if filled_path is None:
                     raise RuntimeError(fill_payload.get("error") or "埋めたモデルを作成できませんでした")
                 result = app_module.estimate(
-                    filled_path, name, material, 5.0, 1,
+                    filled_path, name, material, 5.0, BENCHMARK_MACHINE_ID,
                     use_manufacturer_conditions=True, estimate_mode="cautious",
                 )
                 report[key] = summarize(result)
                 with app_module.db() as conn:
-                    nc_machine = conn.execute("SELECT * FROM machines WHERE machine_id = 1").fetchone()
+                    nc_machine = conn.execute("SELECT * FROM machines WHERE machine_id = ?", (BENCHMARK_MACHINE_ID,)).fetchone()
                 nc_plan = app_module.nc_hole_plan(fill_items, material, nc_machine, "cautious")
                 report[key]["fill"] = {
                     "drill_count": fill_payload["drill_count"],
