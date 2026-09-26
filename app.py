@@ -1188,14 +1188,54 @@ def roughing_width_for_plan(width_mm: float, tool_diameter_mm: float, ratio: flo
     return min(planned, diameter * 0.8)
 
 
-def axial_depth_for_plan(depth_mm: float, tool_diameter_mm: float, required_depth_mm: float, ratio: float = 1.0) -> float:
+# 工具剛性の制約が強い条件で、カタログapを引き上げてよい上限倍率
+AP_AMPLIFY_LIMIT_FINE = 3.0
+AP_AMPLIFY_LIMIT_LONG_NECK = 3.0
+LONG_NECK_LD_RATIO = 3.0
+
+
+def is_long_neck(diameter_mm: float, effective_length_mm: float, axial_depth_mm: float) -> bool:
+    """首部で長さを稼ぐロングネック条件か。
+
+    有効長/径≥3 でも、長刃工具（例: OSG AE-VML、ap=3D）は刃長全体で切削できるため対象外。
+    カタログapが径未満（首部剛性でapが制限されている）のものをロングネックとみなす。
+    """
+    diameter = float(diameter_mm)
+    return (
+        diameter > 0
+        and float(effective_length_mm) >= diameter * LONG_NECK_LD_RATIO
+        and float(axial_depth_mm) < diameter
+    )
+
+
+def is_long_neck_row(row: sqlite3.Row) -> bool:
+    return is_long_neck(row["outside_diameter_mm"], row["effective_length_mm"], row["axial_depth_mm"])
+
+
+def is_deep_flank_row(row: sqlite3.Row) -> bool:
+    """ap≥2D の長刃側面切削条件か（ae が小さく、面仕上げのピッチ算出には使えない）。"""
+    return float(row["axial_depth_mm"]) >= float(row["outside_diameter_mm"]) * 2
+
+
+def axial_depth_for_plan(
+    depth_mm: float,
+    tool_diameter_mm: float,
+    required_depth_mm: float,
+    ratio: float = 1.0,
+    effective_length_mm: float | None = None,
+) -> float:
     required = max(0.5, float(required_depth_mm))
     diameter = max(0.1, float(tool_diameter_mm))
-    planned = max(float(depth_mm), min(required, diameter * ratio), 0.5)
+    catalog_ap = float(depth_mm)
+    planned = max(catalog_ap, min(required, diameter * ratio), 0.5)
     # 微細用条件（ap<0.3mm）は工具剛性の制約が強く、工具径基準への引き上げは
     # 非現実的な除去レートになるため3倍までに制限する
-    if 0 < float(depth_mm) < 0.3:
-        planned = min(planned, max(float(depth_mm) * 3.0, 0.5))
+    if 0 < catalog_ap < 0.3:
+        planned = min(planned, max(catalog_ap * AP_AMPLIFY_LIMIT_FINE, 0.5))
+    # ロングネック（有効長/径≥3）の小さいapは首部の剛性由来。
+    # 工具径まで引き上げると除去レートを過大評価するため、カタログapの3倍までに制限する
+    if catalog_ap > 0 and effective_length_mm is not None and is_long_neck(diameter, effective_length_mm, catalog_ap):
+        planned = min(planned, max(catalog_ap * AP_AMPLIFY_LIMIT_LONG_NECK, 0.5))
     return min(planned, required)
 
 
@@ -2472,10 +2512,17 @@ def auto_manufacturer_condition_for(
     max_fit_diameter_mm: float | None = None,
     require_depth_fit: bool = False,
     candidates_out: list[dict[str, Any]] | None = None,
+    exclude_long_neck: bool = False,
+    exclude_deep_flank: bool = False,
 ) -> sqlite3.Row | None:
     rows = conn.execute("SELECT * FROM manufacturer_cutting_conditions").fetchall()
     if max_tool_diameter_mm is not None and max_tool_diameter_mm > 0:
         rows = [row for row in rows if float(row["outside_diameter_mm"]) <= max_tool_diameter_mm]
+    if exclude_long_neck:
+        # ロングネック以外（標準長・長刃工具）だけから選ぶ
+        rows = [row for row in rows if not is_long_neck_row(row)]
+    if exclude_deep_flank:
+        rows = [row for row in rows if not is_deep_flank_row(row)]
     if not rows:
         return None
     if max_fit_diameter_mm is not None and max_fit_diameter_mm > 0:
@@ -2493,7 +2540,7 @@ def auto_manufacturer_condition_for(
     # 届かない場合、ロングネックは「必要な選択」なので減点を軽くする。
     standard_reaches = any(
         float(row["effective_length_mm"]) >= required_depth
-        and float(row["effective_length_mm"]) < float(row["outside_diameter_mm"]) * 3
+        and not is_long_neck_row(row)
         and matches_material_keywords(row, keywords)
         for row in rows
     )
@@ -2520,6 +2567,70 @@ def auto_manufacturer_condition_for(
         return (sum(points for _, points in components), -abs(diameter - target_diameter), -int(row["condition_id"]))
 
     scored.sort(key=sort_key, reverse=True)
+    if candidates_out is not None:
+        candidates_out.extend(selection_candidates_summary(scored))
+    return scored[0][0]
+
+
+def planned_pocket_removal_rate(row: sqlite3.Row, stage_depth: float) -> float:
+    """ap上限・ae上限を適用した後の荒取り除去能率（mm3/min）。"""
+    diameter = float(row["outside_diameter_mm"])
+    feed, ap, ae = condition_params(row, catalog=True)
+    plan_ap = axial_depth_for_plan(
+        ap, diameter, stage_depth, ratio=0.85, effective_length_mm=float(row["effective_length_mm"])
+    )
+    lane_pitch = roughing_width_for_plan(ae, diameter, ratio=0.3)
+    return feed * plan_ap * lane_pitch
+
+
+def deep_pocket_condition_for(
+    conn: sqlite3.Connection,
+    material_type: str,
+    required_depth: float,
+    stage_depth: float,
+    max_tool_diameter_mm: float | None = None,
+    candidates_out: list[dict[str, Any]] | None = None,
+) -> sqlite3.Row | None:
+    """深部ポケット用に、必要深さへ届く条件をap上限適用後の実除去能率の高い順に選ぶ。"""
+    keywords = material_keywords(material_type)
+    rows = []
+    for row in conn.execute("SELECT * FROM manufacturer_cutting_conditions").fetchall():
+        diameter = float(row["outside_diameter_mm"])
+        if max_tool_diameter_mm and diameter > max_tool_diameter_mm:
+            continue
+        components = score_manufacturer_condition(
+            row,
+            keywords=keywords,
+            material_type=material_type,
+            process_hint="ポケット",
+            target_diameter=diameter,
+            required_depth=required_depth,
+            require_depth_fit=True,
+        )
+        labels = {label for label, _ in components}
+        # 材質が合い、焼入れ鋼・ステンレス専用条件の流用でないものだけ
+        if "材質一致" not in labels or labels & {"焼入れ鋼向け条件", "ステンレス向け条件"}:
+            continue
+        rows.append(row)
+    if not rows:
+        return None
+    reaching = [row for row in rows if float(row["effective_length_mm"]) >= required_depth]
+    if reaching:
+        rows = reaching
+    else:
+        longest = max(float(row["effective_length_mm"]) for row in rows)
+        rows = [row for row in rows if float(row["effective_length_mm"]) >= longest - 0.01]
+    scored = [
+        (
+            row,
+            [
+                ("ap上限後の除去能率 cm3/min", planned_pocket_removal_rate(row, stage_depth) / 1000.0),
+                ("有効長過剰", -max(0.0, float(row["effective_length_mm"]) - required_depth) * 0.01),
+            ],
+        )
+        for row in rows
+    ]
+    scored.sort(key=lambda item: (sum(points for _, points in item[1]), -int(item[0]["condition_id"])), reverse=True)
     if candidates_out is not None:
         candidates_out.extend(selection_candidates_summary(scored))
     return scored[0][0]
@@ -2591,7 +2702,7 @@ def score_manufacturer_condition(
         if diameter > 0 and radial_depth < diameter * 0.08:
             # 深壁仕上げ用の極小ae条件。汎用パスでは径方向切込みを増幅できない
             components.append(("極小ae条件", -250))
-        if diameter > 0 and effective_length / diameter >= 3:
+        if is_long_neck(diameter, effective_length, axial_depth):
             # ロングネック（深リブ用）条件。汎用の荒取り・側面には標準工具を優先する。
             # ただし標準長で届く工具が無いなら、有効長不足の工具より優先されるよう減点を軽くする
             if standard_reaches:
@@ -2762,7 +2873,9 @@ def estimate(
             side_tool_id = side_tool["tool_id"]
             side_selection_reason = internal_tool_selection_reason(side_tool, 16, max_tool_diameter, "側面加工")
         side_perimeter = 2 * (bbox["x"] + bbox["y"])
-        side_plan_ap = axial_depth_for_plan(side_ap, side_diameter, bbox["z"], ratio=1.0)
+        side_plan_ap = axial_depth_for_plan(
+            side_ap, side_diameter, bbox["z"], ratio=1.0, effective_length_mm=side_effective_length
+        )
         side_plan_pick = roughing_width_for_plan(side_pick, side_diameter, ratio=0.22)
         side_axial_passes = max(1, math.ceil(bbox["z"] / max(0.001, side_plan_ap)))
         side_radial_stock = max(blank_allowance_mm, side_plan_pick)
@@ -3241,7 +3354,9 @@ def estimate(
                 slot_note = "B-Rep円筒端部ペアからスロット候補を抽出"
                 slot_condition_text = master_condition_summary(slot_cond)
                 slot_selection_reason = internal_tool_selection_reason(slot_tool, width, max_tool_diameter, "溝加工")
-            slot_plan_ap = axial_depth_for_plan(slot_ap, slot_diameter, depth, ratio=0.8)
+            slot_plan_ap = axial_depth_for_plan(
+                slot_ap, slot_diameter, depth, ratio=0.8, effective_length_mm=slot_effective_length
+            )
             slot_plan_ae = roughing_width_for_plan(slot_ae, slot_diameter, ratio=0.25)
             slot_depth_passes = max(1, math.ceil(depth / max(0.001, slot_plan_ap)))
             slot_radial_passes = max(1, math.ceil(width / max(0.001, slot_plan_ae)))
@@ -3570,8 +3685,8 @@ def estimate(
             pocket_cond = condition_for(conn, pocket_tool["tool_id"], material_type, "ポケット")
             pocket_candidates: list[dict[str, Any]] = []
             pocket_catalog_cond = None
+            pocket_target_diameter = 6.0 if bbox["x"] * bbox["y"] >= 2500 else 3.0
             if use_manufacturer_conditions:
-                pocket_target_diameter = 6.0 if bbox["x"] * bbox["y"] >= 2500 else 3.0
                 pocket_required_depth = min(bbox["z"], max(3.0, bbox["z"] * 0.3))
                 pocket_catalog_cond = auto_manufacturer_condition_for(
                     conn,
@@ -3617,52 +3732,191 @@ def estimate(
                 pocket_tool_id = pocket_tool["tool_id"]
                 pocket_selection_reason = internal_tool_selection_reason(pocket_tool, 10, max_tool_diameter, "荒取り・ポケット加工")
             pocket_depth = min(bbox["z"], max(1.0, volume / max(1.0, bbox["x"] * bbox["y"])))
-            pocket_plan_ap = axial_depth_for_plan(pocket_ap, pocket_diameter, pocket_depth, ratio=0.85)
-            pocket_lane_pitch = roughing_width_for_plan(pocket_ae, pocket_diameter, ratio=0.3)
-            pocket_depth_passes = max(1, math.ceil(pocket_depth / max(0.001, pocket_plan_ap)))
-            pocket_lanes = max(1, math.ceil(min(bbox["x"], bbox["y"]) / pocket_lane_pitch))
-            pocket_volume_path = volume / max(0.001, pocket_plan_ap * pocket_lane_pitch)
-            pocket_scan_path = max(bbox["x"], bbox["y"]) * pocket_lanes * pocket_depth_passes
-            pocket_cutting_length = max(pocket_volume_path, pocket_scan_path)
-            pocket_passes = pocket_depth_passes * pocket_lanes
-            pocket_reachability, pocket_reachability_factor = reachability_assessment(
-                tool_diameter_mm=pocket_diameter,
-                required_depth_mm=pocket_depth,
-                effective_length_mm=pocket_effective_length,
-                context="ポケット",
-            )
-            pocket_sec = path_time_sec(
-                pocket_cutting_length,
-                pocket_feed,
-                approach_count=pocket_depth_passes * 2,
-                approach_mm=min(pocket_depth + 5.0, 60.0),
-                rapid_feed_mm_min=rapid_feed,
-                efficiency=0.74,
-            ) * pocket_reachability_factor
-            features.append(
-                Feature(
-                    "荒取り・ポケット加工",
-                    f"推定除去体積 {volume:.0f} mm3",
-                    1,
-                    pocket_tool_id,
-                    pocket_tool_name,
-                    "ポケット",
-                    pocket_sec,
-                    pocket_note,
-                    pocket_condition_text,
-                    path_plan_summary(
-                        pocket_cutting_length,
-                        pocket_passes,
-                        pocket_depth_passes * 2,
-                        method="等間隔走査",
-                        extra=f"Z {pocket_depth_passes}段 x レーン {pocket_lanes}",
-                    ),
-                    pocket_selection_reason,
-                    pocket_reachability,
-                    feature_key="pocket_rough",
-                    selection_candidates=pocket_candidates,
+
+            def pocket_stage_feature(
+                *,
+                feature_type: str,
+                stage_volume: float,
+                stage_depth: float,
+                reach_depth: float,
+                diameter: float,
+                effective_length: float,
+                feed: float,
+                ap: float,
+                ae: float,
+                tool_id: int | None,
+                tool_name: str,
+                note: str,
+                condition_text: str,
+                selection_reason: str,
+                candidates: list[dict[str, Any]],
+                method_extra: str = "",
+            ) -> Feature:
+                """ポケット荒取り1段分（stage_depthの厚みをstage_volumeだけ除去）の時間を算出する。"""
+                plan_ap = axial_depth_for_plan(
+                    ap, diameter, stage_depth, ratio=0.85, effective_length_mm=effective_length
                 )
-            )
+                lane_pitch = roughing_width_for_plan(ae, diameter, ratio=0.3)
+                depth_passes = max(1, math.ceil(stage_depth / max(0.001, plan_ap)))
+                lanes = max(1, math.ceil(min(bbox["x"], bbox["y"]) / lane_pitch))
+                volume_path = stage_volume / max(0.001, plan_ap * lane_pitch)
+                scan_path = max(bbox["x"], bbox["y"]) * lanes * depth_passes
+                cutting_length = max(volume_path, scan_path)
+                reachability, reachability_factor = reachability_assessment(
+                    tool_diameter_mm=diameter,
+                    required_depth_mm=reach_depth,
+                    effective_length_mm=effective_length,
+                    context="ポケット",
+                )
+                stage_sec = path_time_sec(
+                    cutting_length,
+                    feed,
+                    approach_count=depth_passes * 2,
+                    approach_mm=min(reach_depth + 5.0, 60.0),
+                    rapid_feed_mm_min=rapid_feed,
+                    efficiency=0.74,
+                ) * reachability_factor
+                extra = f"Z {depth_passes}段 x レーン {lanes}" + (f" / {method_extra}" if method_extra else "")
+                return Feature(
+                    feature_type,
+                    f"推定除去体積 {stage_volume:.0f} mm3",
+                    1,
+                    tool_id,
+                    tool_name,
+                    "ポケット",
+                    stage_sec,
+                    note,
+                    condition_text,
+                    path_plan_summary(cutting_length, depth_passes * lanes, depth_passes * 2, method="等間隔走査", extra=extra),
+                    selection_reason,
+                    reachability,
+                    feature_key="pocket_rough",
+                    selection_candidates=candidates,
+                )
+
+            def catalog_pocket_stage_args(cond: sqlite3.Row, required_depth: float, context: str) -> dict[str, Any]:
+                diameter = float(cond["outside_diameter_mm"])
+                feed, ap, ae = condition_params(cond, catalog=True)
+                return {
+                    "diameter": diameter,
+                    "effective_length": float(cond["effective_length_mm"]),
+                    "feed": feed,
+                    "ap": ap,
+                    "ae": ae,
+                    "tool_id": None,
+                    "tool_name": f'{cond["manufacturer"]} {cond["series_code"]} φ{diameter:g} {cond["corner_radius_label"]}',
+                    "note": (
+                        f'STP形状から自動選定: {cond["work_material"]} '
+                        f'{cond["hardness"]}, {cond["model_family"]}, rpm {cond["spindle_rpm"]}, '
+                        f'ap {cond["axial_depth_mm"]}, ae {cond["radial_depth_mm"]}, '
+                        f'出典 p.{cond["source_page"]}'
+                    ),
+                    "condition_text": catalog_condition_summary(cond),
+                    "selection_reason": catalog_tool_selection_reason(
+                        cond, pocket_target_diameter, required_depth, max_tool_diameter, context
+                    ),
+                }
+
+            primary_args = {
+                "diameter": pocket_diameter,
+                "effective_length": pocket_effective_length,
+                "feed": pocket_feed,
+                "ap": pocket_ap,
+                "ae": pocket_ae,
+                "tool_id": pocket_tool_id,
+                "tool_name": pocket_tool_name,
+                "note": pocket_note,
+                "condition_text": pocket_condition_text,
+                "selection_reason": pocket_selection_reason,
+                "candidates": pocket_candidates,
+            }
+
+            # ロングネックが選ばれた場合、標準長工具で届く上部は標準工具で荒取りし、
+            # ロングネック（ap上限付き）は届かない深部だけに使う
+            shallow_cond = None
+            shallow_candidates: list[dict[str, Any]] = []
+            if (
+                pocket_catalog_cond is not None
+                and is_long_neck(pocket_diameter, pocket_effective_length, pocket_ap)
+            ):
+                shallow_cond = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    pocket_target_diameter,
+                    pocket_depth,
+                    "ポケット",
+                    max_tool_diameter,
+                    candidates_out=shallow_candidates,
+                    exclude_long_neck=True,
+                )
+
+            if shallow_cond is not None:
+                shallow_args = catalog_pocket_stage_args(shallow_cond, pocket_depth, "荒取り・ポケット加工（上部）")
+                shallow_reach = min(pocket_depth, shallow_args["effective_length"])
+                if shallow_reach >= pocket_depth - 0.01:
+                    # 平均深さまで標準工具で届くならロングネックは不要
+                    features.append(
+                        pocket_stage_feature(
+                            feature_type="荒取り・ポケット加工",
+                            stage_volume=volume,
+                            stage_depth=pocket_depth,
+                            reach_depth=pocket_depth,
+                            candidates=shallow_candidates,
+                            method_extra="標準長工具で全深さに到達",
+                            **shallow_args,
+                        )
+                    )
+                else:
+                    # 除去体積は深さ方向に均等と仮定して上部/深部に按分する
+                    shallow_volume = volume * shallow_reach / pocket_depth
+                    deep_candidates: list[dict[str, Any]] = []
+                    deep_cond = deep_pocket_condition_for(
+                        conn,
+                        material_type,
+                        pocket_depth,
+                        pocket_depth - shallow_reach,
+                        max_tool_diameter,
+                        candidates_out=deep_candidates,
+                    )
+                    deep_args = (
+                        {
+                            **catalog_pocket_stage_args(deep_cond, pocket_depth, "荒取り・ポケット加工（深部）"),
+                            "candidates": deep_candidates,
+                        }
+                        if deep_cond is not None
+                        else primary_args
+                    )
+                    features.append(
+                        pocket_stage_feature(
+                            feature_type="荒取り・ポケット加工（上部・標準工具）",
+                            stage_volume=shallow_volume,
+                            stage_depth=shallow_reach,
+                            reach_depth=shallow_reach,
+                            candidates=shallow_candidates,
+                            method_extra=f"深さ 0〜{shallow_reach:.1f} mm",
+                            **shallow_args,
+                        )
+                    )
+                    features.append(
+                        pocket_stage_feature(
+                            feature_type="荒取り・ポケット加工（深部・ロングネック）",
+                            stage_volume=max(0.0, volume - shallow_volume),
+                            stage_depth=pocket_depth - shallow_reach,
+                            reach_depth=pocket_depth,
+                            method_extra=f"深さ {shallow_reach:.1f}〜{pocket_depth:.1f} mm",
+                            **deep_args,
+                        )
+                    )
+            else:
+                features.append(
+                    pocket_stage_feature(
+                        feature_type="荒取り・ポケット加工",
+                        stage_volume=volume,
+                        stage_depth=pocket_depth,
+                        reach_depth=pocket_depth,
+                        **primary_args,
+                    )
+                )
 
         if analysis["face_count"] >= 18:
             finish_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
@@ -3680,6 +3934,8 @@ def estimate(
                     "側面",
                     max_tool_diameter,
                     candidates_out=finish_candidates,
+                    # 底面仕上げのピッチをaeから決めるため、ae極小の長刃側面条件は使わない
+                    exclude_deep_flank=True,
                 )
             if finish_catalog_cond is not None:
                 finish_diameter = float(finish_catalog_cond["outside_diameter_mm"])
