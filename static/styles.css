@@ -1074,3 +1074,73 @@ body.is-analyzing .analysis-grid button.primary {
 
 .fill-kind.drill { background: #e6eef8; color: #1d4f91; }
 .fill-kind.wire { background: #fff1e3; color: #9a4a06; }
+
+/* --- 別工程（NC穴加工・ワイヤカット） --- */
+.wire-params {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px 12px;
+}
+
+.wire-params legend {
+  padding: 0 4px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--sub);
+}
+
+.wire-params .setting-note {
+  grid-column: 1 / -1;
+}
+
+.process-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+  margin: 4px 0 14px;
+}
+
+.process-card {
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-top: 3px solid var(--steel);
+  background: #fff;
+}
+
+.process-card.drill { border-top-color: #1d4f91; }
+.process-card.wire { border-top-color: #f08a24; }
+.process-card.total { border-top-color: var(--green); background: var(--soft); }
+
+.process-card span {
+  display: block;
+  color: var(--sub);
+  font-size: 12px;
+}
+
+.process-card strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.process-section {
+  margin-top: 14px;
+}
+
+.process-section h4 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+
+.process-meta {
+  margin-left: 8px;
+  color: var(--sub);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.row-uncomputed td {
+  color: var(--sub);
+}

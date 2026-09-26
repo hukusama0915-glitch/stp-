@@ -83,6 +83,28 @@
                   <span>ワイヤカット形状を埋める（貫通する抜き窓・異形穴・溝・丸穴）</span>
                 </label>
                 <p class="setting-note">モデル上で形状を埋めてから解析し直します。元モデルの時間と比較表示します。</p>
+                <label>NC穴加工に使う機械（埋めたドリル穴）
+                  <select id="ncMachineSelect" name="nc_machine_id" data-persist="nc_machine_id"></select>
+                </label>
+                <fieldset class="wire-params">
+                  <legend>ワイヤカット条件（お使いの機械の値を入力）</legend>
+                  <label>荒加工速度 mm²/分
+                    <input type="number" name="wire_rough_speed_mm2_min" min="0" step="1" placeholder="未入力" data-persist="wire_rough_speed_mm2_min">
+                  </label>
+                  <label>仕上げ回数
+                    <input type="number" name="wire_skim_count" min="0" max="10" step="1" value="0" data-persist="wire_skim_count">
+                  </label>
+                  <label>仕上げ送り mm/分
+                    <input type="number" name="wire_skim_speed_mm_min" min="0" step="0.1" placeholder="未入力" data-persist="wire_skim_speed_mm_min">
+                  </label>
+                  <label>結線時間 秒/形状
+                    <input type="number" name="wire_thread_sec" min="0" step="1" value="0" data-persist="wire_thread_sec">
+                  </label>
+                  <label>段取り 分
+                    <input type="number" name="wire_setup_min" min="0" step="1" value="0" data-persist="wire_setup_min">
+                  </label>
+                  <p class="setting-note">メーカーの板厚別標準条件は公開されていないため、取扱説明書の条件表や社内実績の値を入れてください。入力値はこのブラウザに保存されます。</p>
+                </fieldset>
               </details>
               <details class="edm-settings" open>
                 <summary>放電置き換え条件</summary>
@@ -182,15 +204,32 @@
             <p class="edm-note">
               下の形状をモデル上で埋めてから解析し直し、MC加工時間から除外しています。
               3Dプレビューの「元／埋め後／比較」で形状を確認できます（比較ではオレンジが埋めた部分）。
-              ワイヤ切断面積は「輪郭周長 × 板厚」で、ワイヤ加工時間の目安計算に使えます。
             </p>
-            <div class="table-wrap">
-              <table>
-                <thead>
-                  <tr><th>区分</th><th>種別</th><th>寸法</th><th>数量</th><th>ワイヤ切断面積</th></tr>
-                </thead>
-                <tbody id="fillRows"></tbody>
-              </table>
+            <div id="processCards" class="process-cards"></div>
+            <div id="ncHoleSection" class="process-section hidden">
+              <h4>NC穴加工（ドリル穴）<span id="ncHoleMeta" class="process-meta"></span></h4>
+              <p class="edm-note">OSG 超硬ドリル ADO の公式切削条件（送り量は範囲の中央値）で算出。穴間の移動は実際の穴位置を近い順に巡回した距離です。</p>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>種別</th><th>寸法</th><th>数量</th><th>回転数</th><th>送り mm/分</th><th>時間</th><th>条件・備考</th></tr>
+                  </thead>
+                  <tbody id="ncHoleRows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div id="wireSection" class="process-section hidden">
+              <h4>ワイヤカット<span id="wireMeta" class="process-meta"></span></h4>
+              <p class="edm-note">時間 ＝ 切断面積（輪郭周長×板厚）÷ 荒加工速度 ＋ 周長×仕上げ回数÷仕上げ送り ＋ 結線時間。スタート穴の加工は含みません。</p>
+              <p id="wireMessage" class="fill-message hidden"></p>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>種別</th><th>寸法</th><th>数量</th><th>切断面積</th><th>時間</th></tr>
+                  </thead>
+                  <tbody id="wireRows"></tbody>
+                </table>
+              </div>
             </div>
           </section>
 

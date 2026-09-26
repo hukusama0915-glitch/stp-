@@ -1808,6 +1808,249 @@ def summarize_fill_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# 別工程の時間算出（埋めた形状を NC穴加工機・ワイヤ放電加工機で加工する場合）
+# ---------------------------------------------------------------------------
+
+DRILL_CONDITIONS_PATH = BASE_DIR / "data" / "osg_drill_conditions.csv"
+DRILL_TIP_LENGTH_RATIO = 0.18  # 先端角140°のドリル先端長 ≒ D/2 / tan70°
+DRILL_APPROACH_MM = 1.0  # 切削送りで入る逃げ量
+DRILL_R_POINT_MM = 3.0  # 穴上のR点（早送りで戻る高さ）
+DRILL_STEP_RATIO = 2.0  # 8D超の穴は 2D ごとのステップ送り（カタログ注記8 の 1D～2D の上限側）
+_drill_condition_cache: dict[str, Any] = {"mtime": None, "rows": []}
+
+
+def load_drill_conditions() -> list[dict[str, Any]]:
+    """公式ドリル条件CSVを読み込む（ファイル更新時のみ再読込）。"""
+    if not DRILL_CONDITIONS_PATH.is_file():
+        return []
+    mtime = DRILL_CONDITIONS_PATH.stat().st_mtime
+    if _drill_condition_cache["mtime"] != mtime:
+        with DRILL_CONDITIONS_PATH.open("r", encoding="utf-8", newline="") as f:
+            rows = []
+            for row in csv.DictReader(f):
+                rows.append(
+                    {
+                        **row,
+                        "drill_diameter_mm": float(row["drill_diameter_mm"]),
+                        "spindle_rpm": float(row["spindle_rpm"]),
+                        "feed_per_rev_min": float(row["feed_per_rev_min"]),
+                        "feed_per_rev_max": float(row["feed_per_rev_max"]),
+                        "max_depth_ratio": float(row["max_depth_ratio"]),
+                    }
+                )
+        _drill_condition_cache.update({"mtime": mtime, "rows": rows})
+    return list(_drill_condition_cache["rows"])
+
+
+def drill_condition_for(diameter_mm: float, material_type: str) -> dict[str, Any] | None:
+    """径の前後の表の行から回転数・送り量を線形補間する。表の範囲外・材質なしは None。"""
+    rows = sorted(
+        (row for row in load_drill_conditions() if row["app_material"] and row["app_material"] in material_type),
+        key=lambda row: row["drill_diameter_mm"],
+    )
+    if not rows:
+        return None
+    lower = [row for row in rows if row["drill_diameter_mm"] <= diameter_mm + 1e-9]
+    upper = [row for row in rows if row["drill_diameter_mm"] >= diameter_mm - 1e-9]
+    if not lower or not upper:
+        return None
+    low, high = lower[-1], upper[0]
+    span = high["drill_diameter_mm"] - low["drill_diameter_mm"]
+    ratio = 0.0 if span <= 0 else (diameter_mm - low["drill_diameter_mm"]) / span
+
+    def interpolate(key: str) -> float:
+        return low[key] + (high[key] - low[key]) * ratio
+
+    feed_per_rev = (interpolate("feed_per_rev_min") + interpolate("feed_per_rev_max")) / 2
+    rpm = interpolate("spindle_rpm")
+    return {
+        "rpm": rpm,
+        "feed_per_rev": feed_per_rev,
+        "feed_mm_min": rpm * feed_per_rev,
+        "max_depth_ratio": low["max_depth_ratio"],
+        "source": f'{low["manufacturer"]} {low["series_code"]} {low["work_material"]} 出典 p.{low["source_page"]}',
+        "source_url": low["source_url"],
+    }
+
+
+def _nearest_neighbour_length(points: list[list[float]]) -> float:
+    """穴位置を近い順に巡回したときの移動距離（XY平面）。"""
+    if len(points) < 2:
+        return 0.0
+    remaining = [tuple(p[:2]) for p in points]
+    current = remaining.pop(0)
+    total = 0.0
+    while remaining:
+        nearest = min(remaining, key=lambda p: math.dist(p, current))
+        total += math.dist(nearest, current)
+        remaining.remove(nearest)
+        current = nearest
+    return total
+
+
+def nc_hole_plan(
+    items: list[dict[str, Any]],
+    material_type: str,
+    machine: sqlite3.Row | dict[str, Any],
+    estimate_mode: str,
+) -> dict[str, Any]:
+    """埋めたドリル穴を NC穴加工機で加工した場合の時間。"""
+    drill_items = [item for item in items if item["category"] == "drill"]
+    rapid_feed = max(1.0, float(machine["rapid_feed_mm_min"]))
+    profile = SAFETY_PROFILES.get(estimate_mode, SAFETY_PROFILES["cautious"])
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for item in drill_items:
+        key = (item["kind"], item["diameter_mm"], item["depth_mm"], item["axis"])
+        group = groups.setdefault(key, {"item": item, "centers": []})
+        group["centers"].append(item["center"])
+
+    rows: list[dict[str, Any]] = []
+    tools: set[float] = set()
+    directions: set[str] = set()
+    cutting_total = 0.0
+    rapid_total = 0.0
+    for (kind, diameter, depth, axis), group in sorted(groups.items(), key=lambda pair: (pair[0][1], pair[0][0])):
+        count = len(group["centers"])
+        condition = drill_condition_for(float(diameter), material_type)
+        row: dict[str, Any] = {
+            "kind": kind,
+            "dimensions": f"φ{fmt_number(diameter)} / 深さ {float(depth):.1f} mm / 軸 {axis}",
+            "count": count,
+            "rpm": None,
+            "feed_mm_min": None,
+            "sec": None,
+            "note": "",
+        }
+        if condition is None:
+            if float(diameter) < 2.0:
+                row["note"] = "φ2未満はドリルの公式条件が未登録のため時間未算出"
+            elif float(diameter) > 20.0:
+                row["note"] = "φ20超はドリルの公式条件が未登録のため時間未算出"
+            else:
+                row["note"] = f"{material_type}のドリル公式条件が未登録のため時間未算出"
+            rows.append(row)
+            continue
+        feed = max(1.0, condition["feed_mm_min"])
+        depth_ratio = float(depth) / max(float(diameter), 0.1)
+        cut_length = float(depth) + float(diameter) * DRILL_TIP_LENGTH_RATIO + DRILL_APPROACH_MM
+        cutting_sec = cut_length / feed * 60
+        retract_sec = (float(depth) + DRILL_R_POINT_MM) / rapid_feed * 60
+        notes = [condition["source"]]
+        if kind == "座ぐり":
+            notes.append("座ぐりカッターの公式条件が無いため同径ドリル条件で近似")
+        if depth_ratio > condition["max_depth_ratio"]:
+            steps = max(0, math.ceil(float(depth) / (float(diameter) * DRILL_STEP_RATIO)) - 1)
+            # ステップごとに穴上まで戻って再進入する往復分を早送りで加算
+            retract_sec += sum(2 * (float(diameter) * DRILL_STEP_RATIO * (i + 1)) for i in range(steps)) / rapid_feed * 60
+            notes.append(f"L/D {depth_ratio:.1f} は条件表の範囲（{condition['max_depth_ratio']:g}D以下）外: 2Dステップ送りで概算")
+        travel_sec = _nearest_neighbour_length(group["centers"]) / rapid_feed * 60
+        group_cutting = cutting_sec * count
+        group_rapid = retract_sec * count + travel_sec
+        cutting_total += group_cutting
+        rapid_total += group_rapid
+        tools.add(round(float(diameter), 3))
+        directions.add(axis)
+        row.update(
+            {
+                "rpm": round(condition["rpm"]),
+                "feed_mm_min": round(feed, 1),
+                "sec": round(group_cutting + group_rapid, 1),
+                "note": " / ".join(notes),
+            }
+        )
+        rows.append(row)
+
+    computed = [row for row in rows if row["sec"] is not None]
+    if not computed:
+        return {"rows": rows, "total_sec": None, "message": "時間を算出できる穴がありません。"}
+    allowance_sec = cutting_total * float(profile["hole"])
+    tool_change_sec = len(tools) * float(machine["atc_time_sec"])
+    setup_sec = float(machine["setup_time_min"]) * 60 * max(1, len(directions))
+    total = cutting_total + rapid_total + allowance_sec + tool_change_sec + setup_sec
+    return {
+        "rows": rows,
+        "machine_name": machine["machine_name"],
+        "cutting_sec": round(cutting_total, 1),
+        "rapid_sec": round(rapid_total, 1),
+        "allowance_sec": round(allowance_sec, 1),
+        "tool_change_sec": round(tool_change_sec, 1),
+        "tool_count": len(tools),
+        "setup_sec": round(setup_sec, 1),
+        "directions": sorted(directions),
+        "total_sec": round(total, 1),
+        "uncomputed_count": sum(row["count"] for row in rows if row["sec"] is None),
+    }
+
+
+def wire_params_from_form(form: Any) -> dict[str, Any]:
+    """ワイヤ加工条件（利用者入力）。荒加工速度が空欄なら時間は算出しない。"""
+    rough = input_number(form, "wire_rough_speed_mm2_min", "ワイヤ荒加工速度", default=0.0, minimum=0, maximum=10000)
+    return {
+        "rough_speed_mm2_min": float(rough),
+        "skim_count": int(input_number(form, "wire_skim_count", "ワイヤ仕上げ回数", default=0, minimum=0, maximum=10, integer=True)),
+        "skim_speed_mm_min": float(
+            input_number(form, "wire_skim_speed_mm_min", "ワイヤ仕上げ送り", default=0.0, minimum=0, maximum=1000)
+        ),
+        "thread_sec": float(input_number(form, "wire_thread_sec", "結線時間", default=0.0, minimum=0, maximum=3600)),
+        "setup_min": float(input_number(form, "wire_setup_min", "ワイヤ段取り", default=0.0, minimum=0, maximum=1440)),
+    }
+
+
+def wire_cut_plan(items: list[dict[str, Any]], params: dict[str, Any]) -> dict[str, Any]:
+    """埋めたワイヤカット形状をワイヤ放電加工機で加工した場合の時間。"""
+    wire_items = [item for item in items if item["category"] == "wire"]
+    rows: list[dict[str, Any]] = []
+    rough_speed = params["rough_speed_mm2_min"]
+    skim_count = params["skim_count"]
+    skim_speed = params["skim_speed_mm_min"]
+    missing: list[str] = []
+    if rough_speed <= 0:
+        missing.append("荒加工速度")
+    if skim_count > 0 and skim_speed <= 0:
+        missing.append("仕上げ送り")
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for item in wire_items:
+        key = (item["kind"], item["width_mm"], item["length_mm"], item["thickness_mm"], item["perimeter_mm"])
+        groups.setdefault(key, {"item": item, "count": 0})["count"] += 1
+    total_cut = 0.0
+    for (kind, width, length, thickness, perimeter), group in groups.items():
+        item = group["item"]
+        count = group["count"]
+        size = f'φ{fmt_number(item["diameter_mm"])}' if kind == "丸穴" else f"{width:.1f} x {length:.1f} mm"
+        row: dict[str, Any] = {
+            "kind": kind,
+            "dimensions": f"{size} / 板厚 {thickness:.1f} mm / 周長 {perimeter:.1f} mm",
+            "count": count,
+            "cut_area_mm2": round(float(item["cut_area_mm2"]) * count, 1),
+            "sec": None,
+        }
+        if not missing:
+            rough_sec = float(item["cut_area_mm2"]) / rough_speed * 60
+            skim_sec = float(perimeter) * skim_count / skim_speed * 60 if skim_count > 0 else 0.0
+            shape_sec = (rough_sec + skim_sec + params["thread_sec"]) * count
+            row["sec"] = round(shape_sec, 1)
+            total_cut += shape_sec
+        rows.append(row)
+    if not rows:
+        return {"rows": [], "total_sec": None, "message": "ワイヤカット形状がありません。"}
+    if missing:
+        return {
+            "rows": rows,
+            "total_sec": None,
+            "params": params,
+            "message": f"ワイヤ加工条件（{'・'.join(missing)}）が未入力のため時間を算出していません。",
+        }
+    setup_sec = params["setup_min"] * 60
+    return {
+        "rows": rows,
+        "params": params,
+        "cutting_sec": round(total_cut, 1),
+        "setup_sec": round(setup_sec, 1),
+        "total_sec": round(total_cut + setup_sec, 1),
+    }
+
+
 def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | None:
     if os.environ.get("ENABLE_BREP_ANALYSIS", "1") != "1":
         return None
@@ -4795,6 +5038,10 @@ def api_analyze() -> Response:
         excluded_keys = set()
 
     fill_options = fill_options_from_form(request.form)
+    wire_params = wire_params_from_form(request.form)
+    nc_machine_id = int(
+        input_number(request.form, "nc_machine_id", "NC穴加工機", default=machine_id, minimum=1, integer=True)
+    )
 
     cleanup_old_uploads()
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
@@ -4810,7 +5057,7 @@ def api_analyze() -> Response:
         analyze_path = path
         fill_payload: dict[str, Any] | None = None
         if fill_options["drill_holes"] or fill_options["wire_shapes"]:
-            fill_payload, filled_path = prepare_filled_model(path, fill_options)
+            fill_payload, filled_path, fill_items = prepare_filled_model(path, fill_options)
             if filled_path is not None:
                 # 比較用に元モデルの時間も算出する（履歴には保存しない）
                 original = estimate(
@@ -4821,6 +5068,10 @@ def api_analyze() -> Response:
                 fill_payload["original_machining_sec"] = original["breakdown"]["machining_sec"]
                 fill_payload["original_time_label"] = seconds_label(original["breakdown"]["total_sec"])
                 analyze_path = filled_path
+            if fill_items:
+                fill_payload["processes"] = separate_process_plans(
+                    fill_items, material_type, nc_machine_id, estimate_mode, wire_params
+                )
         result = estimate(
             analyze_path,
             upload.filename,
@@ -4839,18 +5090,20 @@ def api_analyze() -> Response:
         return jsonify({"error": f"解析に失敗しました: {exc}"}), 500
 
 
-def prepare_filled_model(path: Path, fill_options: dict[str, Any]) -> tuple[dict[str, Any], Path | None]:
+def prepare_filled_model(
+    path: Path, fill_options: dict[str, Any]
+) -> tuple[dict[str, Any], Path | None, list[dict[str, Any]]]:
     """埋めたモデルを作成し、画面表示用のペイロードと解析対象パスを返す。失敗時は元モデルで続行する。"""
     payload: dict[str, Any] = {"enabled": True, "options": fill_options}
     try:
         fill = build_filled_model(path, fill_options, path.with_suffix(""))
     except InputError as exc:
         payload["error"] = str(exc)
-        return payload, None
+        return payload, None, []
     except Exception as exc:  # noqa: BLE001 - 埋めに失敗しても通常の見積もりは返す
         app.logger.exception("モデル埋めに失敗しました: %s", path.name)
         payload["error"] = f"形状を埋められませんでした（元モデルで算出しています）: {exc}"
-        return payload, None
+        return payload, None, []
     rows = summarize_fill_items(fill["items"])
     payload.update(
         {
@@ -4864,7 +5117,29 @@ def prepare_filled_model(path: Path, fill_options: dict[str, Any]) -> tuple[dict
     )
     if not rows:
         payload["message"] = "埋める対象の形状が見つかりませんでした。元モデルのまま算出しています。"
-    return payload, fill["filled_path"]
+    return payload, fill["filled_path"], fill["items"]
+
+
+def separate_process_plans(
+    items: list[dict[str, Any]],
+    material_type: str,
+    nc_machine_id: int,
+    estimate_mode: str,
+    wire_params: dict[str, Any],
+) -> dict[str, Any]:
+    """埋めた形状を別工程（NC穴加工・ワイヤカット）で加工する時間。"""
+    plans: dict[str, Any] = {}
+    if any(item["category"] == "drill" for item in items):
+        with db() as conn:
+            machine = conn.execute("SELECT * FROM machines WHERE machine_id = ?", (nc_machine_id,)).fetchone()
+            if machine is None:
+                machine = conn.execute("SELECT * FROM machines ORDER BY machine_id LIMIT 1").fetchone()
+        plans["nc_holes"] = nc_hole_plan(items, material_type, machine, estimate_mode) if machine else {
+            "rows": [], "total_sec": None, "message": "機械マスタが未登録です。",
+        }
+    if any(item["category"] == "wire" for item in items):
+        plans["wire"] = wire_cut_plan(items, wire_params)
+    return plans
 
 
 FILL_MODEL_KINDS = {"filled": "__filled.step", "bodies": "__fillbodies.step"}
@@ -4940,6 +5215,27 @@ def api_history_csv(history_id: int) -> Response:
                     row["cut_area_mm2"] if row["category"] == "wire" else "",
                 ]
             )
+        processes = fill.get("processes") or {}
+        nc = processes.get("nc_holes")
+        if nc:
+            writer.writerow([])
+            writer.writerow(["NC穴加工", "合計", seconds_label(nc["total_sec"]) if nc.get("total_sec") is not None else "未算出"])
+            writer.writerow(["種別", "寸法", "数量", "回転数", "送りmm/min", "時間秒", "条件・備考"])
+            for row in nc.get("rows", []):
+                writer.writerow(
+                    [row["kind"], row["dimensions"], row["count"], row["rpm"] or "", row["feed_mm_min"] or "",
+                     row["sec"] if row["sec"] is not None else "未算出", row["note"]]
+                )
+        wire = processes.get("wire")
+        if wire:
+            writer.writerow([])
+            writer.writerow(["ワイヤカット", "合計", seconds_label(wire["total_sec"]) if wire.get("total_sec") is not None else "未算出", wire.get("message", "")])
+            writer.writerow(["種別", "寸法", "数量", "切断面積mm2", "時間秒"])
+            for row in wire.get("rows", []):
+                writer.writerow(
+                    [row["kind"], row["dimensions"], row["count"], row["cut_area_mm2"],
+                     row["sec"] if row["sec"] is not None else "未算出"]
+                )
     writer.writerow([])
     writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "工具選定理由", "到達性", "加工パス", "加工時間秒", "備考"])
     for feature in payload["features"]:

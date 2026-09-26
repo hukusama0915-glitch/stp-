@@ -17,6 +17,31 @@ function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
 }
 
+// ワイヤ条件などの入力値をブラウザに保存する（保存できない環境では何もしない）
+const PERSIST_PREFIX = "stp-tool:";
+function readPersisted(key) {
+  try {
+    return window.localStorage.getItem(PERSIST_PREFIX + key);
+  } catch {
+    return null;
+  }
+}
+
+function writePersisted(key, value) {
+  try {
+    window.localStorage.setItem(PERSIST_PREFIX + key, value);
+  } catch {
+    // 保存できなくても計算には影響しない
+  }
+}
+
+function restorePersistedInputs() {
+  $$("input[data-persist]").forEach((input) => {
+    const saved = readPersisted(input.dataset.persist);
+    if (saved !== null) input.value = saved;
+  });
+}
+
 function safeUrl(value) {
   const url = String(value || "");
   return /^https?:\/\//i.test(url) ? esc(url) : "#";
@@ -508,7 +533,9 @@ function renderFillPanel(result) {
     badge.textContent = fill.error ? "埋め不可" : "対象なし";
     badge.className = "fill-badge warn";
     summary.innerHTML = `<p class="fill-message">${esc(fill.error || fill.message || "")}</p>`;
-    $("#fillRows").innerHTML = "";
+    $("#processCards").innerHTML = "";
+    $("#ncHoleSection").classList.add("hidden");
+    $("#wireSection").classList.add("hidden");
     return;
   }
   badge.className = "fill-badge";
@@ -523,15 +550,74 @@ function renderFillPanel(result) {
     <div><span>差</span><strong class="${diff <= 0 ? "minus" : "plus"}">${diff <= 0 ? "-" : "+"}${secLabel(Math.abs(diff))}</strong></div>
     <div><span>ワイヤ切断面積 合計</span><strong>${Number(fill.wire_cut_area_mm2 || 0).toLocaleString()} mm²</strong></div>
   `;
-  $("#fillRows").innerHTML = rows.map((row) => `
-    <tr>
-      <td><span class="fill-kind ${row.category}">${row.category === "drill" ? "ドリル穴" : "ワイヤカット"}</span></td>
-      <td>${esc(row.kind)}</td>
-      <td>${esc(row.dimensions)}</td>
-      <td>${esc(row.count)}</td>
-      <td>${row.category === "wire" ? `${Number(row.cut_area_mm2).toLocaleString()} mm²` : "-"}</td>
-    </tr>
-  `).join("");
+  renderProcessPlans(result, fill.processes || {});
+}
+
+function processTimeLabel(sec) {
+  return Number.isFinite(Number(sec)) && sec !== null ? secLabel(sec) : "未算出";
+}
+
+function renderProcessPlans(result, processes) {
+  const nc = processes.nc_holes;
+  const wire = processes.wire;
+  const mcSec = Number(result.breakdown.total_sec) || 0;
+  const parts = [{ label: "MC（埋めたモデル）", sec: mcSec, kind: "mc" }];
+  if (nc) parts.push({ label: `NC穴加工${nc.machine_name ? `（${nc.machine_name}）` : ""}`, sec: nc.total_sec, kind: "drill" });
+  if (wire) parts.push({ label: "ワイヤカット", sec: wire.total_sec, kind: "wire" });
+  const computed = parts.filter((p) => p.sec !== null && p.sec !== undefined);
+  const total = computed.reduce((sum, p) => sum + Number(p.sec), 0);
+  const incomplete = computed.length < parts.length;
+  $("#processCards").innerHTML = `
+    ${parts.map((p) => `
+      <div class="process-card ${p.kind}">
+        <span>${esc(p.label)}</span>
+        <strong>${processTimeLabel(p.sec)}</strong>
+      </div>`).join("")}
+    <div class="process-card total">
+      <span>工程合計${incomplete ? "（未算出の工程を除く）" : ""}</span>
+      <strong>${secLabel(total)}</strong>
+    </div>
+  `;
+
+  const ncSection = $("#ncHoleSection");
+  ncSection.classList.toggle("hidden", !nc);
+  if (nc) {
+    $("#ncHoleMeta").textContent = nc.total_sec !== null && nc.total_sec !== undefined
+      ? ` 切削 ${secLabel(nc.cutting_sec)} / 早送り ${secLabel(nc.rapid_sec)} / 補正 ${secLabel(nc.allowance_sec)} / 工具交換 ${nc.tool_count}本 ${secLabel(nc.tool_change_sec)} / 段取り ${secLabel(nc.setup_sec)}（加工方向 ${(nc.directions || []).join("・")}）`
+      : ` ${nc.message || ""}`;
+    $("#ncHoleRows").innerHTML = (nc.rows || []).map((row) => `
+      <tr class="${row.sec === null ? "row-uncomputed" : ""}">
+        <td>${esc(row.kind)}</td>
+        <td>${esc(row.dimensions)}</td>
+        <td>${esc(row.count)}</td>
+        <td>${row.rpm === null ? "-" : Number(row.rpm).toLocaleString()}</td>
+        <td>${row.feed_mm_min === null ? "-" : esc(row.feed_mm_min)}</td>
+        <td>${processTimeLabel(row.sec)}</td>
+        <td class="condition-cell">${esc(row.note)}</td>
+      </tr>
+    `).join("");
+  }
+
+  const wireSection = $("#wireSection");
+  wireSection.classList.toggle("hidden", !wire);
+  if (wire) {
+    const params = wire.params || {};
+    $("#wireMeta").textContent = wire.total_sec !== null && wire.total_sec !== undefined
+      ? ` 荒 ${params.rough_speed_mm2_min} mm²/分 / 仕上げ ${params.skim_count}回${params.skim_count ? ` ${params.skim_speed_mm_min} mm/分` : ""} / 段取り ${secLabel(wire.setup_sec)}`
+      : "";
+    const message = $("#wireMessage");
+    message.classList.toggle("hidden", !wire.message);
+    message.textContent = wire.message || "";
+    $("#wireRows").innerHTML = (wire.rows || []).map((row) => `
+      <tr>
+        <td>${esc(row.kind)}</td>
+        <td>${esc(row.dimensions)}</td>
+        <td>${esc(row.count)}</td>
+        <td>${Number(row.cut_area_mm2).toLocaleString()} mm²</td>
+        <td>${processTimeLabel(row.sec)}</td>
+      </tr>
+    `).join("");
+  }
 }
 
 function renderCadScene() {
@@ -1044,6 +1130,14 @@ function renderMaster() {
   $("#machineSelect").innerHTML = state.master.machines
     .map((m) => `<option value="${m.machine_id}">${esc(m.machine_name)}${m.max_tool_diameter_mm ? ` / 最大工具径 ${m.max_tool_diameter_mm}mm` : ""}</option>`)
     .join("");
+  const ncSelect = $("#ncMachineSelect");
+  if (ncSelect) {
+    const saved = readPersisted("nc_machine_id");
+    ncSelect.innerHTML = state.master.machines
+      .map((m) => `<option value="${m.machine_id}">${esc(m.machine_name)}</option>`)
+      .join("");
+    if (saved && state.master.machines.some((m) => String(m.machine_id) === saved)) ncSelect.value = saved;
+  }
   if ($("#conditionToolSelect")) {
     $("#conditionToolSelect").innerHTML = state.master.tools
       .map((t) => `<option value="${t.tool_id}">${esc(t.tool_name)}</option>`)
@@ -1501,6 +1595,10 @@ function bindEvents() {
     button.addEventListener("click", () => setModelView(button.dataset.modelView));
   });
 
+  $$("[data-persist]").forEach((input) => {
+    input.addEventListener("change", () => writePersisted(input.dataset.persist, input.value));
+  });
+
   document.body.addEventListener("click", async (event) => {
     const excludeButton = event.target.closest("[data-exclude-key]");
     const restoreButton = event.target.closest("[data-restore-key]");
@@ -1700,6 +1798,7 @@ function bindEvents() {
   });
 }
 
+restorePersistedInputs();
 bindEvents();
 drawPreviewPlaceholder();
 updateViewerControls();

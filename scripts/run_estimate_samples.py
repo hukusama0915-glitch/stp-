@@ -124,7 +124,7 @@ def main() -> int:
         for material in ("鉄", "SUS"):
             key = f"{name}|{material}|埋め(ドリル+ワイヤ)"
             try:
-                fill_payload, filled_path = app_module.prepare_filled_model(work_copy, fill_options)
+                fill_payload, filled_path, fill_items = app_module.prepare_filled_model(work_copy, fill_options)
                 if filled_path is None:
                     raise RuntimeError(fill_payload.get("error") or "埋めたモデルを作成できませんでした")
                 result = app_module.estimate(
@@ -132,10 +132,15 @@ def main() -> int:
                     use_manufacturer_conditions=True, estimate_mode="cautious",
                 )
                 report[key] = summarize(result)
+                with app_module.db() as conn:
+                    nc_machine = conn.execute("SELECT * FROM machines WHERE machine_id = 1").fetchone()
+                nc_plan = app_module.nc_hole_plan(fill_items, material, nc_machine, "cautious")
                 report[key]["fill"] = {
                     "drill_count": fill_payload["drill_count"],
                     "wire_count": fill_payload["wire_count"],
                     "wire_cut_area_mm2": fill_payload["wire_cut_area_mm2"],
+                    "nc_hole_sec": nc_plan.get("total_sec"),
+                    "nc_hole_uncomputed": nc_plan.get("uncomputed_count"),
                 }
             except Exception as exc:  # noqa: BLE001
                 report[key] = {"error": str(exc)}
