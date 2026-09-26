@@ -5219,17 +5219,17 @@ def api_analyze() -> Response:
     nc_machine_id = int(
         input_number(request.form, "nc_machine_id", "NC穴加工機", default=machine_id, minimum=1, integer=True)
     )
-
-    cleanup_old_uploads()
-    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
-    path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{safe_name}"
-    upload.save(path)
     shape_mode = request.form.get("shape_mode", "prismatic")
     if shape_mode not in SHAPE_MODES:
         raise InputError(f"形状タイプは {' / '.join(SHAPE_MODES.values())} から選択してください。")
     mold_finish_passes = int(
         input_number(request.form, "mold_finish_passes", "金型の仕上げ回数", default=2, minimum=1, maximum=5, integer=True)
     )
+
+    cleanup_old_uploads()
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
+    path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{safe_name}"
+    upload.save(path)
     estimate_args = dict(
         use_manufacturer_conditions=use_manufacturer_conditions,
         estimate_mode=estimate_mode,
