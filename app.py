@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
 
@@ -1505,6 +1505,309 @@ def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
     return analysis
 
 
+# ---------------------------------------------------------------------------
+# モデル埋め（MCのみの加工時間算出用）
+# ドリル穴・ワイヤカット形状をソリッドで埋めたモデルを作り、それを解析し直す。
+# ---------------------------------------------------------------------------
+
+FILL_MIN_HOLE_ARC_RATIO = 0.95  # 全周円筒（穴）とみなす円弧率
+FILL_THROUGH_TOLERANCE = 0.01  # 押し出し柱と材料の重なりがこの比率未満なら貫通
+DEFAULT_FILL_DRILL_MAX_DIAMETER_MM = 13.0
+
+
+def fill_options_from_form(form: Any) -> dict[str, Any]:
+    return {
+        "drill_holes": form.get("fill_drill_holes") == "on",
+        "wire_shapes": form.get("fill_wire_shapes") == "on",
+        # この径を超える丸穴はドリル穴として扱わない（0で上限なし）
+        "drill_max_diameter_mm": float(
+            input_number(
+                form,
+                "fill_drill_max_diameter_mm",
+                "ドリル穴とみなす最大径",
+                default=DEFAULT_FILL_DRILL_MAX_DIAMETER_MM,
+                minimum=0,
+                maximum=200,
+            )
+        ),
+    }
+
+
+def _axis_extent(face: Any, origin: Any, axis: Any) -> tuple[float, float]:
+    import cadquery as cq  # type: ignore
+
+    values = [(cq.Vector(*vertex.toTuple()) - origin).dot(axis) for vertex in face.Vertices()]
+    if not values:
+        return 0.0, 0.0
+    return min(values), max(values)
+
+
+def _canonical_axis(origin: Any, axis: Any) -> tuple[Any, Any]:
+    """軸の向きをそろえ、原点に最も近い軸上の点を基準点にする（同一軸線の判定用）。"""
+    for component in (axis.x, axis.y, axis.z):
+        if abs(component) > 1e-9:
+            if component < 0:
+                axis = axis * -1
+            break
+    base = origin - axis * origin.dot(axis)
+    return base, axis
+
+
+def _same_axis_line(origin_a: Any, axis_a: Any, origin_b: Any, axis_b: Any, tol: float = 0.02) -> bool:
+    if abs(abs(axis_a.dot(axis_b)) - 1.0) > 1e-4:
+        return False
+    offset = origin_b - origin_a
+    radial = offset - axis_a * offset.dot(axis_a)
+    return radial.Length <= tol
+
+
+def _hole_label(diameter: float, axis: Any, coaxial_smaller: bool) -> str:
+    if coaxial_smaller:
+        return "座ぐり"
+    if diameter < 3.0:
+        return "微細穴"
+    if abs(axis.z) < 0.99:
+        return "横穴"
+    return "穴"
+
+
+def _wire_shape_label(wire: Any) -> tuple[str, float, float]:
+    edges = wire.Edges()
+    bounds = wire.BoundingBox()
+    width, length = sorted((float(bounds.xlen), float(bounds.ylen)))
+    if len(edges) == 1 and edges[0].geomType() == "CIRCLE":
+        return "丸穴", width, length
+    if width > 0 and length / width >= 3.0:
+        return "溝", width, length
+    return "抜き窓・異形穴", width, length
+
+
+def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) -> dict[str, Any]:
+    """指定カテゴリの形状を埋めたモデルをSTEPで書き出し、埋めた内容を返す。
+
+    - ドリル穴: 空洞側の全周円筒（穴・横穴・座ぐり・微細穴）を同径の円柱で埋める。
+      同軸の円錐面（皿もみ・ドリル先端）も一緒に埋める。
+    - ワイヤカット形状: 上向き平面の内側輪郭を最下面まで押し出し、材料と重ならない
+      （＝板厚方向に貫通する）ものを柱で埋める。抜き窓・異形穴・溝・丸穴が対象。
+    返り値の filled_path / bodies_path は埋め後モデルと、埋めた部分だけのモデル。
+    """
+    import cadquery as cq  # type: ignore
+
+    imported = cq.importers.importStep(str(path))
+    shape = imported.val()
+    if not hasattr(shape, "Faces") or not hasattr(shape, "BoundingBox"):
+        raise InputError("B-Repソリッドとして読み込めないため、形状を埋められません（STEP風の簡易データなど）。")
+    bounds = shape.BoundingBox()
+    zmin = float(bounds.zmin)
+    original_volume = float(shape.Volume())
+
+    tools: list[Any] = []
+    items: list[dict[str, Any]] = []
+    filled_axes: list[tuple[Any, Any]] = []
+
+    if options.get("drill_holes"):
+        # 円筒面は半周ずつに分割されていることが多いので、同一軸線・同一半径でまとめてから判定する
+        cylinder_groups: list[dict[str, Any]] = []
+        for face in shape.Faces():
+            if face.geomType() != "CYLINDER":
+                continue
+            cylinder = face._geomAdaptor().Cylinder()
+            radius = float(cylinder.Radius())
+            if radius <= 0:
+                continue
+            direction = cylinder.Axis().Direction()
+            location = cylinder.Axis().Location()
+            origin, axis = _canonical_axis(
+                cq.Vector(location.X(), location.Y(), location.Z()),
+                cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized(),
+            )
+            t_min, t_max = _axis_extent(face, origin, axis)
+            group = next(
+                (
+                    g
+                    for g in cylinder_groups
+                    if abs(g["radius"] - radius) < 1e-3
+                    and _same_axis_line(g["origin"], g["axis"], origin, axis)
+                    and t_min <= g["t_max"] + 1e-3
+                    and t_max >= g["t_min"] - 1e-3
+                ),
+                None,
+            )
+            if group is None:
+                cylinder_groups.append(
+                    {"radius": radius, "origin": origin, "axis": axis, "t_min": t_min, "t_max": t_max, "area": float(face.Area())}
+                )
+            else:
+                group["t_min"] = min(group["t_min"], t_min)
+                group["t_max"] = max(group["t_max"], t_max)
+                group["area"] += float(face.Area())
+
+        holes: list[dict[str, Any]] = []
+        for group in cylinder_groups:
+            length = group["t_max"] - group["t_min"]
+            if length < 0.05:
+                continue
+            if group["area"] / (2 * math.pi * group["radius"] * length) < FILL_MIN_HOLE_ARC_RATIO:
+                continue
+            middle = group["origin"] + group["axis"] * ((group["t_min"] + group["t_max"]) / 2)
+            if shape.isInside(middle, 1e-4):
+                continue  # 材料側の円筒（ボス等）は対象外
+            holes.append({**group, "length": length})
+
+        max_diameter = float(options.get("drill_max_diameter_mm") or 0.0)
+        for hole in holes:
+            coaxial_smaller = [
+                other
+                for other in holes
+                if other is not hole
+                and other["radius"] < hole["radius"] - 1e-3
+                and _same_axis_line(hole["origin"], hole["axis"], other["origin"], other["axis"])
+            ]
+            # 座ぐりは下穴の径で、それ以外は自身の径でドリル穴かを判断する
+            reference_diameter = min([o["radius"] for o in coaxial_smaller] + [hole["radius"]]) * 2
+            if max_diameter > 0 and reference_diameter > max_diameter + 1e-6:
+                continue
+            hole["coaxial_smaller"] = bool(coaxial_smaller)
+            start = hole["origin"] + hole["axis"] * hole["t_min"]
+            tools.append(cq.Solid.makeCylinder(hole["radius"], hole["length"], start, hole["axis"]))
+            filled_axes.append((hole["origin"], hole["axis"]))
+            diameter = hole["radius"] * 2
+            items.append(
+                {
+                    "category": "drill",
+                    "kind": _hole_label(diameter, hole["axis"], hole["coaxial_smaller"]),
+                    "diameter_mm": round(diameter, 3),
+                    "depth_mm": round(hole["length"], 2),
+                    "axis": axis_label((hole["axis"].x, hole["axis"].y, hole["axis"].z)),
+                    "volume_mm3": math.pi * hole["radius"] ** 2 * hole["length"],
+                    "center": [round(v, 2) for v in (start + hole["axis"] * (hole["length"] / 2)).toTuple()],
+                }
+            )
+        # 埋めた穴と同軸の円錐面（皿もみ・ドリル先端）も埋める
+        for face in shape.Faces():
+            if face.geomType() != "CONE":
+                continue
+            cone = face._geomAdaptor().Cone()
+            direction = cone.Axis().Direction()
+            location = cone.Axis().Location()
+            axis = cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized()
+            origin = cq.Vector(location.X(), location.Y(), location.Z())
+            if not any(_same_axis_line(o, a, origin, axis) for o, a in filled_axes):
+                continue
+            t_min, t_max = _axis_extent(face, origin, axis)
+            if t_max - t_min < 0.01:
+                continue
+
+            def radius_at(t: float) -> float:
+                radii = [
+                    ((cq.Vector(*v.toTuple()) - origin) - axis * (cq.Vector(*v.toTuple()) - origin).dot(axis)).Length
+                    for v in face.Vertices()
+                    if abs((cq.Vector(*v.toTuple()) - origin).dot(axis) - t) < 1e-3
+                ]
+                return max(radii) if radii else 0.0
+
+            r_start, r_end = radius_at(t_min), radius_at(t_max)
+            middle = origin + axis * ((t_min + t_max) / 2)
+            if shape.isInside(middle, 1e-4):
+                continue
+            tools.append(
+                cq.Solid.makeCone(r_start, r_end, t_max - t_min, origin + axis * t_min, axis)
+            )
+
+    if options.get("wire_shapes"):
+        for face in shape.Faces():
+            if face.geomType() != "PLANE" or face.normalAt().z < 0.99:
+                continue
+            face_z = float(face.Center().z)
+            height = face_z - zmin
+            if height < 0.05:
+                continue
+            for wire in face.innerWires():
+                prism = cq.Solid.extrudeLinear(cq.Face.makeFromWires(wire), cq.Vector(0, 0, -height))
+                prism_volume = abs(float(prism.Volume()))
+                if prism_volume <= 0:
+                    continue
+                if float(prism.intersect(shape).Volume()) >= prism_volume * FILL_THROUGH_TOLERANCE:
+                    continue  # 途中で材料に当たる＝貫通していない（止まりポケット等）
+                kind, width, length = _wire_shape_label(wire)
+                center = prism.Center()
+                if kind == "丸穴" and any(
+                    _same_axis_line(o, a, cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)) for o, a in filled_axes
+                ):
+                    continue  # ドリル穴として埋め済み
+                perimeter = sum(float(edge.Length()) for edge in wire.Edges())
+                tools.append(prism)
+                items.append(
+                    {
+                        "category": "wire",
+                        "kind": kind,
+                        "width_mm": round(width, 2),
+                        "length_mm": round(length, 2),
+                        "diameter_mm": round(width, 3) if kind == "丸穴" else None,
+                        "thickness_mm": round(height, 2),
+                        "perimeter_mm": round(perimeter, 1),
+                        "cut_area_mm2": round(perimeter * height, 1),
+                        "volume_mm3": prism_volume,
+                        "center": [round(v, 2) for v in center.toTuple()],
+                    }
+                )
+
+    if not tools:
+        return {"items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0}
+
+    filled = shape.fuse(*tools).clean()
+    bodies = cq.Compound.makeCompound(tools)
+    filled_path = output_stem.with_name(output_stem.name + "__filled.step")
+    bodies_path = output_stem.with_name(output_stem.name + "__fillbodies.step")
+    cq.exporters.export(filled, str(filled_path), "STEP")
+    cq.exporters.export(bodies, str(bodies_path), "STEP")
+    return {
+        "items": items,
+        "filled_path": filled_path,
+        "bodies_path": bodies_path,
+        "added_volume_mm3": max(0.0, float(filled.Volume()) - original_volume),
+    }
+
+
+def summarize_fill_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同じ寸法の埋め形状をまとめて一覧用の行にする。"""
+    groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for item in items:
+        if item["category"] == "drill":
+            key = ("drill", item["kind"], item["diameter_mm"], item["depth_mm"], item["axis"])
+            label = f'φ{fmt_number(item["diameter_mm"])} / 深さ {item["depth_mm"]:.1f} mm / 軸 {item["axis"]}'
+        else:
+            key = ("wire", item["kind"], item["width_mm"], item["length_mm"], item["thickness_mm"], item["perimeter_mm"])
+            size = (
+                f'φ{fmt_number(item["diameter_mm"])}'
+                if item["kind"] == "丸穴"
+                else f'{item["width_mm"]:.1f} x {item["length_mm"]:.1f} mm'
+            )
+            label = f'{size} / 板厚 {item["thickness_mm"]:.1f} mm / 周長 {item["perimeter_mm"]:.1f} mm'
+        group = groups.setdefault(
+            key,
+            {
+                "category": item["category"],
+                "kind": item["kind"],
+                "dimensions": label,
+                "count": 0,
+                "volume_mm3": 0.0,
+                "cut_area_mm2": 0.0,
+                "centers": [],
+            },
+        )
+        group["count"] += 1
+        group["volume_mm3"] += float(item["volume_mm3"])
+        group["cut_area_mm2"] += float(item.get("cut_area_mm2") or 0.0)
+        group["centers"].append(item["center"])
+    rows = list(groups.values())
+    rows.sort(key=lambda row: (row["category"] != "drill", row["kind"], row["dimensions"]))
+    for row in rows:
+        row["volume_mm3"] = round(row["volume_mm3"], 1)
+        row["cut_area_mm2"] = round(row["cut_area_mm2"], 1)
+    return rows
+
+
 def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | None:
     if os.environ.get("ENABLE_BREP_ANALYSIS", "1") != "1":
         return None
@@ -2769,6 +3072,8 @@ def estimate(
     estimate_mode: str = "cautious",
     edm_policy: dict[str, Any] | None = None,
     excluded_keys: set[str] | list[str] | None = None,
+    save_history: bool = True,
+    extra_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     analysis = parse_step_file(path, blank_allowance_mm)
     bbox = analysis["bbox"]
@@ -3680,7 +3985,11 @@ def estimate(
             complexity = min(0.22, max(0.06, analysis["face_count"] / 500))
             pocket_volume = bbox["x"] * bbox["y"] * bbox["z"] * complexity
 
-        if analysis["face_count"] >= 18 and pocket_volume > significant_volume_threshold(bbox):
+        # B-Rep解析できた場合は面数ではなく除去体積で判断する（穴を埋めたモデルは面数が少なくなるため）
+        has_internal_machining = pocket_volume > significant_volume_threshold(bbox) and (
+            bool(analysis.get("brep_available")) or analysis["face_count"] >= 18
+        )
+        if has_internal_machining:
             pocket_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
             pocket_cond = condition_for(conn, pocket_tool["tool_id"], material_type, "ポケット")
             pocket_candidates: list[dict[str, Any]] = []
@@ -3918,7 +4227,7 @@ def estimate(
                     )
                 )
 
-        if analysis["face_count"] >= 18:
+        if analysis["face_count"] >= 18 or has_internal_machining:
             finish_tool = pick_tool(conn, "EM", 10, max_tool_diameter)
             finish_cond = condition_for(conn, finish_tool["tool_id"], material_type, "ポケット")
             finish_candidates: list[dict[str, Any]] = []
@@ -4337,6 +4646,10 @@ def estimate(
             "condition_source": "STP形状からメーカー条件を自動選定" if use_manufacturer_conditions else "社内マスタ条件",
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
+        if extra_payload:
+            result.update(extra_payload)
+        if not save_history:
+            return result
         cur = conn.execute(
             """
             INSERT INTO histories
@@ -4481,21 +4794,41 @@ def api_analyze() -> Response:
     except (ValueError, TypeError):
         excluded_keys = set()
 
+    fill_options = fill_options_from_form(request.form)
+
     cleanup_old_uploads()
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
-    path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{safe_name}"
+    path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{safe_name}"
     upload.save(path)
+    estimate_args = dict(
+        use_manufacturer_conditions=use_manufacturer_conditions,
+        estimate_mode=estimate_mode,
+        edm_policy=edm_policy,
+        excluded_keys=excluded_keys,
+    )
     try:
+        analyze_path = path
+        fill_payload: dict[str, Any] | None = None
+        if fill_options["drill_holes"] or fill_options["wire_shapes"]:
+            fill_payload, filled_path = prepare_filled_model(path, fill_options)
+            if filled_path is not None:
+                # 比較用に元モデルの時間も算出する（履歴には保存しない）
+                original = estimate(
+                    path, upload.filename, material_type, blank_allowance_mm, machine_id,
+                    save_history=False, **estimate_args,
+                )
+                fill_payload["original_total_sec"] = original["breakdown"]["total_sec"]
+                fill_payload["original_machining_sec"] = original["breakdown"]["machining_sec"]
+                fill_payload["original_time_label"] = seconds_label(original["breakdown"]["total_sec"])
+                analyze_path = filled_path
         result = estimate(
-            path,
+            analyze_path,
             upload.filename,
             material_type,
             blank_allowance_mm,
             machine_id,
-            use_manufacturer_conditions=use_manufacturer_conditions,
-            estimate_mode=estimate_mode,
-            edm_policy=edm_policy,
-            excluded_keys=excluded_keys,
+            extra_payload={"fill": fill_payload} if fill_payload else None,
+            **estimate_args,
         )
         result["time_label"] = seconds_label(result["breakdown"]["total_sec"])
         return jsonify(result)
@@ -4504,6 +4837,48 @@ def api_analyze() -> Response:
     except Exception as exc:
         app.logger.exception("解析に失敗しました: %s", upload.filename)
         return jsonify({"error": f"解析に失敗しました: {exc}"}), 500
+
+
+def prepare_filled_model(path: Path, fill_options: dict[str, Any]) -> tuple[dict[str, Any], Path | None]:
+    """埋めたモデルを作成し、画面表示用のペイロードと解析対象パスを返す。失敗時は元モデルで続行する。"""
+    payload: dict[str, Any] = {"enabled": True, "options": fill_options}
+    try:
+        fill = build_filled_model(path, fill_options, path.with_suffix(""))
+    except InputError as exc:
+        payload["error"] = str(exc)
+        return payload, None
+    except Exception as exc:  # noqa: BLE001 - 埋めに失敗しても通常の見積もりは返す
+        app.logger.exception("モデル埋めに失敗しました: %s", path.name)
+        payload["error"] = f"形状を埋められませんでした（元モデルで算出しています）: {exc}"
+        return payload, None
+    rows = summarize_fill_items(fill["items"])
+    payload.update(
+        {
+            "items": rows,
+            "drill_count": sum(row["count"] for row in rows if row["category"] == "drill"),
+            "wire_count": sum(row["count"] for row in rows if row["category"] == "wire"),
+            "wire_cut_area_mm2": round(sum(row["cut_area_mm2"] for row in rows if row["category"] == "wire"), 1),
+            "added_volume_mm3": round(fill["added_volume_mm3"], 1),
+            "token": path.stem if fill["filled_path"] else None,
+        }
+    )
+    if not rows:
+        payload["message"] = "埋める対象の形状が見つかりませんでした。元モデルのまま算出しています。"
+    return payload, fill["filled_path"]
+
+
+FILL_MODEL_KINDS = {"filled": "__filled.step", "bodies": "__fillbodies.step"}
+
+
+@app.get("/api/fill-models/<token>/<kind>")
+def api_fill_model(token: str, kind: str) -> Any:
+    """埋めたモデル（filled）と埋めた部分（bodies）のSTEPを返す。3D比較表示用。"""
+    if kind not in FILL_MODEL_KINDS or not re.fullmatch(r"[A-Za-z0-9_.-]+", token) or ".." in token:
+        return jsonify({"error": "指定が不正です。"}), 400
+    file_path = UPLOAD_DIR / f"{token}{FILL_MODEL_KINDS[kind]}"
+    if not file_path.is_file():
+        return jsonify({"error": "埋めたモデルが見つかりません（保存期間を過ぎた可能性があります）。"}), 404
+    return send_file(file_path, mimetype="application/step", download_name=f"{kind}.step")
 
 
 @app.get("/api/histories")
@@ -4550,6 +4925,21 @@ def api_history_csv(history_id: int) -> Response:
     writer.writerow(["機械", payload["machine"]["machine_name"]])
     writer.writerow(["見積安全率", payload.get("estimate_mode_label", "-")])
     writer.writerow(["合計時間", seconds_label(payload["breakdown"]["total_sec"])])
+    fill = payload.get("fill") or {}
+    if fill.get("items"):
+        writer.writerow(["元モデルの合計時間", fill.get("original_time_label", "-")])
+        writer.writerow([])
+        writer.writerow(["埋めた形状（MC時間から除外）", "種別", "寸法", "数量", "ワイヤ切断面積mm2"])
+        for row in fill["items"]:
+            writer.writerow(
+                [
+                    "ドリル穴" if row["category"] == "drill" else "ワイヤカット",
+                    row["kind"],
+                    row["dimensions"],
+                    row["count"],
+                    row["cut_area_mm2"] if row["category"] == "wire" else "",
+                ]
+            )
     writer.writerow([])
     writer.writerow(["フィーチャ", "寸法", "数量", "工具", "工程", "切削条件", "工具選定理由", "到達性", "加工パス", "加工時間秒", "備考"])
     for feature in payload["features"]:

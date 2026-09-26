@@ -3,7 +3,7 @@ const state = {
   lastResult: null,
   preview: null,
   previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0, preset: "iso" },
-  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded", toolpathGroup: null, showPaths: true },
+  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded", toolpathGroup: null, showPaths: true, originalGroup: null, filledGroup: null, fillBodiesGroup: null, modelView: "original", fillToken: null },
   excluded: new Set(),
   highlightedKey: null,
 };
@@ -385,6 +385,82 @@ function buildCadMesh(geometryMesh) {
   return { mesh, edges };
 }
 
+function meshGroupFromOcct(result) {
+  const group = new window.THREE.Group();
+  for (const geometryMesh of result.meshes) {
+    const { mesh, edges } = buildCadMesh(geometryMesh);
+    group.add(mesh);
+    group.add(edges);
+  }
+  return group;
+}
+
+function readStepMeshes(buffer) {
+  const result = state.cadPreview.occt.ReadStepFile(new Uint8Array(buffer), {
+    linearUnit: "millimeter",
+    linearDeflectionType: "bounding_box_ratio",
+    linearDeflection: 0.0008,
+    angularDeflection: 0.35,
+  });
+  if (!result.success || !result.meshes?.length) throw new Error("STEP形状をメッシュ化できませんでした。");
+  return result;
+}
+
+// 埋めたモデルと「埋めた部分」を読み込み、元モデルと同じ座標系で重ねる
+async function loadFillModels(token) {
+  const cp = state.cadPreview;
+  $("#modelViewButtons")?.classList.add("hidden");
+  if (cp.filledGroup) cp.group?.remove(cp.filledGroup);
+  if (cp.fillBodiesGroup) cp.group?.remove(cp.fillBodiesGroup);
+  cp.filledGroup = null;
+  cp.fillBodiesGroup = null;
+  cp.fillToken = token || null;
+  if (!token || !cp.group || !cp.occt || cp.mode !== "cad") {
+    setModelView("original");
+    return;
+  }
+  const fetchBuffer = async (kind) => {
+    const response = await fetch(`/api/fill-models/${encodeURIComponent(token)}/${kind}`);
+    if (!response.ok) throw new Error("埋めたモデルを取得できませんでした（保存期間切れの可能性があります）。");
+    return response.arrayBuffer();
+  };
+  const [filledBuffer, bodiesBuffer] = await Promise.all([fetchBuffer("filled"), fetchBuffer("bodies")]);
+  if (cp.fillToken !== token) return; // 読み込み中に別の結果へ切り替わった
+  const THREE = window.THREE;
+  const filledGroup = meshGroupFromOcct(readStepMeshes(filledBuffer));
+  const bodiesGroup = meshGroupFromOcct(readStepMeshes(bodiesBuffer));
+  bodiesGroup.traverse((object) => {
+    object.userData.overlay = true; // 表示モード（ワイヤ/透過）の切替対象外
+    if (object.isMesh) {
+      object.material = new THREE.MeshStandardMaterial({
+        color: 0xf08a24, roughness: 0.5, metalness: 0.05, transparent: true, opacity: 0.88, side: THREE.DoubleSide,
+        // 穴の壁と同一面になるため、手前に描いてちらつきを防ぐ
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+      });
+    }
+    if (object.isLineSegments) object.material = new THREE.LineBasicMaterial({ color: 0x9a4a06, transparent: true, opacity: 0.7 });
+  });
+  cp.group.add(filledGroup);
+  cp.group.add(bodiesGroup);
+  cp.filledGroup = filledGroup;
+  cp.fillBodiesGroup = bodiesGroup;
+  applyCadDisplayMode(cp.displayMode);
+  $("#modelViewButtons")?.classList.remove("hidden");
+  setModelView("compare");
+}
+
+function setModelView(view) {
+  const cp = state.cadPreview;
+  const hasFill = Boolean(cp.filledGroup && cp.fillBodiesGroup);
+  const next = hasFill ? view : "original";
+  cp.modelView = next;
+  if (cp.originalGroup) cp.originalGroup.visible = next !== "filled";
+  if (cp.filledGroup) cp.filledGroup.visible = next === "filled";
+  if (cp.fillBodiesGroup) cp.fillBodiesGroup.visible = next === "compare";
+  $$("[data-model-view]").forEach((button) => button.classList.toggle("active", button.dataset.modelView === next));
+  renderCurrentPreview();
+}
+
 async function loadDetailedCadPreview(buffer) {
   if (!window.occtimportjs) throw new Error("OpenCascade WASMを読み込めませんでした。");
   initCadPreview();
@@ -393,23 +469,12 @@ async function loadDetailedCadPreview(buffer) {
     state.cadPreview.occt = await window.occtimportjs();
   }
 
-  const result = state.cadPreview.occt.ReadStepFile(new Uint8Array(buffer), {
-    linearUnit: "millimeter",
-    linearDeflectionType: "bounding_box_ratio",
-    linearDeflection: 0.0008,
-    angularDeflection: 0.35,
-  });
-  if (!result.success || !result.meshes?.length) {
-    throw new Error("OpenCascadeでSTEP形状をメッシュ化できませんでした。");
-  }
+  const result = readStepMeshes(buffer);
 
   const THREE = window.THREE;
   const group = new THREE.Group();
-  for (const geometryMesh of result.meshes) {
-    const { mesh, edges } = buildCadMesh(geometryMesh);
-    group.add(mesh);
-    group.add(edges);
-  }
+  const originalGroup = meshGroupFromOcct(result);
+  group.add(originalGroup);
 
   const box = new THREE.Box3().setFromObject(group);
   const center = box.getCenter(new THREE.Vector3());
@@ -417,12 +482,56 @@ async function loadDetailedCadPreview(buffer) {
   group.position.sub(center);
 
   state.cadPreview.group = group;
+  state.cadPreview.originalGroup = originalGroup;
+  state.cadPreview.filledGroup = null;
+  state.cadPreview.fillBodiesGroup = null;
+  state.cadPreview.fillToken = null;
+  setModelView("original");
   state.cadPreview.baseRadius = Math.max(size.x, size.y, size.z, 1);
   state.cadPreview.scene.add(group);
   applyCadDisplayMode(state.cadPreview.displayMode);
   setPreviewMode("cad");
   renderCadScene();
   if (state.lastResult) renderToolpaths(state.lastResult);
+}
+
+function renderFillPanel(result) {
+  const panel = $("#fillPanel");
+  if (!panel) return;
+  const fill = result.fill;
+  panel.classList.toggle("hidden", !fill);
+  if (!fill) return;
+  const rows = fill.items || [];
+  const badge = $("#fillBadge");
+  const summary = $("#fillSummary");
+  if (fill.error || !rows.length) {
+    badge.textContent = fill.error ? "埋め不可" : "対象なし";
+    badge.className = "fill-badge warn";
+    summary.innerHTML = `<p class="fill-message">${esc(fill.error || fill.message || "")}</p>`;
+    $("#fillRows").innerHTML = "";
+    return;
+  }
+  badge.className = "fill-badge";
+  badge.textContent = `ドリル穴 ${fill.drill_count}箇所 / ワイヤ形状 ${fill.wire_count}箇所`;
+  const original = Number(fill.original_total_sec) || 0;
+  const current = Number(result.breakdown.total_sec) || 0;
+  const diff = current - original;
+  summary.innerHTML = `
+    <div><span>元モデル</span><strong>${esc(fill.original_time_label || secLabel(original))}</strong></div>
+    <div class="fill-arrow" aria-hidden="true">→</div>
+    <div><span>MCのみ（埋めたモデル）</span><strong>${esc(result.time_label || secLabel(current))}</strong></div>
+    <div><span>差</span><strong class="${diff <= 0 ? "minus" : "plus"}">${diff <= 0 ? "-" : "+"}${secLabel(Math.abs(diff))}</strong></div>
+    <div><span>ワイヤ切断面積 合計</span><strong>${Number(fill.wire_cut_area_mm2 || 0).toLocaleString()} mm²</strong></div>
+  `;
+  $("#fillRows").innerHTML = rows.map((row) => `
+    <tr>
+      <td><span class="fill-kind ${row.category}">${row.category === "drill" ? "ドリル穴" : "ワイヤカット"}</span></td>
+      <td>${esc(row.kind)}</td>
+      <td>${esc(row.dimensions)}</td>
+      <td>${esc(row.count)}</td>
+      <td>${row.category === "wire" ? `${Number(row.cut_area_mm2).toLocaleString()} mm²` : "-"}</td>
+    </tr>
+  `).join("");
 }
 
 function renderCadScene() {
@@ -1277,6 +1386,11 @@ function renderResult(result) {
   `;
 
   renderToolpaths(result);
+  renderFillPanel(result);
+  const fillToken = result.fill?.token || null;
+  if (fillToken !== state.cadPreview.fillToken || !state.cadPreview.filledGroup) {
+    loadFillModels(fillToken).catch((error) => toast(error.message));
+  }
 }
 
 async function reanalyzeWithExclusions() {
@@ -1383,6 +1497,10 @@ function bindEvents() {
 
   $("[data-view-fit]")?.addEventListener("click", fitPreview);
 
+  $$("[data-model-view]").forEach((button) => {
+    button.addEventListener("click", () => setModelView(button.dataset.modelView));
+  });
+
   document.body.addEventListener("click", async (event) => {
     const excludeButton = event.target.closest("[data-exclude-key]");
     const restoreButton = event.target.closest("[data-restore-key]");
@@ -1458,6 +1576,8 @@ function bindEvents() {
       const formData = new FormData(event.currentTarget);
       // チェックボックスは未チェック時に送信されないため、明示的にoffを送る
       if (!formData.has("edm_enabled")) formData.set("edm_enabled", "off");
+      if (!formData.has("fill_drill_holes")) formData.set("fill_drill_holes", "off");
+      if (!formData.has("fill_wire_shapes")) formData.set("fill_wire_shapes", "off");
       formData.set("excluded_features", JSON.stringify(Array.from(state.excluded)));
       const data = await jsonFetch("/api/analyze", { method: "POST", body: formData });
       renderResult(data);

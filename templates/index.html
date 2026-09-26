@@ -69,6 +69,21 @@
                   <option value="conservative">保守的</option>
                 </select>
               </label>
+              <details class="edm-settings fill-settings" open>
+                <summary>MCのみで算出（形状を埋める）</summary>
+                <label class="checkbox-line">
+                  <input type="checkbox" name="fill_drill_holes">
+                  <span>ドリル穴を埋める（穴・横穴・座ぐり・微細穴）</span>
+                </label>
+                <label>ドリル穴とみなす最大径 mm（0で上限なし）
+                  <input type="number" name="fill_drill_max_diameter_mm" value="13" min="0" step="0.5">
+                </label>
+                <label class="checkbox-line">
+                  <input type="checkbox" name="fill_wire_shapes">
+                  <span>ワイヤカット形状を埋める（貫通する抜き窓・異形穴・溝・丸穴）</span>
+                </label>
+                <p class="setting-note">モデル上で形状を埋めてから解析し直します。元モデルの時間と比較表示します。</p>
+              </details>
               <details class="edm-settings" open>
                 <summary>放電置き換え条件</summary>
                 <label class="checkbox-line">
@@ -110,6 +125,11 @@
                     <button type="button" data-view-mode="wire" title="ワイヤ表示">WIRE</button>
                     <button type="button" data-view-mode="transparent" title="透過表示">TRANS</button>
                     <button type="button" data-view-toggle="paths" class="active" title="工具パス表示切替">PATH</button>
+                    <span id="modelViewButtons" class="model-view-buttons hidden" role="group" aria-label="元モデルと埋めたモデルの切替">
+                      <button type="button" data-model-view="original" title="元のモデル">元</button>
+                      <button type="button" data-model-view="filled" title="ドリル穴・ワイヤ形状を埋めたモデル">埋め後</button>
+                      <button type="button" data-model-view="compare" title="元モデルに埋めた部分をオレンジで重ねて表示">比較</button>
+                    </span>
                     <button type="button" data-view-fit title="全体表示">FIT</button>
                   </div>
                   <div id="pathLegend" class="path-legend hidden" aria-label="工具パス凡例">
@@ -151,6 +171,27 @@
               <strong id="confidenceLabel">0%</strong>
             </div>
             <a id="csvLink" class="secondary-link" href="#">CSV出力</a>
+          </section>
+
+          <section class="panel fill-panel hidden" id="fillPanel">
+            <div class="section-head">
+              <h3>MCのみ算出（埋めた形状）</h3>
+              <span id="fillBadge" class="fill-badge">-</span>
+            </div>
+            <div id="fillSummary" class="fill-summary"></div>
+            <p class="edm-note">
+              下の形状をモデル上で埋めてから解析し直し、MC加工時間から除外しています。
+              3Dプレビューの「元／埋め後／比較」で形状を確認できます（比較ではオレンジが埋めた部分）。
+              ワイヤ切断面積は「輪郭周長 × 板厚」で、ワイヤ加工時間の目安計算に使えます。
+            </p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>区分</th><th>種別</th><th>寸法</th><th>数量</th><th>ワイヤ切断面積</th></tr>
+                </thead>
+                <tbody id="fillRows"></tbody>
+              </table>
+            </div>
           </section>
 
           <section class="panel">

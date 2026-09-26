@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -26,6 +27,9 @@ _tmpdir = tempfile.mkdtemp(prefix="stp_tool_harness_")
 os.environ["STP_TOOL_DB_PATH"] = str(Path(_tmpdir) / "harness.sqlite3")
 
 import app as app_module  # noqa: E402
+
+# 形状を埋めて（MCのみで）算出するケースも回すサンプル
+FILL_SAMPLES = ("wire_cut_test_plate.stp", "mixed_feature_test_part.stp")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -107,6 +111,32 @@ def main() -> int:
                     estimate_mode="cautious",
                 )
                 report[key] = summarize(result)
+            except Exception as exc:  # noqa: BLE001
+                report[key] = {"error": str(exc)}
+            print(f"{key}: {report[key].get('time_label', report[key].get('error'))}")
+
+    # ドリル穴・ワイヤ形状を埋めたモデル（MCのみ）の見積もり
+    fill_options = {"drill_holes": True, "wire_shapes": True, "drill_max_diameter_mm": 13.0}
+    for name in FILL_SAMPLES:
+        sample = BASE_DIR / "samples" / name
+        work_copy = Path(_tmpdir) / name  # 埋めたモデルはコピーの隣に書き出される
+        shutil.copyfile(sample, work_copy)
+        for material in ("鉄", "SUS"):
+            key = f"{name}|{material}|埋め(ドリル+ワイヤ)"
+            try:
+                fill_payload, filled_path = app_module.prepare_filled_model(work_copy, fill_options)
+                if filled_path is None:
+                    raise RuntimeError(fill_payload.get("error") or "埋めたモデルを作成できませんでした")
+                result = app_module.estimate(
+                    filled_path, name, material, 5.0, 1,
+                    use_manufacturer_conditions=True, estimate_mode="cautious",
+                )
+                report[key] = summarize(result)
+                report[key]["fill"] = {
+                    "drill_count": fill_payload["drill_count"],
+                    "wire_count": fill_payload["wire_count"],
+                    "wire_cut_area_mm2": fill_payload["wire_cut_area_mm2"],
+                }
             except Exception as exc:  # noqa: BLE001
                 report[key] = {"error": str(exc)}
             print(f"{key}: {report[key].get('time_label', report[key].get('error'))}")

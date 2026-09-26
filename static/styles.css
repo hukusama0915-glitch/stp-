@@ -998,3 +998,79 @@ body.is-analyzing .analysis-grid button.primary {
     grid-template-columns: 1fr;
   }
 }
+
+/* --- MCのみ算出（形状を埋める） --- */
+.setting-note {
+  margin: 4px 0 0;
+  color: var(--sub);
+  font-size: 12px;
+}
+
+.model-view-buttons {
+  display: inline-flex;
+  gap: 0;
+  margin-left: 6px;
+  border-left: 1px solid var(--line);
+  padding-left: 6px;
+}
+
+.fill-panel {
+  border-left: 3px solid #f08a24;
+}
+
+.fill-badge {
+  justify-self: end;
+  padding: 4px 10px;
+  background: #fff1e3;
+  color: #9a4a06;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.fill-badge.warn {
+  background: #fdecea;
+  color: var(--danger);
+}
+
+.fill-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 22px;
+  margin-bottom: 12px;
+}
+
+.fill-summary span {
+  display: block;
+  color: var(--sub);
+  font-size: 12px;
+}
+
+.fill-summary strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.fill-summary .minus { color: var(--green); }
+.fill-summary .plus { color: var(--danger); }
+
+.fill-arrow {
+  color: var(--sub);
+  font-size: 20px;
+}
+
+.fill-message {
+  margin: 0;
+  color: var(--danger);
+}
+
+.fill-kind {
+  display: inline-block;
+  padding: 1px 7px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.fill-kind.drill { background: #e6eef8; color: #1d4f91; }
+.fill-kind.wire { background: #fff1e3; color: #9a4a06; }
