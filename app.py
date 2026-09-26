@@ -26,7 +26,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
-APP_VERSION = "2026-09-26-standard-machines"
+APP_VERSION = "2026-09-26-mc430-spec"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -257,6 +257,11 @@ DEFAULT_TOOLS = [
         ("M6 タップ", "TAP", 6, 3, 25, "アルミ/鉄/SUS", 0, 1, "ねじ穴概算"),
     ]
 
+MC430_MEMO = (
+    "ソディック MC430L（リニア駆動・HSK-E25・ATC16/45本）: 主軸6,000〜40,000min-1・早送り36m/min・最大工具径φ6"
+    "（販売店・工作機械データサイトの掲載値）。工具交換8秒は資料が見つからず仮、段取り30分は社内実績で要確認"
+)
+
 # 社内の標準機（2026-09-26 登録依頼）。仕様は公開情報から取った値で、確認できなかった項目は
 # memo に「仮」と明記している。段取り時間は社内実績で見直すこと。
 STANDARD_MACHINES = [
@@ -273,8 +278,8 @@ STANDARD_MACHINES = [
         "牧野 D500 5軸: 主軸20,000min-1（HSK-A63）・早送りX48/YZ50m/min・工具最大径φ70（隣接空きでφ140）（公開仕様）。工具交換6秒・段取り45分は仮",
     ),
     (
-        "MC430", 3, 30000, 8, 40000, 12, 30,
-        "ソディック MC430L（リニア駆動・HSK-E25・ATC16本）: 主軸40,000min-1（公開仕様）。早送り30m/min・工具交換8秒・最大工具径φ12（HSK-E25の小径機として）・段取り30分は仮",
+        "MC430", 3, 36000, 8, 40000, 6, 30,
+        MC430_MEMO,
     ),
 ]
 
