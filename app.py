@@ -26,7 +26,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
-APP_VERSION = "2026-09-26-mold-nc-wire"
+APP_VERSION = "2026-09-26-viewer-ux"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -262,6 +262,27 @@ DEFAULT_MACHINES = [
     ("高速 5軸MC", 5, 30000, 5, 20000, 20, 45, "5軸案件の概算"),
 ]
 
+# 社内の標準機（2026-09-26 登録依頼）。仕様は公開情報から取った値で、確認できなかった項目は
+# memo に「仮」と明記している。段取り時間は社内実績で見直すこと。
+STANDARD_MACHINES = [
+    (
+        "V33", 3, 20000, 5, 20000, 80, 30,
+        "牧野 V33（V33i相当）: 主軸20,000min-1・早送り20m/min・工具最大径φ80・工具交換4.8秒（公開仕様）。段取り30分は仮",
+    ),
+    (
+        "V77", 3, 20000, 6, 20000, 120, 30,
+        "牧野 V77（#40/HSK-A63）: 主軸20,000min-1・早送り20m/min・工具最大φ120×300（公開仕様）。工具交換6秒・段取り30分は仮",
+    ),
+    (
+        "D500", 5, 48000, 6, 20000, 70, 45,
+        "牧野 D500 5軸: 主軸20,000min-1（HSK-A63）・早送りX48/YZ50m/min・工具最大径φ70（隣接空きでφ140）（公開仕様）。工具交換6秒・段取り45分は仮",
+    ),
+    (
+        "MC430", 3, 30000, 8, 40000, 12, 30,
+        "ソディック MC430L（リニア駆動・HSK-E25・ATC16本）: 主軸40,000min-1（公開仕様）。早送り30m/min・工具交換8秒・最大工具径φ12（HSK-E25の小径機として）・段取り30分は仮",
+    ),
+]
+
 
 def seed_master(conn: sqlite3.Connection) -> None:
     tools = DEFAULT_TOOLS
@@ -352,6 +373,25 @@ def seed_default_conditions_for_tools(conn: sqlite3.Connection, tool_ids: set[in
 def ensure_operational_master(conn: sqlite3.Connection) -> None:
     remove_deprecated_default_tools(conn)
     seed_default_machines(conn)
+    seed_standard_machines(conn)
+
+
+def seed_standard_machines(conn: sqlite3.Connection) -> None:
+    """社内標準機を一度だけ登録する。利用者が後で削除しても復活させない。"""
+    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    flag = "standard_machines_2026_09"
+    if conn.execute("SELECT 1 FROM app_meta WHERE key = ?", (flag,)).fetchone():
+        return
+    existing = {row[0] for row in conn.execute("SELECT machine_name FROM machines").fetchall()}
+    conn.executemany(
+        """
+        INSERT INTO machines
+        (machine_name, axis_count, rapid_feed_mm_min, atc_time_sec, max_spindle_rpm, max_tool_diameter_mm, setup_time_min, memo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [row for row in STANDARD_MACHINES if row[0] not in existing],
+    )
+    conn.execute("INSERT INTO app_meta (key, value) VALUES (?, ?)", (flag, datetime.now().isoformat(timespec="seconds")))
 
 
 def remove_deprecated_default_tools(conn: sqlite3.Connection) -> None:
@@ -1584,13 +1624,66 @@ def _wire_shape_label(wire: Any) -> tuple[str, float, float]:
     return "抜き窓・異形穴", width, length
 
 
+class _VerticalRay:
+    """部品を鉛直線で貫き、開口の周囲で材料がどこまで続くかを調べる。"""
+
+    SAMPLES = 24
+    RING_OFFSET_MM = 0.3
+
+    def __init__(self, shape: Any) -> None:
+        from OCP.IntCurvesFace import IntCurvesFace_ShapeIntersector  # type: ignore
+
+        self._intersector = IntCurvesFace_ShapeIntersector()
+        self._intersector.Load(shape.wrapped, 1e-4)
+        bounds = shape.BoundingBox()
+        self._span = float(bounds.zlen) + 2.0
+
+    def _ring(self, wire: Any) -> Any | None:
+        # 内側輪郭の向きで offset2D の符号が変わるため、外側に広がった方を使う
+        rings = []
+        for distance in (self.RING_OFFSET_MM, -self.RING_OFFSET_MM):
+            try:
+                rings.extend(wire.offset2D(distance, "intersection"))
+            except Exception:  # noqa: BLE001 - オフセットできない輪郭は外周を使う
+                continue
+        if not rings:
+            return None
+        return max(rings, key=lambda ring: float(ring.BoundingBox().xlen) + float(ring.BoundingBox().ylen))
+
+    def material_ends(self, wire: Any, face_z: float, direction: float) -> list[float]:
+        """開口のすぐ外側の各点で、面から direction 方向に続く材料の端のZを返す。"""
+        from OCP.gp import gp_Dir, gp_Lin, gp_Pnt  # type: ignore
+
+        ring = self._ring(wire)
+        if ring is None:
+            return []
+        ends: list[float] = []
+        for index in range(self.SAMPLES):
+            point = ring.positionAt(index / self.SAMPLES)
+            start = face_z - direction * 0.05
+            self._intersector.Perform(
+                gp_Lin(gp_Pnt(point.x, point.y, start), gp_Dir(0, 0, direction)), 0.0, self._span
+            )
+            hits = sorted(
+                (self._intersector.Pnt(k).Z() for k in range(1, self._intersector.NbPnt() + 1)),
+                key=lambda z: (z - start) * direction,
+            )
+            # 最初の交点が面そのもの（＝この点は材料の上）で、その次が材料の反対側の端
+            if len(hits) >= 2 and abs(hits[0] - face_z) < 0.1:
+                beyond = [z for z in hits[1:] if (z - face_z) * direction > 0.05]
+                if beyond:
+                    ends.append(float(beyond[0]))
+        return ends
+
+
 def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) -> dict[str, Any]:
     """指定カテゴリの形状を埋めたモデルをSTEPで書き出し、埋めた内容を返す。
 
     - ドリル穴: 空洞側の全周円筒（穴・横穴・座ぐり・微細穴）を同径の円柱で埋める。
       同軸の円錐面（皿もみ・ドリル先端）も一緒に埋める。
-    - ワイヤカット形状: 上向き平面の内側輪郭を最下面まで押し出し、材料と重ならない
-      （＝板厚方向に貫通する）ものを柱で埋める。抜き窓・異形穴・溝・丸穴が対象。
+    - ワイヤカット形状: 水平な平面の内側輪郭を板厚方向（上向き面は下、下向き面は上）へ
+      押し出し、材料と重ならない（＝貫通する）ものを柱で埋める。抜き窓・異形穴・溝・丸穴が対象。
+      柱の長さは開口まわりの材料の厚みまでにして、上面が曲面の金型でも外へはみ出させない。
     返り値の filled_path / bodies_path は埋め後モデルと、埋めた部分だけのモデル。
     """
     import cadquery as cq  # type: ignore
@@ -1717,26 +1810,70 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
             )
 
     if options.get("wire_shapes"):
+        zmax = float(bounds.zmax)
+        ray = _VerticalRay(shape)
+        wire_boxes: list[tuple[float, float, float, float]] = []
         for face in shape.Faces():
-            if face.geomType() != "PLANE" or face.normalAt().z < 0.99:
+            if face.geomType() != "PLANE" or abs(face.normalAt().z) < 0.99:
                 continue
+            # 上向き面は下へ、下向き面（底面側から開いた開口）は上へ押し出して貫通を調べる。
+            # 金型のように上面が曲面の部品は、開口が底面側の平面にしか輪郭を持たない。
+            direction = -1.0 if face.normalAt().z > 0 else 1.0
             face_z = float(face.Center().z)
-            height = face_z - zmin
-            if height < 0.05:
+            limit_z = zmin if direction < 0 else zmax
+            if abs(limit_z - face_z) < 0.05:
                 continue
             for wire in face.innerWires():
-                prism = cq.Solid.extrudeLinear(cq.Face.makeFromWires(wire), cq.Vector(0, 0, -height))
-                prism_volume = abs(float(prism.Volume()))
-                if prism_volume <= 0:
+                wire_bounds = wire.BoundingBox()
+                box = (float(wire_bounds.center.x), float(wire_bounds.center.y), float(wire_bounds.xlen), float(wire_bounds.ylen))
+                if any(all(abs(a - b) < 0.1 for a, b in zip(box, other)) for other in wire_boxes):
+                    continue  # 上下両面から見つかった同じ開口
+                full = cq.Solid.extrudeLinear(cq.Face.makeFromWires(wire), cq.Vector(0, 0, limit_z - face_z))
+                full_volume = abs(float(full.Volume()))
+                if full_volume <= 0:
                     continue
-                if float(prism.intersect(shape).Volume()) >= prism_volume * FILL_THROUGH_TOLERANCE:
+                if float(full.intersect(shape).Volume()) >= full_volume * FILL_THROUGH_TOLERANCE:
                     continue  # 途中で材料に当たる＝貫通していない（止まりポケット等）
+                # 開口まわりの材料の厚みを調べ、埋める柱が部品の外へはみ出さない長さにする
+                ends = ray.material_ends(wire, face_z, direction)
+                if ends:
+                    plug_end = max(ends) if direction < 0 else min(ends)
+                    thickness = max(abs(end - face_z) for end in ends)
+                else:
+                    plug_end = limit_z
+                    thickness = abs(limit_z - face_z)
+                if abs(plug_end - face_z) < 0.05:
+                    continue
+                prism = cq.Solid.extrudeLinear(cq.Face.makeFromWires(wire), cq.Vector(0, 0, plug_end - face_z))
+                prism_volume = abs(float(prism.Volume()))
+                height = thickness
                 kind, width, length = _wire_shape_label(wire)
                 center = prism.Center()
                 if kind == "丸穴" and any(
                     _same_axis_line(o, a, cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)) for o, a in filled_axes
                 ):
                     continue  # ドリル穴として埋め済み
+                max_drill = float(options.get("drill_max_diameter_mm") or 0.0)
+                if kind == "丸穴" and (max_drill <= 0 or width <= max_drill + 1e-6):
+                    # 円筒面が横穴などで欠けて穴として拾えなかった小径の貫通丸穴はドリル穴として扱う
+                    if not options.get("drill_holes"):
+                        continue
+                    wire_boxes.append(box)
+                    tools.append(prism)
+                    filled_axes.append((cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)))
+                    items.append(
+                        {
+                            "category": "drill",
+                            "kind": "微細穴" if width < 3.0 else "穴",
+                            "diameter_mm": round(width, 3),
+                            "depth_mm": round(height, 2),
+                            "axis": "Z",
+                            "volume_mm3": prism_volume,
+                            "center": [round(v, 2) for v in center.toTuple()],
+                        }
+                    )
+                    continue
+                wire_boxes.append(box)
                 perimeter = sum(float(edge.Length()) for edge in wire.Edges())
                 tools.append(prism)
                 items.append(

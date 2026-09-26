@@ -23,168 +23,199 @@
         <button class="tab" data-tab="history">履歴</button>
       </nav>
       <div class="scope-note">
-        CadQuery（OpenCascade）のB-Rep解析で穴・溝・ポケット・微細形状を認識し、
-        メーカー公式の切削条件から工具を自動選定して加工時間を概算します。
+        STPの形状（穴・溝・ポケット・微細形状）を認識し、メーカー公式の切削条件から工具を自動選定して加工時間を概算します。
         結果は見積もりの目安で、実際のCAMパスとは異なります。
       </div>
     </aside>
 
     <main class="workspace">
       <section id="tab-analyze" class="view active">
-        <div class="view-header">
-          <div>
-            <p class="eyebrow">解析画面</p>
-            <h2>STPファイルから加工時間を概算</h2>
-          </div>
-          <div id="totalBadge" class="total-badge muted">未解析</div>
-        </div>
+        <form id="analyzeForm" class="analyze-layout" novalidate>
+          <input id="stpFileInput" class="visually-hidden" type="file" name="stp_file" accept=".stp,.step" tabindex="-1" aria-hidden="true">
 
-        <form id="analyzeForm" class="analysis-grid">
-          <label class="drop-zone">
-            <input type="file" name="stp_file" accept=".stp,.step" required>
-            <span class="drop-icon">↓</span>
-            <strong>STP / STEP ファイル</strong>
-            <small id="fileName">ファイルを選択</small>
-          </label>
+          <section id="previewPanel" class="viewer-card" aria-label="STPプレビュー（ここにファイルをドロップ）">
+            <header class="viewer-head">
+              <div class="file-chip">
+                <span id="previewBadge" class="preview-badge">待機中</span>
+                <div class="file-chip-text">
+                  <strong id="fileName">STPファイル未選択</strong>
+                  <small id="previewStatus">この枠にSTP / STEPファイルをドロップしてください</small>
+                </div>
+              </div>
+              <button type="button" class="secondary-button compact" data-pick-file>ファイルを選択</button>
+            </header>
 
-          <div class="upload-side">
-            <div class="settings-panel">
-              <label>材質
-                <select name="material_type">
-                  <option>鉄</option>
-                  <option>アルミ</option>
-                  <option>SUS</option>
-                </select>
-              </label>
-              <label>ブランク代 mm
-                <input type="number" name="blank_allowance_mm" value="5" min="0" step="0.1">
-              </label>
-              <label>使用機械
-                <select id="machineSelect" name="machine_id"></select>
-              </label>
-              <label>見積もり安全率
-                <select name="estimate_mode">
-                  <option value="cautious" selected>慎重</option>
-                  <option value="standard">標準</option>
-                  <option value="conservative">保守的</option>
-                </select>
-              </label>
-              <label>形状タイプ
-                <select name="shape_mode">
-                  <option value="prismatic" selected>角物（平面・ポケット・穴）</option>
-                  <option value="mold">金型（表面形状・残り取り）</option>
-                </select>
-              </label>
-              <label>金型の仕上げ回数（中仕上げ除く）
-                <input type="number" name="mold_finish_passes" value="2" min="1" max="5" step="1">
-              </label>
-              <details class="edm-settings fill-settings" open>
-                <summary>MCのみで算出（形状を埋める）</summary>
-                <label class="checkbox-line">
-                  <input type="checkbox" name="fill_drill_holes">
-                  <span>ドリル穴を埋める（穴・横穴・座ぐり・微細穴）</span>
-                </label>
-                <label>ドリル穴とみなす最大径 mm（0で上限なし）
-                  <input type="number" name="fill_drill_max_diameter_mm" value="13" min="0" step="0.5">
-                </label>
-                <label class="checkbox-line">
-                  <input type="checkbox" name="fill_wire_shapes">
-                  <span>ワイヤカット形状を埋める（貫通する抜き窓・異形穴・溝・丸穴）</span>
-                </label>
-                <p class="setting-note">モデル上で形状を埋めてから解析し直します。元モデルの時間と比較表示します。</p>
-                <label>NC穴加工に使う機械（埋めたドリル穴）
-                  <select id="ncMachineSelect" name="nc_machine_id" data-persist="nc_machine_id"></select>
-                </label>
-                <fieldset class="wire-params">
-                  <legend>ワイヤカット条件（お使いの機械の値を入力）</legend>
-                  <label>荒加工速度 mm²/分
-                    <input type="number" name="wire_rough_speed_mm2_min" min="0" step="1" placeholder="未入力" data-persist="wire_rough_speed_mm2_min">
-                  </label>
-                  <label>仕上げ回数
-                    <input type="number" name="wire_skim_count" min="0" max="10" step="1" value="0" data-persist="wire_skim_count">
-                  </label>
-                  <label>仕上げ送り mm/分
-                    <input type="number" name="wire_skim_speed_mm_min" min="0" step="0.1" placeholder="未入力" data-persist="wire_skim_speed_mm_min">
-                  </label>
-                  <label>結線時間 秒/形状
-                    <input type="number" name="wire_thread_sec" min="0" step="1" value="0" data-persist="wire_thread_sec">
-                  </label>
-                  <label>段取り 分
-                    <input type="number" name="wire_setup_min" min="0" step="1" value="0" data-persist="wire_setup_min">
-                  </label>
-                  <p class="setting-note">メーカーの板厚別標準条件は公開されていないため、取扱説明書の条件表や社内実績の値を入れてください。入力値はこのブラウザに保存されます。</p>
-                </fieldset>
-              </details>
-              <details class="edm-settings" open>
-                <summary>放電置き換え条件</summary>
-                <label class="checkbox-line">
-                  <input type="checkbox" name="edm_enabled" checked>
-                  <span>切削しない条件を判定して放電加工へ置き換える</span>
-                </label>
-                <label>幅 mm 以下で
-                  <input type="number" name="edm_max_width_mm" value="3" min="0" step="0.1">
-                </label>
-                <label>深さ mm 以上なら放電
-                  <input type="number" name="edm_min_depth_mm" value="10" min="0" step="0.5">
-                </label>
-                <label>深さ/幅比 以上でも放電
-                  <input type="number" name="edm_min_aspect" value="6" min="0" step="0.5">
-                </label>
-                <label>テーパ角 ° 以上でも放電（0で無効）
-                  <input type="number" name="edm_min_taper_deg" value="2" min="0" step="0.5">
-                </label>
-              </details>
-              <button class="primary" type="submit">解析実行</button>
+            <div class="viewer-stack is-empty" id="viewerStack">
+              <div class="viewer-toolbar" aria-label="3D表示操作">
+                <div class="tool-group" role="group" aria-label="視点">
+                  <button type="button" data-view-preset="iso" title="等角表示">等角</button>
+                  <button type="button" data-view-preset="top" title="上から見る">上</button>
+                  <button type="button" data-view-preset="bottom" title="下から見る">下</button>
+                  <button type="button" data-view-preset="front" title="正面（-Y側）から見る">前</button>
+                  <button type="button" data-view-preset="back" title="背面（+Y側）から見る">後</button>
+                  <button type="button" data-view-preset="left" title="左（-X側）から見る">左</button>
+                  <button type="button" data-view-preset="right" title="右（+X側）から見る">右</button>
+                </div>
+                <div class="tool-group" role="group" aria-label="表示方法">
+                  <button type="button" data-view-mode="shaded" title="シェーディング表示">面</button>
+                  <button type="button" data-view-mode="wire" title="ワイヤフレーム表示">線</button>
+                  <button type="button" data-view-mode="transparent" title="透過表示（内部の工具パスが見やすい）">透過</button>
+                </div>
+                <div class="tool-group" role="group" aria-label="重ね表示">
+                  <button type="button" data-view-toggle="paths" class="active" title="工具パスの表示切替">工具パス</button>
+                </div>
+                <div id="modelViewButtons" class="tool-group hidden" role="group" aria-label="元モデルと埋めたモデルの切替">
+                  <button type="button" data-model-view="original" title="元のモデル">元</button>
+                  <button type="button" data-model-view="filled" title="ドリル穴・ワイヤ形状を埋めたモデル">埋め後</button>
+                  <button type="button" data-model-view="compare" title="元モデルに埋めた部分をオレンジで重ねて表示">比較</button>
+                </div>
+                <div class="tool-group" role="group" aria-label="全体表示">
+                  <button type="button" data-view-fit title="全体を画面に収める（ダブルクリックでも可）">全体表示</button>
+                </div>
+              </div>
+
+              <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
+              <canvas id="cadPreviewCanvas" width="720" height="360" aria-label="STP詳細3Dプレビュー" class="hidden"></canvas>
+              <canvas id="axisTriad" class="axis-triad hidden" width="96" height="96" aria-hidden="true"></canvas>
+
+              <div id="viewerEmpty" class="viewer-empty">
+                <div class="viewer-empty-inner">
+                  <span class="drop-icon" aria-hidden="true">↓</span>
+                  <strong>STP / STEP ファイルをここにドロップ</strong>
+                  <span>3Dで形状を確認してから「解析実行」で加工時間を算出します</span>
+                  <button type="button" class="primary" data-pick-file>ファイルを選択</button>
+                </div>
+              </div>
+              <div id="viewerDropHint" class="viewer-drop-hint hidden"><strong>ドロップして読み込む</strong></div>
+              <div id="viewerLoading" class="viewer-loading hidden"><span class="spinner" aria-hidden="true"></span><span id="viewerLoadingText">3D形状を読み込んでいます…</span></div>
+
+              <p class="viewer-hint hidden" id="viewerHint">左ドラッグ: 回転 ／ 右ドラッグ・Shift+ドラッグ: 移動 ／ ホイール: カーソル位置へ拡大縮小 ／ ダブルクリック: 全体表示</p>
             </div>
 
-            <section id="previewPanel" class="preview-panel">
-              <div class="preview-head">
-                <div>
-                  <h3>STPプレビュー</h3>
-                  <p id="previewStatus">ファイルをドロップすると概要を表示します</p>
-                </div>
-                <span id="previewBadge" class="preview-badge">待機中</span>
+            <div id="pathLegend" class="path-legend hidden" aria-label="工具パス凡例">
+              <span><i style="background:#2563eb"></i>穴・座ぐり</span>
+              <span><i style="background:#0e7490"></i>微細穴</span>
+              <span><i style="background:#d97706"></i>溝</span>
+              <span><i style="background:#7c3aed"></i>隅R</span>
+              <span><i style="background:#0d9488"></i>面走査</span>
+              <span><i style="background:#15803d"></i>輪郭</span>
+              <span><i style="background:#dc2626"></i>放電候補</span>
+              <span><i style="background:#9ca3af"></i>除外</span>
+              <span><i style="background:#f08a24"></i>埋めた形状</span>
+            </div>
+          </section>
+
+          <aside class="settings-card" aria-label="解析設定">
+            <div class="settings-scroll">
+              <div class="settings-head">
+                <h3>解析設定</h3>
               </div>
-              <div class="preview-body">
-                <div class="viewer-stack">
-                  <div class="viewer-toolbar" aria-label="3D表示操作">
-                    <button type="button" data-view-preset="iso" title="等角表示">ISO</button>
-                    <button type="button" data-view-preset="top" title="上面">TOP</button>
-                    <button type="button" data-view-preset="front" title="正面">FRONT</button>
-                    <button type="button" data-view-preset="right" title="右側面">RIGHT</button>
-                    <button type="button" data-view-mode="shaded" title="シェーディング">SHADE</button>
-                    <button type="button" data-view-mode="wire" title="ワイヤ表示">WIRE</button>
-                    <button type="button" data-view-mode="transparent" title="透過表示">TRANS</button>
-                    <button type="button" data-view-toggle="paths" class="active" title="工具パス表示切替">PATH</button>
-                    <span id="modelViewButtons" class="model-view-buttons hidden" role="group" aria-label="元モデルと埋めたモデルの切替">
-                      <button type="button" data-model-view="original" title="元のモデル">元</button>
-                      <button type="button" data-model-view="filled" title="ドリル穴・ワイヤ形状を埋めたモデル">埋め後</button>
-                      <button type="button" data-model-view="compare" title="元モデルに埋めた部分をオレンジで重ねて表示">比較</button>
-                    </span>
-                    <button type="button" data-view-fit title="全体表示">FIT</button>
-                  </div>
-                  <div id="pathLegend" class="path-legend hidden" aria-label="工具パス凡例">
-                    <span><i style="background:#2563eb"></i>穴・座ぐり</span>
-                    <span><i style="background:#0e7490"></i>微細穴</span>
-                    <span><i style="background:#d97706"></i>溝</span>
-                    <span><i style="background:#7c3aed"></i>隅R</span>
-                    <span><i style="background:#0d9488"></i>面走査</span>
-                    <span><i style="background:#15803d"></i>輪郭</span>
-                    <span><i style="background:#dc2626"></i>放電候補</span>
-                    <span><i style="background:#9ca3af"></i>除外</span>
-                  </div>
-                  <canvas id="stpPreviewCanvas" width="720" height="360" aria-label="STP簡易プレビュー"></canvas>
-                  <canvas id="cadPreviewCanvas" width="720" height="360" aria-label="STP詳細3Dプレビュー" class="hidden"></canvas>
-                  <div id="viewCube" class="view-cube" aria-label="視点切替キューブ">
-                    <span data-view-preset="top" title="上面から見る">TOP</span>
-                    <strong data-view-preset="iso" title="等角表示に戻す">ISO</strong>
-                    <em data-view-preset="front" title="正面から見る">FRONT</em>
-                  </div>
-                </div>
-                <dl id="previewStats" class="preview-stats"></dl>
+              <div class="settings-grid">
+                <label>材質
+                  <select name="material_type" data-persist="material_type">
+                    <option>鉄</option>
+                    <option>アルミ</option>
+                    <option>SUS</option>
+                  </select>
+                </label>
+                <label>ブランク代 mm
+                  <input type="number" name="blank_allowance_mm" value="5" min="0" max="100" step="any" inputmode="decimal" data-persist="blank_allowance_mm">
+                </label>
+                <label class="span-2">使用機械
+                  <select id="machineSelect" name="machine_id" data-persist="machine_id"></select>
+                </label>
+                <label>見積もり安全率
+                  <select name="estimate_mode" data-persist="estimate_mode">
+                    <option value="cautious" selected>慎重</option>
+                    <option value="standard">標準</option>
+                    <option value="conservative">保守的</option>
+                  </select>
+                </label>
+                <label>形状タイプ
+                  <select name="shape_mode" data-persist="shape_mode">
+                    <option value="prismatic" selected>角物</option>
+                    <option value="mold">金型（自由曲面）</option>
+                  </select>
+                </label>
+                <label class="span-2" data-show-when-mold>金型の仕上げ回数（中仕上げを除く）
+                  <input type="number" name="mold_finish_passes" value="2" min="1" max="5" step="1" inputmode="numeric" data-persist="mold_finish_passes">
+                </label>
               </div>
-            </section>
-          </div>
+
+              <details class="setting-group" id="fillSettings">
+                <summary><span title="ドリル穴・ワイヤ形状を埋めてMCのみの時間を算出">形状を埋めてMCのみで算出</span><em id="fillSummaryChip" class="chip off">オフ</em></summary>
+                <label class="checkbox-line">
+                  <input type="checkbox" name="fill_drill_holes" data-persist="fill_drill_holes">
+                  <span>ドリル穴を埋める<small>穴・横穴・座ぐり・微細穴</small></span>
+                </label>
+                <div class="sub-fields" data-enabled-by="fill_drill_holes">
+                  <label>ドリル穴とみなす最大径 mm（0で上限なし）
+                    <input type="number" name="fill_drill_max_diameter_mm" value="13" min="0" max="200" step="any" inputmode="decimal" data-persist="fill_drill_max_diameter_mm">
+                  </label>
+                  <label>NC穴加工に使う機械
+                    <select id="ncMachineSelect" name="nc_machine_id" data-persist="nc_machine_id"></select>
+                  </label>
+                </div>
+                <label class="checkbox-line">
+                  <input type="checkbox" name="fill_wire_shapes" data-persist="fill_wire_shapes">
+                  <span>ワイヤカット形状を埋める<small>貫通する抜き窓・異形穴・溝・丸穴（底面側から開いた形状も対象）</small></span>
+                </label>
+                <fieldset class="wire-params sub-fields" data-enabled-by="fill_wire_shapes">
+                  <legend>ワイヤカット条件（お使いの機械の値）</legend>
+                  <label>荒加工速度 mm²/分
+                    <input type="number" name="wire_rough_speed_mm2_min" min="0" step="any" inputmode="decimal" placeholder="未入力" data-persist="wire_rough_speed_mm2_min">
+                  </label>
+                  <label>仕上げ回数
+                    <input type="number" name="wire_skim_count" min="0" max="10" step="1" value="0" inputmode="numeric" data-persist="wire_skim_count">
+                  </label>
+                  <label>仕上げ送り mm/分
+                    <input type="number" name="wire_skim_speed_mm_min" min="0" step="any" inputmode="decimal" placeholder="未入力" data-persist="wire_skim_speed_mm_min">
+                  </label>
+                  <label>結線時間 秒/形状
+                    <input type="number" name="wire_thread_sec" min="0" step="any" value="0" inputmode="decimal" data-persist="wire_thread_sec">
+                  </label>
+                  <label>段取り 分
+                    <input type="number" name="wire_setup_min" min="0" step="any" value="0" inputmode="decimal" data-persist="wire_setup_min">
+                  </label>
+                  <p class="setting-note">メーカーの板厚別標準条件は公開されていないため、取扱説明書の条件表や社内実績の値を入れてください。</p>
+                </fieldset>
+                <p class="setting-note">モデル上で形状を埋めてから解析し直し、元モデルの時間と比較します。</p>
+              </details>
+
+              <details class="setting-group" id="edmSettings">
+                <summary><span>放電置き換え条件</span><em id="edmSummaryChip" class="chip">オン</em></summary>
+                <label class="checkbox-line">
+                  <input type="checkbox" name="edm_enabled" checked data-persist="edm_enabled">
+                  <span>切削しない形状を判定して放電加工へ置き換える</span>
+                </label>
+                <div class="sub-fields edm-fields" data-enabled-by="edm_enabled">
+                  <label>幅 mm 以下で
+                    <input type="number" name="edm_max_width_mm" value="3" min="0" max="1000" step="any" inputmode="decimal" data-persist="edm_max_width_mm">
+                  </label>
+                  <label>深さ mm 以上なら放電
+                    <input type="number" name="edm_min_depth_mm" value="10" min="0" max="1000" step="any" inputmode="decimal" data-persist="edm_min_depth_mm">
+                  </label>
+                  <label>深さ/幅比 以上でも放電
+                    <input type="number" name="edm_min_aspect" value="6" min="0" max="1000" step="any" inputmode="decimal" data-persist="edm_min_aspect">
+                  </label>
+                  <label>テーパ角 ° 以上でも放電（0で無効）
+                    <input type="number" name="edm_min_taper_deg" value="2" min="0" max="89" step="any" inputmode="decimal" data-persist="edm_min_taper_deg">
+                  </label>
+                  <button type="button" class="link-btn reset-edm" data-reset-edm>初期値に戻す</button>
+                </div>
+              </details>
+            </div>
+
+            <div class="settings-footer">
+              <div class="footer-result">
+                <span>合計（見積もり）</span>
+                <strong id="totalBadge" class="total-badge muted">未解析</strong>
+              </div>
+              <p id="staleNote" class="stale-note hidden">設定が変わりました。再解析すると反映されます。</p>
+              <button id="analyzeButton" class="primary analyze-button" type="submit" disabled>ファイルを選択してください</button>
+              <a id="jumpToResult" class="jump-link hidden" href="#resultPanel">結果の内訳を見る ↓</a>
+            </div>
+          </aside>
         </form>
 
         <div id="resultPanel" class="result-grid hidden">
@@ -196,12 +227,14 @@
               <div><span>工具交換</span><strong id="toolChangeSec">0</strong></div>
               <div><span>早送り</span><strong id="rapidSec">0</strong></div>
             </div>
-            <div class="confidence">
-              <span>信頼度</span>
-              <meter id="confidenceMeter" min="0" max="1" value="0"></meter>
-              <strong id="confidenceLabel">0%</strong>
+            <div class="metrics-side">
+              <div class="confidence" title="形状認識と条件の確からしさの目安">
+                <span>信頼度</span>
+                <meter id="confidenceMeter" min="0" max="1" value="0"></meter>
+                <strong id="confidenceLabel">0%</strong>
+              </div>
+              <a id="csvLink" class="secondary-link" href="#">CSV出力</a>
             </div>
-            <a id="csvLink" class="secondary-link" href="#">CSV出力</a>
           </section>
 
           <section class="panel fill-panel hidden" id="fillPanel">
@@ -396,20 +429,28 @@
       </section>
 
       <section id="tab-machines" class="view">
-        <div class="view-header"><h2>機械マスタ管理</h2></div>
-        <form id="machineForm" class="inline-form">
+        <div class="view-header">
+          <div>
+            <p class="eyebrow">見積もりに使う機械の仕様</p>
+            <h2>機械マスタ</h2>
+          </div>
+        </div>
+        <form id="machineForm" class="panel machine-form">
           <input name="machine_id" type="hidden">
-          <input name="machine_name" placeholder="機械名" required>
-          <input name="axis_count" type="number" placeholder="軸数" value="3" required>
-          <input name="rapid_feed_mm_min" type="number" placeholder="早送り" required>
-          <input name="atc_time_sec" type="number" placeholder="ATC秒" required>
-          <input name="max_spindle_rpm" type="number" placeholder="最大rpm" required>
-          <input name="max_tool_diameter_mm" type="number" placeholder="最大工具径mm" min="0" step="0.1">
-          <input name="setup_time_min" type="number" placeholder="段取り分" required>
-          <button id="machineSubmitButton" type="submit" class="primary compact">追加</button>
-          <button id="machineResetButton" type="button" class="secondary-button compact hidden">新規入力</button>
+          <label>機械名<input name="machine_name" placeholder="例: V33" required></label>
+          <label>軸数<input name="axis_count" type="number" value="3" min="3" max="9" step="1" required></label>
+          <label>早送り mm/分<input name="rapid_feed_mm_min" type="number" min="1" step="any" required></label>
+          <label>工具交換 秒<input name="atc_time_sec" type="number" min="0" step="1" required></label>
+          <label>最大回転数 min⁻¹<input name="max_spindle_rpm" type="number" min="1" step="1" required></label>
+          <label>最大工具径 mm<input name="max_tool_diameter_mm" type="number" placeholder="空欄で制限なし" min="0" step="any"></label>
+          <label>段取り 分<input name="setup_time_min" type="number" min="0" step="1" required></label>
+          <label class="memo-field">メモ（仕様の出典・仮値の注記など）<input name="memo" maxlength="500"></label>
+          <div class="machine-form-actions">
+            <button id="machineSubmitButton" type="submit" class="primary compact">追加</button>
+            <button id="machineResetButton" type="button" class="secondary-button compact hidden">新規入力に戻す</button>
+          </div>
         </form>
-        <div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>機械</th><th>軸</th><th>早送り</th><th>ATC</th><th>最大rpm</th><th>最大工具径</th><th>段取り</th><th></th></tr></thead><tbody id="machineRows"></tbody></table></div></div>
+        <div class="panel"><div class="table-wrap"><table><thead><tr><th>ID</th><th>機械</th><th>軸</th><th>早送り</th><th>工具交換</th><th>最大回転数</th><th>最大工具径</th><th>段取り</th><th>メモ</th><th></th></tr></thead><tbody id="machineRows"></tbody></table></div></div>
       </section>
 
       <section id="tab-history" class="view">

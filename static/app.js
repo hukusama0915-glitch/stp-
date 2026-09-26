@@ -3,7 +3,15 @@ const state = {
   lastResult: null,
   preview: null,
   previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0, preset: "iso" },
-  cadPreview: { mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null, displayMode: "shaded", toolpathGroup: null, showPaths: true, originalGroup: null, filledGroup: null, fillBodiesGroup: null, modelView: "original", fillToken: null },
+  cadPreview: {
+    mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null,
+    displayMode: "shaded", toolpathGroup: null, showPaths: true, originalGroup: null, filledGroup: null,
+    fillBodiesGroup: null, modelView: "original", fillToken: null, box: null, renderQueued: false,
+    // 注視点・方位角・仰角・平行投影の半高さ（mm）。視点はカメラ側を動かし、モデルは動かさない
+    cam: { target: null, azimuth: -Math.PI / 4, elevation: Math.atan(1 / Math.SQRT2), halfHeight: 100, radius: 100, preset: "iso" },
+  },
+  lastSignature: null,
+  previewLoadId: 0,
   excluded: new Set(),
   highlightedKey: null,
 };
@@ -36,9 +44,17 @@ function writePersisted(key, value) {
 }
 
 function restorePersistedInputs() {
-  $$("input[data-persist]").forEach((input) => {
+  $$("[data-persist]").forEach((input) => {
     const saved = readPersisted(input.dataset.persist);
-    if (saved !== null) input.value = saved;
+    if (saved === null) return;
+    if (input.type === "checkbox") {
+      input.checked = saved === "1";
+    } else if (input.tagName === "SELECT") {
+      // 機械の選択肢はマスタ読込後に復元する
+      if (Array.from(input.options).some((option) => option.value === saved)) input.value = saved;
+    } else {
+      input.value = saved;
+    }
   });
 }
 
@@ -133,9 +149,11 @@ function fillMachineForm(machine) {
   form.elements.max_spindle_rpm.value = machine.max_spindle_rpm ?? "";
   form.elements.max_tool_diameter_mm.value = machine.max_tool_diameter_mm ?? "";
   form.elements.setup_time_min.value = machine.setup_time_min ?? "";
-  $("#machineSubmitButton").textContent = "更新";
+  form.elements.memo.value = machine.memo ?? "";
+  $("#machineSubmitButton").textContent = `「${machine.machine_name}」を更新`;
   $("#machineResetButton")?.classList.remove("hidden");
   form.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  form.elements.machine_name.focus();
 }
 
 function numberLabel(value, digits = 1) {
@@ -258,6 +276,389 @@ function project3d(point, model, scale, origin) {
   };
 }
 
+// 3Dビューの視点（方位角・仰角, ラジアン）。Z軸を上にしたターンテーブル操作
+const VIEW_PRESETS = {
+  iso: { azimuth: -Math.PI / 4, elevation: Math.atan(1 / Math.SQRT2) },
+  top: { azimuth: -Math.PI / 2, elevation: Math.PI / 2 - 1e-4 },
+  bottom: { azimuth: -Math.PI / 2, elevation: -Math.PI / 2 + 1e-4 },
+  front: { azimuth: -Math.PI / 2, elevation: 0 },
+  back: { azimuth: Math.PI / 2, elevation: 0 },
+  left: { azimuth: Math.PI, elevation: 0 },
+  right: { azimuth: 0, elevation: 0 },
+};
+// 簡易プレビュー（2D描画）用の回転角
+const FALLBACK_PRESETS = {
+  iso: { yaw: -0.72, pitch: -0.58 },
+  top: { yaw: 0, pitch: -1.5 },
+  bottom: { yaw: 0, pitch: 1.35 },
+  front: { yaw: 0, pitch: 0 },
+  back: { yaw: Math.PI, pitch: 0 },
+  left: { yaw: Math.PI / 2, pitch: 0 },
+  right: { yaw: -Math.PI / 2, pitch: 0 },
+};
+const MAX_ELEVATION = Math.PI / 2 - 1e-4;
+const ROTATE_SPEED = 0.0085;
+
+function persistInput(input) {
+  if (!input?.dataset?.persist) return;
+  writePersisted(input.dataset.persist, input.type === "checkbox" ? (input.checked ? "1" : "0") : input.value);
+}
+
+function formatSetting(value) {
+  const number = Number(value);
+  return value === "" || !Number.isFinite(number) ? "-" : String(number);
+}
+
+function refreshSettingsUi() {
+  const form = $("#analyzeForm");
+  if (!form) return;
+  const el = form.elements;
+  const mold = el.shape_mode.value === "mold";
+  $$("[data-show-when-mold]").forEach((node) => node.classList.toggle("hidden", !mold));
+  $$("[data-enabled-by]").forEach((group) => {
+    const on = Boolean(el[group.dataset.enabledBy]?.checked);
+    group.classList.toggle("is-disabled", !on);
+    group.querySelectorAll("input, select, button").forEach((control) => {
+      control.disabled = !on;
+    });
+  });
+  const drill = el.fill_drill_holes.checked;
+  const wire = el.fill_wire_shapes.checked;
+  const fillChip = $("#fillSummaryChip");
+  fillChip.textContent = drill && wire ? "穴・ワイヤ" : drill ? "ドリル穴" : wire ? "ワイヤ" : "オフ";
+  fillChip.classList.toggle("off", !drill && !wire);
+  const edmChip = $("#edmSummaryChip");
+  if (el.edm_enabled.checked) {
+    edmChip.textContent = `幅≤${formatSetting(el.edm_max_width_mm.value)} 深さ≥${formatSetting(el.edm_min_depth_mm.value)}`;
+    edmChip.classList.remove("off");
+  } else {
+    edmChip.textContent = "オフ";
+    edmChip.classList.add("off");
+  }
+  refreshAnalyzeButton();
+}
+
+function settingsSignature() {
+  const form = $("#analyzeForm");
+  if (!form) return "";
+  const data = new FormData(form);
+  data.delete("stp_file");
+  ["edm_enabled", "fill_drill_holes", "fill_wire_shapes"].forEach((name) => data.set(name, form.elements[name].checked ? "on" : "off"));
+  return JSON.stringify(Array.from(data.entries()));
+}
+
+function currentFile() {
+  return $("#stpFileInput")?.files?.[0] || null;
+}
+
+function refreshAnalyzeButton() {
+  const button = $("#analyzeButton");
+  if (!button || document.body.classList.contains("is-analyzing")) return;
+  const hasFile = Boolean(currentFile());
+  const stale = Boolean(state.lastResult && state.lastSignature && hasFile && state.lastSignature !== settingsSignature());
+  button.disabled = !hasFile;
+  button.textContent = !hasFile ? "ファイルを選択してください" : stale ? "設定を反映して再解析" : state.lastResult ? "再解析" : "解析実行";
+  $("#staleNote")?.classList.toggle("hidden", !stale);
+}
+
+function validateAnalyzeForm(form) {
+  for (const input of form.querySelectorAll("input[type=number]:not(:disabled)")) {
+    input.classList.remove("invalid");
+    if (input.checkValidity()) continue;
+    const details = input.closest("details");
+    if (details) details.open = true;
+    input.classList.add("invalid");
+    input.focus();
+    const label = (input.closest("label")?.childNodes[0]?.textContent || input.name).trim();
+    const range = [
+      input.min !== "" ? `${input.min}以上` : "",
+      input.max !== "" ? `${input.max}以下` : "",
+    ].filter(Boolean).join("・");
+    return `「${label}」の値が不正です${range ? `（${range}の数値を入力してください）` : ""}。`;
+  }
+  return null;
+}
+
+function requestCadRender() {
+  if (document.hidden) {
+    renderCadScene();
+    return;
+  }
+  if (state.cadPreview.renderQueued) return;
+  state.cadPreview.renderQueued = true;
+  window.requestAnimationFrame(() => {
+    state.cadPreview.renderQueued = false;
+    renderCadScene();
+  });
+}
+
+function cameraAxes(cam) {
+  const THREE = window.THREE;
+  const ce = Math.cos(cam.elevation);
+  const dir = new THREE.Vector3(ce * Math.cos(cam.azimuth), ce * Math.sin(cam.azimuth), Math.sin(cam.elevation));
+  const right = new THREE.Vector3(-Math.sin(cam.azimuth), Math.cos(cam.azimuth), 0);
+  const up = new THREE.Vector3().crossVectors(dir, right).normalize();
+  return { dir, right, up };
+}
+
+function drawAxisTriad() {
+  const canvas = $("#axisTriad");
+  if (!canvas || canvas.classList.contains("hidden") || !window.THREE) return;
+  const dpr = window.devicePixelRatio || 1;
+  const size = 88;
+  if (canvas.width !== Math.round(size * dpr)) {
+    canvas.width = Math.round(size * dpr);
+    canvas.height = Math.round(size * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size, size);
+  const THREE = window.THREE;
+  const { dir, right, up } = cameraAxes(state.cadPreview.cam);
+  const center = size / 2;
+  const length = 30;
+  const axes = [
+    { v: new THREE.Vector3(1, 0, 0), color: "#d0342c", label: "X" },
+    { v: new THREE.Vector3(0, 1, 0), color: "#2f8a3b", label: "Y" },
+    { v: new THREE.Vector3(0, 0, 1), color: "#2563eb", label: "Z" },
+  ].map((axis) => ({ ...axis, depth: axis.v.dot(dir) }));
+  axes.sort((a, b) => a.depth - b.depth);
+  ctx.beginPath();
+  ctx.arc(center, center, 40, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,.55)";
+  ctx.fill();
+  for (const axis of axes) {
+    const x = center + axis.v.dot(right) * length;
+    const y = center - axis.v.dot(up) * length;
+    ctx.globalAlpha = axis.depth < -0.2 ? 0.45 : 1;
+    ctx.strokeStyle = axis.color;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(center, center);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+    ctx.fillStyle = axis.color;
+    ctx.beginPath();
+    ctx.arc(x, y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.font = "800 10px Yu Gothic, Meiryo, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(axis.label, x, y + 0.5);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function rotateCadView(dx, dy) {
+  const cam = state.cadPreview.cam;
+  cam.azimuth -= dx * ROTATE_SPEED;
+  cam.elevation = Math.max(-MAX_ELEVATION, Math.min(MAX_ELEVATION, cam.elevation + dy * ROTATE_SPEED));
+  cam.preset = "free";
+  updateViewerControls();
+  requestCadRender();
+}
+
+function panCadView(dx, dy) {
+  const cp = state.cadPreview;
+  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  if (!cp.cam.target || rect.height <= 0) return;
+  const worldPerPixel = (2 * cp.cam.halfHeight) / rect.height;
+  const { right, up } = cameraAxes(cp.cam);
+  cp.cam.target.addScaledVector(right, -dx * worldPerPixel).addScaledVector(up, dy * worldPerPixel);
+  requestCadRender();
+}
+
+function zoomCadViewAt(factor, clientX, clientY) {
+  const cp = state.cadPreview;
+  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  if (!cp.cam.target || rect.width <= 0 || rect.height <= 0) return;
+  const oldHalf = cp.cam.halfHeight;
+  const newHalf = Math.max(cp.cam.radius * 0.002, Math.min(cp.cam.radius * 20, oldHalf / factor));
+  const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+  const ndcY = -(((clientY - rect.top) / rect.height) * 2 - 1);
+  const aspect = rect.width / rect.height;
+  const { right, up } = cameraAxes(cp.cam);
+  cp.cam.target
+    .addScaledVector(right, ndcX * aspect * (oldHalf - newHalf))
+    .addScaledVector(up, ndcY * (oldHalf - newHalf));
+  cp.cam.halfHeight = newHalf;
+  requestCadRender();
+}
+
+function bindCadViewerControls(canvas) {
+  const pointers = new Map();
+  let dragMode = null;
+  let pinch = null;
+
+  const pinchInfo = () => {
+    const [a, b] = Array.from(pointers.values());
+    return { distance: Math.hypot(a.x - b.x, a.y - b.y), x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  };
+
+  canvas.addEventListener("pointerdown", (event) => {
+    if (state.cadPreview.mode !== "cad") return;
+    try {
+      canvas.setPointerCapture(event.pointerId);
+    } catch {
+      // キャプチャできなくても操作は続ける
+    }
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (pointers.size === 2) {
+      pinch = pinchInfo();
+      dragMode = "pinch";
+    } else {
+      dragMode = event.button === 1 || event.button === 2 || event.shiftKey || event.ctrlKey || event.metaKey ? "pan" : "rotate";
+    }
+    canvas.classList.toggle("is-panning", dragMode === "pan");
+    canvas.classList.toggle("is-rotating", dragMode === "rotate");
+    event.preventDefault();
+  });
+
+  canvas.addEventListener("pointermove", (event) => {
+    const last = pointers.get(event.pointerId);
+    if (!last || !dragMode) return;
+    const dx = event.clientX - last.x;
+    const dy = event.clientY - last.y;
+    pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    if (dragMode === "pinch" && pointers.size === 2) {
+      const next = pinchInfo();
+      if (pinch.distance > 0 && next.distance > 0) zoomCadViewAt(next.distance / pinch.distance, next.x, next.y);
+      panCadView(next.x - pinch.x, next.y - pinch.y);
+      pinch = next;
+    } else if (dragMode === "pan") {
+      panCadView(dx, dy);
+    } else if (dragMode === "rotate") {
+      rotateCadView(dx, dy);
+    }
+  });
+
+  const endPointer = (event) => {
+    pointers.delete(event.pointerId);
+    if (pointers.size === 0) {
+      dragMode = null;
+      pinch = null;
+      canvas.classList.remove("is-panning", "is-rotating");
+    } else if (pointers.size === 1) {
+      dragMode = "rotate";
+      pinch = null;
+    }
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", endPointer);
+  canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+
+  canvas.addEventListener("wheel", (event) => {
+    if (state.cadPreview.mode !== "cad") return;
+    event.preventDefault();
+    // トラックパッドの細かい量にも追従させる（1ノッチ≒12%）
+    const delta = event.deltaMode === 1 ? event.deltaY * 33 : event.deltaY;
+    zoomCadViewAt(Math.exp(-delta * 0.0012), event.clientX, event.clientY);
+  }, { passive: false });
+
+  canvas.addEventListener("dblclick", () => fitPreview());
+}
+
+function bindFallbackViewerControls(canvas) {
+  canvas.addEventListener("pointerdown", (event) => {
+    if (!state.preview) return;
+    state.previewView.dragging = true;
+    state.previewView.lastX = event.clientX;
+    state.previewView.lastY = event.clientY;
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (!state.previewView.dragging || !state.preview) return;
+    const dx = event.clientX - state.previewView.lastX;
+    const dy = event.clientY - state.previewView.lastY;
+    state.previewView.lastX = event.clientX;
+    state.previewView.lastY = event.clientY;
+    state.previewView.yaw += dx * 0.01;
+    state.previewView.pitch = Math.max(-1.55, Math.min(1.35, state.previewView.pitch + dy * 0.01));
+    state.previewView.preset = "free";
+    updateViewerControls();
+    renderCurrentPreview();
+  });
+  const stop = () => {
+    state.previewView.dragging = false;
+  };
+  canvas.addEventListener("pointerup", stop);
+  canvas.addEventListener("pointercancel", stop);
+  canvas.addEventListener("wheel", (event) => {
+    if (!state.preview) return;
+    event.preventDefault();
+    const factor = event.deltaY > 0 ? 0.9 : 1.1;
+    state.previewView.zoom = Math.max(0.3, Math.min(8, state.previewView.zoom * factor));
+    renderCurrentPreview();
+  }, { passive: false });
+  canvas.addEventListener("dblclick", () => fitPreview());
+}
+
+function setViewerLoading(message) {
+  const box = $("#viewerLoading");
+  if (!box) return;
+  box.classList.toggle("hidden", !message);
+  if (message) $("#viewerLoadingText").textContent = message;
+}
+
+function resetResultForNewFile() {
+  state.lastResult = null;
+  state.lastSignature = null;
+  state.highlightedKey = null;
+  state.excluded.clear();
+  $("#resultPanel")?.classList.add("hidden");
+  $("#jumpToResult")?.classList.add("hidden");
+  const badge = $("#totalBadge");
+  badge.textContent = "未解析";
+  badge.classList.add("muted");
+  $("#pathLegend")?.classList.add("hidden");
+  $("#modelViewButtons")?.classList.add("hidden");
+}
+
+function pickDefaultMachine(select, savedKey) {
+  const saved = readPersisted(savedKey);
+  const machines = state.master.machines;
+  if (saved && machines.some((m) => String(m.machine_id) === saved)) {
+    select.value = saved;
+    return;
+  }
+  // 保存された選択がなければ社内標準機（V33）を初期値にする
+  const standard = machines.find((m) => m.machine_name === "V33");
+  if (standard) select.value = String(standard.machine_id);
+}
+
+// 社内標準機（サーバー側 STANDARD_MACHINES と同じ並び）を先頭に並べる
+const STANDARD_MACHINE_NAMES = ["V33", "V77", "D500", "MC430"];
+
+function sortedMachines() {
+  const rank = (m) => {
+    const index = STANDARD_MACHINE_NAMES.indexOf(m.machine_name);
+    return index === -1 ? STANDARD_MACHINE_NAMES.length : index;
+  };
+  return [...state.master.machines].sort((a, b) => rank(a) - rank(b) || a.machine_id - b.machine_id);
+}
+
+function machineOptionLabel(m) {
+  const parts = [m.machine_name];
+  if (m.axis_count && Number(m.axis_count) !== 3) parts.push(`${m.axis_count}軸`);
+  if (m.max_tool_diameter_mm) parts.push(`工具φ${m.max_tool_diameter_mm}まで`);
+  return parts.join(" / ");
+}
+
+function loadFileIntoForm(file) {
+  if (!file) return;
+  const input = $("#stpFileInput");
+  if (input.files?.[0] !== file) {
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+  }
+  previewFile(file).catch((error) => {
+    setViewerLoading(null);
+    toast(error.message);
+  });
+}
+
 function setPreviewMode(mode) {
   state.cadPreview.mode = mode;
   const fallbackCanvas = $("#stpPreviewCanvas");
@@ -265,11 +666,13 @@ function setPreviewMode(mode) {
   if (!fallbackCanvas || !cadCanvas) return;
   fallbackCanvas.classList.toggle("hidden", mode === "cad");
   cadCanvas.classList.toggle("hidden", mode !== "cad");
+  $("#axisTriad")?.classList.toggle("hidden", mode !== "cad");
+  $("#viewerHint")?.classList.toggle("hidden", !state.preview);
 }
 
 function renderCurrentPreview() {
   if (state.cadPreview.mode === "cad" && state.cadPreview.renderer) {
-    renderCadScene();
+    requestCadRender();
   } else if (state.preview) {
     drawStepPreview(state.preview);
   } else {
@@ -278,34 +681,77 @@ function renderCurrentPreview() {
 }
 
 function updateViewerControls() {
+  const preset = state.cadPreview.mode === "cad" ? state.cadPreview.cam.preset : state.previewView.preset;
   $$("[data-view-preset]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.viewPreset === state.previewView.preset);
+    button.classList.toggle("active", button.dataset.viewPreset === preset);
   });
   $$("[data-view-mode]").forEach((button) => {
     button.classList.toggle("active", button.dataset.viewMode === state.cadPreview.displayMode);
   });
-  const cube = $("#viewCube");
-  if (cube) cube.querySelector("strong").textContent = state.previewView.preset.toUpperCase();
 }
 
 function applyViewPreset(preset) {
-  const presets = {
-    iso: { yaw: -0.72, pitch: -0.58 },
-    top: { yaw: 0, pitch: -1.5 },
-    front: { yaw: 0, pitch: 0 },
-    right: { yaw: -Math.PI / 2, pitch: 0 },
-  };
-  const next = presets[preset] || presets.iso;
-  state.previewView.yaw = next.yaw;
-  state.previewView.pitch = next.pitch;
-  state.previewView.preset = preset in presets ? preset : "iso";
+  const key = preset in VIEW_PRESETS ? preset : "iso";
+  const cam = state.cadPreview.cam;
+  cam.azimuth = VIEW_PRESETS[key].azimuth;
+  cam.elevation = VIEW_PRESETS[key].elevation;
+  cam.preset = key;
+  state.previewView.yaw = FALLBACK_PRESETS[key].yaw;
+  state.previewView.pitch = FALLBACK_PRESETS[key].pitch;
+  state.previewView.preset = key;
+  // 視点を切り替えたら、その向きで全体が収まるように合わせる
+  fitPreview();
   updateViewerControls();
-  renderCurrentPreview();
 }
 
 function fitPreview() {
   state.previewView.zoom = 1;
+  const cp = state.cadPreview;
+  if (cp.mode === "cad" && cp.box && window.THREE) {
+    const THREE = window.THREE;
+    frameBox(new THREE.Vector3(0, 0, 0), cp.box.clone().multiplyScalar(0.5), 1.12);
+  }
   renderCurrentPreview();
+}
+
+// 中心と半分の大きさで表した箱が、今の向きで画面に収まるように注視点と倍率を合わせる
+function frameBox(center, half, margin, minHalfHeight = 0) {
+  const THREE = window.THREE;
+  const cp = state.cadPreview;
+  const { right, up } = cameraAxes(cp.cam);
+  let halfW = 0;
+  let halfH = 0;
+  for (const sx of [-1, 1]) {
+    for (const sy of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        const corner = new THREE.Vector3(half.x * sx, half.y * sy, half.z * sz);
+        halfW = Math.max(halfW, Math.abs(corner.dot(right)));
+        halfH = Math.max(halfH, Math.abs(corner.dot(up)));
+      }
+    }
+  }
+  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  const aspect = rect.width > 0 && rect.height > 0 ? rect.width / rect.height : 1.6;
+  cp.cam.target = center.clone();
+  cp.cam.halfHeight = Math.max(halfH, halfW / aspect, cp.cam.radius * 0.02, minHalfHeight) * margin;
+}
+
+// 選んだフィーチャの工具パスが画面に大きく入るように寄る
+function frameHighlightedFeature() {
+  const cp = state.cadPreview;
+  if (!window.THREE || !cp.toolpathGroup || state.highlightedKey === null) return;
+  const THREE = window.THREE;
+  const box = new THREE.Box3();
+  cp.toolpathGroup.children.forEach((object) => {
+    if (object.userData.featureKey === state.highlightedKey) box.expandByObject(object);
+  });
+  if (box.isEmpty()) return;
+  const center = box.getCenter(new THREE.Vector3());
+  const half = box.getSize(new THREE.Vector3()).multiplyScalar(0.5);
+  // 小さな穴1つでも周囲が分かるよう、部品の大きさの15%までは引いて見せる
+  frameBox(center, half, 1.35, cp.cam.radius * 0.15);
+  cp.cam.preset = "free";
+  updateViewerControls();
 }
 
 function applyCadDisplayMode(mode) {
@@ -325,6 +771,17 @@ function applyCadDisplayMode(mode) {
         object.visible = mode !== "wire";
         object.material.opacity = mode === "transparent" ? 0.72 : 0.42;
       }
+    });
+  }
+  // 比較表示では元モデルを半透明にして、内側に埋めた部分（オレンジ）も見えるようにする
+  const cp = state.cadPreview;
+  if (cp.originalGroup && cp.modelView === "compare" && mode === "shaded") {
+    cp.originalGroup.traverse((object) => {
+      if (!object.isMesh) return;
+      object.material.transparent = true;
+      object.material.opacity = 0.38;
+      object.material.depthWrite = false;
+      object.material.needsUpdate = true;
     });
   }
   updateViewerControls();
@@ -363,13 +820,19 @@ function initCadPreview() {
     const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000000);
     camera.up.set(0, 0, 1);
 
-    scene.add(new THREE.HemisphereLight(0xf4f4f4, 0x5f635f, 1.45));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 1.35);
-    keyLight.position.set(1.6, -2.4, 2.8);
-    scene.add(keyLight);
-    const rimLight = new THREE.DirectionalLight(0xffffff, 0.62);
-    rimLight.position.set(-2.8, 2.2, 1.6);
-    scene.add(rimLight);
+    scene.add(new THREE.HemisphereLight(0xf2f4f2, 0x5a5f5b, 0.85));
+    // 視点についてくるライト（どの向きから見ても手前の面が明るい）
+    const headLight = new THREE.DirectionalLight(0xffffff, 1.05);
+    headLight.position.set(0.35, 0.55, 1);
+    const lightTarget = new THREE.Object3D();
+    lightTarget.position.set(0, 0, -1);
+    camera.add(headLight);
+    camera.add(lightTarget);
+    headLight.target = lightTarget;
+    const fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
+    fillLight.position.set(-2.8, 2.2, -1.6);
+    scene.add(fillLight);
+    scene.add(camera);
 
     state.cadPreview.renderer = renderer;
     state.cadPreview.scene = scene;
@@ -378,6 +841,7 @@ function initCadPreview() {
 
   if (state.cadPreview.group) {
     state.cadPreview.scene.remove(state.cadPreview.group);
+    state.cadPreview.group = null;
   }
 }
 
@@ -394,7 +858,7 @@ function buildCadMesh(geometryMesh) {
     geometry.setIndex(new THREE.BufferAttribute(Uint32Array.from(geometryMesh.index.array), 1));
   }
 
-  const color = geometryMesh.color || [0.78, 0.82, 0.78];
+  const color = geometryMesh.color || [0.64, 0.7, 0.72];
   const material = new THREE.MeshStandardMaterial({
     color: new THREE.Color(color[0], color[1], color[2]),
     metalness: 0.06,
@@ -449,7 +913,14 @@ async function loadFillModels(token) {
     if (!response.ok) throw new Error("埋めたモデルを取得できませんでした（保存期間切れの可能性があります）。");
     return response.arrayBuffer();
   };
-  const [filledBuffer, bodiesBuffer] = await Promise.all([fetchBuffer("filled"), fetchBuffer("bodies")]);
+  setViewerLoading("埋めたモデルを読み込んでいます…");
+  let filledBuffer;
+  let bodiesBuffer;
+  try {
+    [filledBuffer, bodiesBuffer] = await Promise.all([fetchBuffer("filled"), fetchBuffer("bodies")]);
+  } finally {
+    setViewerLoading(null);
+  }
   if (cp.fillToken !== token) return; // 読み込み中に別の結果へ切り替わった
   const THREE = window.THREE;
   const filledGroup = meshGroupFromOcct(readStepMeshes(filledBuffer));
@@ -483,7 +954,7 @@ function setModelView(view) {
   if (cp.filledGroup) cp.filledGroup.visible = next === "filled";
   if (cp.fillBodiesGroup) cp.fillBodiesGroup.visible = next === "compare";
   $$("[data-model-view]").forEach((button) => button.classList.toggle("active", button.dataset.modelView === next));
-  renderCurrentPreview();
+  applyCadDisplayMode(cp.displayMode);
 }
 
 async function loadDetailedCadPreview(buffer) {
@@ -491,9 +962,13 @@ async function loadDetailedCadPreview(buffer) {
   initCadPreview();
 
   if (!state.cadPreview.occt) {
+    setViewerLoading("3D表示エンジンを準備しています（初回のみ）…");
     state.cadPreview.occt = await window.occtimportjs();
   }
-
+  setViewerLoading("STEP形状をメッシュ化しています…");
+  // 画面に進捗表示を出してから重い処理に入る
+  // （requestAnimationFrame は裏タブで止まるので setTimeout で待つ）
+  await new Promise((resolve) => window.setTimeout(resolve, 30));
   const result = readStepMeshes(buffer);
 
   const THREE = window.THREE;
@@ -506,17 +981,25 @@ async function loadDetailedCadPreview(buffer) {
   const size = box.getSize(new THREE.Vector3());
   group.position.sub(center);
 
-  state.cadPreview.group = group;
-  state.cadPreview.originalGroup = originalGroup;
-  state.cadPreview.filledGroup = null;
-  state.cadPreview.fillBodiesGroup = null;
-  state.cadPreview.fillToken = null;
+  const cp = state.cadPreview;
+  cp.group = group;
+  cp.originalGroup = originalGroup;
+  cp.filledGroup = null;
+  cp.fillBodiesGroup = null;
+  cp.fillToken = null;
+  cp.toolpathGroup = null;
+  cp.box = size;
+  // STEPテキストの座標点は配置用の点も含み外形が大きく出るため、メッシュの外形で表示し直す
+  if (state.preview) {
+    $("#previewStatus").textContent = `${(state.preview.fileSize / 1024).toFixed(0)} KB ／ 外形 ${numberLabel(size.x)} × ${numberLabel(size.y)} × ${numberLabel(size.z)} mm`;
+  }
+  cp.cam.radius = Math.max(size.length() / 2, 1);
+  cp.baseRadius = Math.max(size.x, size.y, size.z, 1);
   setModelView("original");
-  state.cadPreview.baseRadius = Math.max(size.x, size.y, size.z, 1);
-  state.cadPreview.scene.add(group);
-  applyCadDisplayMode(state.cadPreview.displayMode);
+  cp.scene.add(group);
+  applyCadDisplayMode(cp.displayMode);
   setPreviewMode("cad");
-  renderCadScene();
+  applyViewPreset(cp.cam.preset && cp.cam.preset !== "free" ? cp.cam.preset : "iso");
   if (state.lastResult) renderToolpaths(state.lastResult);
 }
 
@@ -621,29 +1104,34 @@ function renderProcessPlans(result, processes) {
 }
 
 function renderCadScene() {
-  const { renderer, scene, camera, group, baseRadius } = state.cadPreview;
+  const { renderer, scene, camera, group, cam } = state.cadPreview;
   if (!renderer || !scene || !camera || !group) return;
+  const THREE = window.THREE;
   const canvas = $("#cadPreviewCanvas");
   const rect = canvas.getBoundingClientRect();
   const width = Math.max(1, Math.round(rect.width));
   const height = Math.max(1, Math.round(rect.height));
+  if (rect.width < 2 || rect.height < 2) return; // 非表示のタブでは描かない
   renderer.setSize(width, height, false);
 
-  const distance = (baseRadius * 1.85) / Math.max(state.previewView.zoom, 0.2);
-  camera.position.set(0, -distance, distance * 0.62);
-  camera.near = Math.max(0.01, distance / 1000);
-  camera.far = Math.max(1000, distance * 20);
-  const viewSize = Math.max(baseRadius * 1.18 / Math.max(state.previewView.zoom, 0.2), 1);
+  if (!cam.target) cam.target = new THREE.Vector3(0, 0, 0);
+  const { dir } = cameraAxes(cam);
+  const reach = cam.radius * 4 + cam.target.length();
+  camera.position.copy(cam.target).addScaledVector(dir, reach);
+  camera.up.set(0, 0, 1);
+  // 平行投影なので、注視点をずらしても形状が切れないよう奥行きを広めに取る
+  camera.near = -reach * 2;
+  camera.far = reach * 4;
   const aspect = width / height;
-  camera.left = -viewSize * aspect;
-  camera.right = viewSize * aspect;
-  camera.top = viewSize;
-  camera.bottom = -viewSize;
-  camera.lookAt(0, 0, 0);
+  camera.left = -cam.halfHeight * aspect;
+  camera.right = cam.halfHeight * aspect;
+  camera.top = cam.halfHeight;
+  camera.bottom = -cam.halfHeight;
+  camera.lookAt(cam.target);
   camera.updateProjectionMatrix();
-
-  group.rotation.set(state.previewView.pitch, 0, state.previewView.yaw, "XYZ");
+  group.rotation.set(0, 0, 0);
   renderer.render(scene, camera);
+  drawAxisTriad();
 }
 
 const TOOLPATH_COLORS = {
@@ -840,6 +1328,7 @@ function setHighlightedFeature(key) {
         state.cadPreview.toolpathGroup.visible = true;
         $("[data-view-toggle='paths']")?.classList.add("active");
       }
+      frameHighlightedFeature();
       const panel = $("#previewPanel");
       const rect = panel?.getBoundingClientRect();
       if (rect && (rect.bottom < 80 || rect.top > window.innerHeight - 80)) {
@@ -860,17 +1349,6 @@ function drawPreviewPlaceholder() {
   canvas.height = Math.max(1, Math.round(rect.height * dpr));
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, rect.width, rect.height);
-  ctx.strokeStyle = "#b9c3bd";
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 6]);
-  ctx.strokeRect(22, 22, rect.width - 44, rect.height - 44);
-  ctx.setLineDash([]);
-  ctx.fillStyle = "#68746f";
-  ctx.font = "700 14px Yu Gothic, Meiryo, sans-serif";
-  ctx.textAlign = "center";
-  ctx.fillText("STPファイルをドロップ", rect.width / 2, rect.height / 2 - 6);
-  ctx.font = "12px Yu Gothic, Meiryo, sans-serif";
-  ctx.fillText("外形・面・円筒面候補を簡易表示", rect.width / 2, rect.height / 2 + 18);
 }
 
 function drawStepPreview(preview) {
@@ -1049,69 +1527,60 @@ function drawStepPreview(preview) {
   ctx.fillStyle = "#17201b";
   ctx.font = "800 13px Yu Gothic, Meiryo, sans-serif";
   ctx.textAlign = "left";
-  ctx.fillText(`${numberLabel(b.x)} x ${numberLabel(b.y)} x ${numberLabel(b.z)} mm`, 18, 26);
-  ctx.fillStyle = "#68746f";
-  ctx.font = "12px Yu Gothic, Meiryo, sans-serif";
-  ctx.fillText(`ドラッグで回転 / ホイールでズーム / 平面 ${preview.planeCount} / エッジ ${preview.edges?.length || 0} / 円筒 ${preview.cylinders.length}`, 18, 46);
+  ctx.fillText(`${numberLabel(b.x)} x ${numberLabel(b.y)} x ${numberLabel(b.z)} mm（簡易表示）`, 18, 70);
 }
 
 function renderStepPreview(preview) {
   state.preview = preview;
-  const badge = $("#previewBadge");
-  const status = $("#previewStatus");
-  const stats = $("#previewStats");
   const hasGeometry = Boolean(preview.bbox);
-
-  badge.className = `preview-badge ${hasGeometry ? "ready" : "warn"}`;
-  badge.textContent = hasGeometry ? "読込済み" : "点群なし";
-  status.textContent = preview.truncated
-    ? "先頭部分だけを読み込んで3D概要を表示しています"
-    : "座標点・エッジ・円筒面候補から3D概要を表示しています";
-
-  const bboxText = preview.bbox
-    ? `${numberLabel(preview.bbox.x)} x ${numberLabel(preview.bbox.y)} x ${numberLabel(preview.bbox.z)} mm`
-    : "取得不可";
-  stats.innerHTML = `
-    <dt>ファイル</dt><dd>${esc(preview.fileName)}</dd>
-    <dt>サイズ</dt><dd>${(preview.fileSize / 1024).toFixed(1)} KB</dd>
-    <dt>外形</dt><dd>${bboxText}</dd>
-    <dt>座標点</dt><dd>${preview.points.length}</dd>
-    <dt>エッジ</dt><dd>${preview.edges?.length || 0}</dd>
-    <dt>エンティティ</dt><dd>${preview.entityCount}</dd>
-    <dt>平面</dt><dd>${preview.planeCount}</dd>
-    <dt>面候補</dt><dd>${preview.faceCount}</dd>
-    <dt>円/円筒</dt><dd>${preview.circles?.length || 0} / ${preview.cylinders.length}</dd>
-  `;
+  const bboxText = hasGeometry
+    ? `外形 ${numberLabel(preview.bbox.x)} × ${numberLabel(preview.bbox.y)} × ${numberLabel(preview.bbox.z)} mm`
+    : "外形を取得できません";
+  $("#previewBadge").className = `preview-badge ${hasGeometry ? "ready" : "warn"}`;
+  $("#previewBadge").textContent = hasGeometry ? "簡易表示" : "点群なし";
+  $("#previewStatus").textContent = `${(preview.fileSize / 1024).toFixed(0)} KB ／ ${bboxText}${preview.truncated ? "（先頭のみ読込）" : ""}`;
+  $("#viewerHint")?.classList.remove("hidden");
   drawStepPreview(preview);
 }
 
 async function previewFile(file) {
-  if (!file) {
-    drawPreviewPlaceholder();
-    return;
-  }
+  if (!file) return;
   const lowerName = file.name.toLowerCase();
   if (!lowerName.endsWith(".stp") && !lowerName.endsWith(".step")) {
     toast("STPまたはSTEPファイルを選択してください。");
-    drawPreviewPlaceholder();
     return;
   }
+  const loadId = (state.previewLoadId || 0) + 1;
+  state.previewLoadId = loadId;
+  resetResultForNewFile();
+  $("#fileName").textContent = file.name;
+  $("#viewerEmpty")?.classList.add("hidden");
+  $("#viewerStack")?.classList.remove("is-empty");
   $("#previewBadge").className = "preview-badge";
   $("#previewBadge").textContent = "読込中";
-  $("#previewStatus").textContent = "ブラウザ内でSTEPテキストを読み込んでいます";
-  const maxPreviewBytes = 16 * 1024 * 1024;
-  const buffer = await file.arrayBuffer();
-  const text = new TextDecoder("utf-8").decode(buffer.slice(0, maxPreviewBytes));
-  renderStepPreview(parseStepPreview(text, file));
+  $("#previewStatus").textContent = `${(file.size / 1024).toFixed(0)} KB を読み込んでいます`;
+  setViewerLoading("ファイルを読み込んでいます…");
+  refreshAnalyzeButton();
   try {
-    $("#previewStatus").textContent = "OpenCascadeでSTEP形状を詳細メッシュ化しています";
-    await loadDetailedCadPreview(buffer);
-    $("#previewBadge").className = "preview-badge ready";
-    $("#previewBadge").textContent = "詳細表示";
-    $("#previewStatus").textContent = "OpenCascadeメッシュをWebGLで表示しています";
-  } catch (error) {
-    setPreviewMode("fallback");
-    $("#previewStatus").textContent = `簡易表示に切替: ${error.message}`;
+    const maxPreviewBytes = 16 * 1024 * 1024;
+    const buffer = await file.arrayBuffer();
+    const text = new TextDecoder("utf-8").decode(buffer.slice(0, maxPreviewBytes));
+    if (loadId !== state.previewLoadId) return;
+    renderStepPreview(parseStepPreview(text, file));
+    try {
+      await loadDetailedCadPreview(buffer);
+      if (loadId !== state.previewLoadId) return;
+      $("#previewBadge").className = "preview-badge ready";
+      $("#previewBadge").textContent = "3D表示";
+    } catch (error) {
+      setPreviewMode("fallback");
+      renderCurrentPreview();
+      $("#previewBadge").className = "preview-badge warn";
+      $("#previewBadge").textContent = "簡易表示";
+      $("#previewStatus").textContent += ` ／ 詳細3Dに失敗したため簡易表示: ${error.message}`;
+    }
+  } finally {
+    if (loadId === state.previewLoadId) setViewerLoading(null);
   }
 }
 
@@ -1119,6 +1588,7 @@ function setTab(name) {
   $$(".tab").forEach((button) => button.classList.toggle("active", button.dataset.tab === name));
   $$(".view").forEach((view) => view.classList.toggle("active", view.id === `tab-${name}`));
   if (name === "history") loadHistories();
+  if (name === "analyze") window.requestAnimationFrame(renderCurrentPreview);
 }
 
 async function loadMaster() {
@@ -1127,16 +1597,15 @@ async function loadMaster() {
 }
 
 function renderMaster() {
-  $("#machineSelect").innerHTML = state.master.machines
-    .map((m) => `<option value="${m.machine_id}">${esc(m.machine_name)}${m.max_tool_diameter_mm ? ` / 最大工具径 ${m.max_tool_diameter_mm}mm` : ""}</option>`)
+  const machineOptions = sortedMachines()
+    .map((m) => `<option value="${m.machine_id}">${esc(machineOptionLabel(m))}</option>`)
     .join("");
+  $("#machineSelect").innerHTML = machineOptions;
+  pickDefaultMachine($("#machineSelect"), "machine_id");
   const ncSelect = $("#ncMachineSelect");
   if (ncSelect) {
-    const saved = readPersisted("nc_machine_id");
-    ncSelect.innerHTML = state.master.machines
-      .map((m) => `<option value="${m.machine_id}">${esc(m.machine_name)}</option>`)
-      .join("");
-    if (saved && state.master.machines.some((m) => String(m.machine_id) === saved)) ncSelect.value = saved;
+    ncSelect.innerHTML = machineOptions;
+    pickDefaultMachine(ncSelect, "nc_machine_id");
   }
   if ($("#conditionToolSelect")) {
     $("#conditionToolSelect").innerHTML = state.master.tools
@@ -1169,12 +1638,13 @@ function renderMaster() {
     `).join("");
   }
 
-  $("#machineRows").innerHTML = state.master.machines.map((m) => `
+  $("#machineRows").innerHTML = sortedMachines().map((m) => `
     <tr>
-      <td>${m.machine_id}</td><td>${esc(m.machine_name)}</td><td>${esc(m.axis_count)}</td>
-      <td>${esc(m.rapid_feed_mm_min)}</td><td>${esc(m.atc_time_sec)}</td><td>${esc(m.max_spindle_rpm)}</td>
-      <td>${m.max_tool_diameter_mm ? `${esc(m.max_tool_diameter_mm)} mm` : "制限なし"}</td><td>${esc(m.setup_time_min)}</td>
-      <td>
+      <td>${m.machine_id}</td><td><strong>${esc(m.machine_name)}</strong>${STANDARD_MACHINE_NAMES.includes(m.machine_name) ? ' <span class="candidate-tag">標準</span>' : ""}</td><td>${esc(m.axis_count)}</td>
+      <td>${Number(m.rapid_feed_mm_min).toLocaleString()} mm/分</td><td>${esc(m.atc_time_sec)} 秒</td><td>${Number(m.max_spindle_rpm).toLocaleString()}</td>
+      <td>${m.max_tool_diameter_mm ? `${esc(m.max_tool_diameter_mm)} mm` : "制限なし"}</td><td>${esc(m.setup_time_min)} 分</td>
+      <td class="memo-cell">${esc(m.memo || "")}</td>
+      <td class="action-cell">
         <button class="secondary-button compact" data-edit-machine="${m.machine_id}">編集</button>
         <button class="danger compact" data-delete-machine="${m.machine_id}">削除</button>
       </td>
@@ -1384,6 +1854,7 @@ function renderResult(result) {
   $("#confidenceMeter").value = result.confidence;
   $("#confidenceLabel").textContent = `${Math.round(result.confidence * 100)}%`;
   $("#csvLink").href = `/api/histories/${result.history_id}/csv`;
+  $("#jumpToResult")?.classList.remove("hidden");
 
   const machiningTotal = Number(result.breakdown.machining_sec) || 0;
   $("#featureRows").innerHTML = result.features.map((f) => {
@@ -1495,6 +1966,7 @@ function renderResult(result) {
 
   renderToolpaths(result);
   renderFillPanel(result);
+  refreshAnalyzeButton();
   const fillToken = result.fill?.token || null;
   if (fillToken !== state.cadPreview.fillToken || !state.cadPreview.filledGroup) {
     loadFillModels(fillToken).catch((error) => toast(error.message));
@@ -1543,74 +2015,105 @@ async function loadHistories() {
 function bindEvents() {
   $$(".tab").forEach((button) => button.addEventListener("click", () => setTab(button.dataset.tab)));
 
-  window.addEventListener("resize", () => {
-    renderCurrentPreview();
+  const viewerStack = $("#viewerStack");
+  if (window.ResizeObserver && viewerStack) {
+    new ResizeObserver(() => renderCurrentPreview()).observe(viewerStack);
+  } else {
+    window.addEventListener("resize", () => renderCurrentPreview());
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) renderCurrentPreview();
   });
 
-  const fileInput = $("input[name='stp_file']");
-  const dropZone = $(".drop-zone");
-  const previewCanvases = [$("#stpPreviewCanvas"), $("#cadPreviewCanvas")].filter(Boolean);
-
-  previewCanvases.forEach((previewCanvas) => {
-    previewCanvas.addEventListener("pointerdown", (event) => {
-      if (!state.preview) return;
-      state.previewView.dragging = true;
-      state.previewView.lastX = event.clientX;
-      state.previewView.lastY = event.clientY;
-      previewCanvas.setPointerCapture(event.pointerId);
-    });
-
-    previewCanvas.addEventListener("pointermove", (event) => {
-      if (!state.previewView.dragging || !state.preview) return;
-      const dx = event.clientX - state.previewView.lastX;
-      const dy = event.clientY - state.previewView.lastY;
-      state.previewView.lastX = event.clientX;
-      state.previewView.lastY = event.clientY;
-      state.previewView.yaw += dx * 0.01;
-      state.previewView.pitch = Math.max(-1.55, Math.min(1.35, state.previewView.pitch + dy * 0.01));
-      state.previewView.preset = "free";
-      updateViewerControls();
-      renderCurrentPreview();
-    });
-
-    previewCanvas.addEventListener("pointerup", () => {
-      state.previewView.dragging = false;
-    });
-
-    previewCanvas.addEventListener("pointercancel", () => {
-      state.previewView.dragging = false;
-    });
-
-    previewCanvas.addEventListener("wheel", (event) => {
-      if (!state.preview) return;
-      event.preventDefault();
-      const factor = event.deltaY > 0 ? 0.92 : 1.08;
-      state.previewView.zoom = Math.max(0.55, Math.min(3.2, state.previewView.zoom * factor));
-      renderCurrentPreview();
-    }, { passive: false });
-
-    previewCanvas.addEventListener("dblclick", () => {
-      state.previewView.zoom = 1;
-      applyViewPreset("iso");
-    });
-  });
+  bindCadViewerControls($("#cadPreviewCanvas"));
+  bindFallbackViewerControls($("#stpPreviewCanvas"));
 
   $$("[data-view-preset]").forEach((button) => {
     button.addEventListener("click", () => applyViewPreset(button.dataset.viewPreset));
   });
-
   $$("[data-view-mode]").forEach((button) => {
     button.addEventListener("click", () => applyCadDisplayMode(button.dataset.viewMode));
   });
-
   $("[data-view-fit]")?.addEventListener("click", fitPreview);
-
   $$("[data-model-view]").forEach((button) => {
     button.addEventListener("click", () => setModelView(button.dataset.modelView));
   });
+  $$("[data-view-toggle]").forEach((button) => {
+    button.addEventListener("click", () => {
+      if (button.dataset.viewToggle !== "paths") return;
+      state.cadPreview.showPaths = !state.cadPreview.showPaths;
+      button.classList.toggle("active", state.cadPreview.showPaths);
+      if (state.cadPreview.toolpathGroup) state.cadPreview.toolpathGroup.visible = state.cadPreview.showPaths;
+      renderCurrentPreview();
+    });
+  });
 
-  $$("[data-persist]").forEach((input) => {
-    input.addEventListener("change", () => writePersisted(input.dataset.persist, input.value));
+  // ---- ファイル選択・ドロップ（プレビュー枠全体が受け口） ----
+  const fileInput = $("#stpFileInput");
+  $$("[data-pick-file]").forEach((button) => button.addEventListener("click", () => fileInput.click()));
+  fileInput.addEventListener("change", () => loadFileIntoForm(fileInput.files[0]));
+
+  const viewerCard = $("#previewPanel");
+  const dropHint = $("#viewerDropHint");
+  let dragDepth = 0;
+  const hasFiles = (event) => Array.from(event.dataTransfer?.types || []).includes("Files");
+  // 枠の外に落としてもブラウザがファイルを開いてしまわないようにする
+  window.addEventListener("dragover", (event) => {
+    if (hasFiles(event)) event.preventDefault();
+  });
+  window.addEventListener("drop", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    if (!viewerCard.contains(event.target)) toast("ファイルは3Dプレビューの枠にドロップしてください。");
+  });
+  viewerCard.addEventListener("dragenter", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    dragDepth += 1;
+    viewerCard.classList.add("dragging");
+    dropHint.classList.remove("hidden");
+  });
+  viewerCard.addEventListener("dragover", (event) => {
+    if (!hasFiles(event)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  });
+  viewerCard.addEventListener("dragleave", () => {
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (dragDepth === 0) {
+      viewerCard.classList.remove("dragging");
+      dropHint.classList.add("hidden");
+    }
+  });
+  viewerCard.addEventListener("drop", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth = 0;
+    viewerCard.classList.remove("dragging");
+    dropHint.classList.add("hidden");
+    const file = event.dataTransfer.files[0];
+    if (file) loadFileIntoForm(file);
+  });
+
+  // ---- 解析設定 ----
+  const form = $("#analyzeForm");
+  form.addEventListener("input", (event) => {
+    event.target.classList?.remove("invalid");
+    persistInput(event.target);
+    refreshSettingsUi();
+  });
+  form.addEventListener("change", (event) => {
+    persistInput(event.target);
+    refreshSettingsUi();
+  });
+  $("[data-reset-edm]")?.addEventListener("click", () => {
+    const defaults = { edm_max_width_mm: 3, edm_min_depth_mm: 10, edm_min_aspect: 6, edm_min_taper_deg: 2 };
+    Object.entries(defaults).forEach(([name, value]) => {
+      form.elements[name].value = value;
+      persistInput(form.elements[name]);
+    });
+    refreshSettingsUi();
   });
 
   document.body.addEventListener("click", async (event) => {
@@ -1622,78 +2125,40 @@ function bindEvents() {
     await reanalyzeWithExclusions();
   });
 
-  $$("[data-view-toggle]").forEach((button) => {
-    button.addEventListener("click", () => {
-      if (button.dataset.viewToggle !== "paths") return;
-      state.cadPreview.showPaths = !state.cadPreview.showPaths;
-      button.classList.toggle("active", state.cadPreview.showPaths);
-      if (state.cadPreview.toolpathGroup) {
-        state.cadPreview.toolpathGroup.visible = state.cadPreview.showPaths;
-      }
-      renderCurrentPreview();
-    });
-  });
-
-  fileInput.addEventListener("change", (event) => {
-    state.excluded.clear();
-    const file = event.target.files[0];
-    $("#fileName").textContent = file ? file.name : "ファイルを選択";
-    previewFile(file).catch((error) => toast(error.message));
-  });
-
-  ["dragenter", "dragover"].forEach((eventName) => {
-    dropZone.addEventListener(eventName, (event) => {
-      event.preventDefault();
-      dropZone.classList.add("dragging");
-    });
-  });
-
-  ["dragleave", "drop"].forEach((eventName) => {
-    dropZone.addEventListener(eventName, (event) => {
-      event.preventDefault();
-      dropZone.classList.remove("dragging");
-    });
-  });
-
-  dropZone.addEventListener("drop", (event) => {
-    const file = event.dataTransfer.files[0];
-    if (!file) return;
-    const transfer = new DataTransfer();
-    transfer.items.add(file);
-    fileInput.files = transfer.files;
-    $("#fileName").textContent = file.name;
-    previewFile(file).catch((error) => toast(error.message));
-  });
-
-  $("#analyzeForm").addEventListener("submit", async (event) => {
+  form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    // requestSubmit()による再解析では event.submitter が null になる
-    const button = event.submitter || $("#analyzeForm button.primary[type=submit]") || { disabled: false, textContent: "" };
-    const fileInput = event.currentTarget.elements.stp_file;
-    if (!fileInput?.files?.length) {
+    const button = $("#analyzeButton");
+    if (!currentFile()) {
       toast("STP / STEP ファイルを選択してください。");
       return;
     }
-    button.disabled = true;
+    const invalid = validateAnalyzeForm(form);
+    if (invalid) {
+      toast(invalid);
+      return;
+    }
     const startedAt = Date.now();
     const showElapsed = () => {
       button.textContent = `解析中… ${Math.floor((Date.now() - startedAt) / 1000)}秒`;
     };
+    document.body.classList.add("is-analyzing");
+    button.disabled = true;
     showElapsed();
     const elapsedTimer = window.setInterval(showElapsed, 1000);
-    document.body.classList.add("is-analyzing");
     $("#totalBadge").textContent = "解析中…";
     $("#totalBadge").classList.add("muted");
+    const signature = settingsSignature();
     try {
-      const formData = new FormData(event.currentTarget);
+      const formData = new FormData(form);
       // チェックボックスは未チェック時に送信されないため、明示的にoffを送る
-      if (!formData.has("edm_enabled")) formData.set("edm_enabled", "off");
-      if (!formData.has("fill_drill_holes")) formData.set("fill_drill_holes", "off");
-      if (!formData.has("fill_wire_shapes")) formData.set("fill_wire_shapes", "off");
+      ["edm_enabled", "fill_drill_holes", "fill_wire_shapes"].forEach((name) => {
+        if (!formData.has(name)) formData.set(name, "off");
+      });
       formData.set("excluded_features", JSON.stringify(Array.from(state.excluded)));
       const data = await jsonFetch("/api/analyze", { method: "POST", body: formData });
+      state.lastSignature = signature;
       renderResult(data);
-      toast("解析が完了しました。");
+      toast(data.fill?.error ? `解析は完了しましたが、形状を埋められませんでした: ${data.fill.error}` : "解析が完了しました。");
     } catch (error) {
       toast(error.message);
       $("#totalBadge").textContent = state.lastResult ? state.lastResult.time_label || secLabel(state.lastResult.breakdown.total_sec) : "未解析";
@@ -1701,22 +2166,26 @@ function bindEvents() {
     } finally {
       window.clearInterval(elapsedTimer);
       document.body.classList.remove("is-analyzing");
-      button.disabled = false;
-      button.textContent = "解析実行";
+      refreshAnalyzeButton();
     }
+  });
+
+  $("#jumpToResult")?.addEventListener("click", (event) => {
+    event.preventDefault();
+    $("#resultPanel").scrollIntoView({ behavior: "smooth", block: "start" });
   });
 
   const postMasterForm = (selector, url) => {
     $(selector)?.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const form = event.currentTarget;
+      const masterForm = event.currentTarget;
       try {
         await jsonFetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(formJson(form)),
+          body: JSON.stringify(formJson(masterForm)),
         });
-        form.reset();
+        masterForm.reset();
         await loadMaster();
         toast("登録しました。");
       } catch (error) {
@@ -1732,6 +2201,7 @@ function bindEvents() {
     const data = formJson(event.currentTarget);
     const machineId = data.machine_id;
     delete data.machine_id;
+    data.memo = event.currentTarget.elements.memo.value;
     try {
       await jsonFetch(machineId ? `/api/machines/${machineId}` : "/api/machines", {
         method: machineId ? "PUT" : "POST",
@@ -1747,13 +2217,6 @@ function bindEvents() {
   });
 
   $("#machineResetButton")?.addEventListener("click", resetMachineForm);
-
-  $("#machineForm").addEventListener("reset", () => {
-    window.setTimeout(() => {
-      $("#machineSubmitButton").textContent = "追加";
-      $("#machineResetButton")?.classList.add("hidden");
-    });
-  });
 
   $("#catalogSearch")?.addEventListener("input", renderCatalogs);
   $("#catalogTypeFilter")?.addEventListener("change", renderCatalogs);
@@ -1814,6 +2277,7 @@ function bindEvents() {
 
 restorePersistedInputs();
 bindEvents();
+refreshSettingsUi();
 drawPreviewPlaceholder();
 updateViewerControls();
 loadMaster().catch((error) => toast(error.message));
