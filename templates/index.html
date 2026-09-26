@@ -69,6 +69,15 @@
                   <option value="conservative">保守的</option>
                 </select>
               </label>
+              <label>形状タイプ
+                <select name="shape_mode">
+                  <option value="prismatic" selected>角物（平面・ポケット・穴）</option>
+                  <option value="mold">金型（表面形状・残り取り）</option>
+                </select>
+              </label>
+              <label>金型の仕上げ回数（中仕上げ除く）
+                <input type="number" name="mold_finish_passes" value="2" min="1" max="5" step="1">
+              </label>
               <details class="edm-settings fill-settings" open>
                 <summary>MCのみで算出（形状を埋める）</summary>
                 <label class="checkbox-line">

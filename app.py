@@ -17,6 +17,8 @@ from typing import Any, Iterator
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 
+import mold_mode
+
 
 BASE_DIR = Path(__file__).resolve().parent
 # 検証ハーネス等から開発DBを汚さずに起動できるよう、環境変数でDBパスを差し替え可能にする
@@ -3305,6 +3307,129 @@ def selection_candidates_summary(
     return candidates
 
 
+SHAPE_MODES = {"prismatic": "角物", "mold": "金型（表面形状）"}
+# 金型モードで工具段階の工程に置き換える角物フィーチャ（上面・外周は前工程で6面仕上げ済みとみなす）
+MOLD_REPLACED_FEATURE_PREFIXES = (
+    "face_top",
+    "side_walls",
+    "pocket_rough",
+    "floor_finish",
+    "wall_finish",
+    "chamfer_deburr",
+    "fillet_finish",
+    "corner_fillet",
+    "slot",
+)
+
+
+def mold_mode_features(
+    conn: sqlite3.Connection,
+    path: Path,
+    material_type: str,
+    max_tool_diameter: float | None,
+    use_manufacturer_conditions: bool,
+    finish_passes: int,
+) -> tuple[list[Feature], dict[str, Any]]:
+    """金型モード: 高さマップから工具段階（荒取り→残り取り→仕上げ）の工程を作る。"""
+    plan = mold_mode.plan_mold_machining(mold_mode.load_step_shape(path), max_tool_diameter)
+
+    def select_condition(diameter: float, required_depth: float, tool_shape: str) -> dict[str, Any]:
+        candidates: list[dict[str, Any]] = []
+        row = None
+        if use_manufacturer_conditions:
+            row = auto_manufacturer_condition_for(
+                conn,
+                material_type,
+                diameter,
+                required_depth,
+                "等高線",
+                max_tool_diameter,
+                max_fit_diameter_mm=diameter + 1e-6,
+                require_depth_fit=True,
+                candidates_out=candidates,
+            )
+        shape_label = "ボール相当" if tool_shape == "ball" else "ラジアス相当"
+        if row is not None:
+            feed, ap, ae = condition_params(row, catalog=True)
+            return {
+                "tool_id": None,
+                "tool_name": (
+                    f'{row["manufacturer"]} {row["series_code"]} φ{fmt_number(row["outside_diameter_mm"])} '
+                    f'{row["corner_radius_label"] or ""}'
+                ).strip(),
+                "feed": feed,
+                "ap": ap,
+                "ae": ae,
+                "effective_length": float(row["effective_length_mm"]),
+                "condition_text": catalog_condition_summary(row),
+                "selection_reason": catalog_tool_selection_reason(
+                    row, diameter, required_depth, max_tool_diameter, f"金型 φ{diameter:g}（{shape_label}）"
+                ),
+                "candidates": candidates,
+            }
+        tool = pick_tool(conn, "EM", diameter, max_tool_diameter, max_fit_diameter_mm=diameter + 1e-6)
+        cond = condition_for(conn, tool["tool_id"], material_type, "ポケット")
+        feed, ap, ae = condition_params(cond)
+        return {
+            "tool_id": tool["tool_id"],
+            "tool_name": tool["tool_name"],
+            "feed": feed,
+            "ap": ap,
+            "ae": ae,
+            "effective_length": float(tool["max_depth_mm"]),
+            "condition_text": master_condition_summary(cond),
+            "selection_reason": internal_tool_selection_reason(tool, diameter, max_tool_diameter, f"金型 φ{diameter:g}"),
+            "candidates": [],
+        }
+
+    features: list[Feature] = []
+    for op in mold_mode.build_mold_operations(plan, select_condition, finish_passes=finish_passes):
+        cond = op["cond"]
+        features.append(
+            Feature(
+                op["feature_type"],
+                op["dimensions"],
+                1,
+                cond["tool_id"],
+                cond["tool_name"],
+                "仕上げ" if "仕上げ" in op["feature_type"] else "ポケット",
+                op["minutes"] * 60,
+                op["note"],
+                cond["condition_text"],
+                path_plan_summary(op["length"], op["passes"], op["passes"] * 2, method=op["method"], extra=op["extra"]),
+                cond["selection_reason"],
+                op["reachability"],
+                feature_key=op["feature_key"],
+                selection_candidates=cond["candidates"],
+            )
+        )
+    summary = {
+        "resolution_mm": round(plan.resolution, 3),
+        "surface_area_mm2": round(plan.surface_area, 1),
+        "roughing_volume_mm3": round(plan.roughing_volume, 1),
+        "machined_floor_z": round(plan.machined_floor_z, 3),
+        "through_area_mm2": round(plan.through_area, 1),
+        "min_concave_radius": round(plan.min_concave_radius, 3) if plan.min_concave_radius else None,
+        "concave_radius_counts": plan.concave_radius_counts,
+        "finish_passes": finish_passes,
+        "tool_ladder": [
+            {
+                "diameter": stage.diameter,
+                "shape": stage.tool_shape,
+                "whole_surface": stage.whole_surface,
+                "region_area_mm2": round(stage.region_projected_area, 1),
+                "finish_area_mm2": round(stage.finish_projected_area, 1),
+                "required_depth_mm": round(stage.required_depth, 2),
+                "reason": stage.reason,
+            }
+            for stage in plan.stages
+        ],
+        "notes": plan.notes,
+        "calibration": "係数は 301_DJ30-RC6-2701（スキャナカバー）の実績NC・CAMシート（140.2h）から逆算",
+    }
+    return features, summary
+
+
 def estimate(
     path: Path,
     file_name: str,
@@ -3317,6 +3442,8 @@ def estimate(
     excluded_keys: set[str] | list[str] | None = None,
     save_history: bool = True,
     extra_payload: dict[str, Any] | None = None,
+    shape_mode: str = "prismatic",
+    mold_finish_passes: int = 2,
 ) -> dict[str, Any]:
     analysis = parse_step_file(path, blank_allowance_mm)
     bbox = analysis["bbox"]
@@ -4724,6 +4851,28 @@ def estimate(
                     )
                 )
 
+        if shape_mode == "mold":
+            try:
+                mold_features, mold_summary = mold_mode_features(
+                    conn,
+                    path,
+                    material_type,
+                    max_tool_diameter,
+                    use_manufacturer_conditions,
+                    mold_finish_passes,
+                )
+            except Exception as exc:  # noqa: BLE001 - 金型解析に失敗しても角物の見積もりは返す
+                app.logger.exception("金型モードの解析に失敗しました: %s", path.name)
+                analysis["mold"] = {"error": f"金型モードで解析できませんでした（角物で算出しています）: {exc}"}
+            else:
+                features = [
+                    feature
+                    for feature in features
+                    if not feature.feature_key.startswith(MOLD_REPLACED_FEATURE_PREFIXES)
+                ] + mold_features
+                analysis["mold"] = mold_summary
+        analysis["shape_mode"] = shape_mode if analysis.get("mold") and "error" not in analysis["mold"] else "prismatic"
+
         # 「穴埋め・加工対象外」指定されたフィーチャをMC時間・放電候補から除外する
         if excluded_set:
             kept_features: list[Feature] = []
@@ -4755,9 +4904,34 @@ def estimate(
                     kept_candidates.append(candidate)
             edm_candidates = kept_candidates
 
-        safety_feature = safety_allowance_feature(features, estimate_mode, machining_features, max_tool_diameter)
+        # 金型工程の係数は実績CAM時間から逆算済みなので、安全補正の対象から外す
+        safety_feature = safety_allowance_feature(
+            [feature for feature in features if not feature.feature_key.startswith("mold_")],
+            estimate_mode,
+            machining_features,
+            max_tool_diameter,
+        )
         if safety_feature is not None:
             features.append(safety_feature)
+        mold_sec = sum(feature.machining_sec for feature in features if feature.feature_key.startswith("mold_"))
+        if mold_sec > 0:
+            profile = SAFETY_PROFILES.get(estimate_mode, SAFETY_PROFILES["cautious"])
+            mold_correction_sec = mold_sec * float(profile["small_tool"])
+            features.append(
+                Feature(
+                    "見積安全補正（金型工程）",
+                    f'{profile["label"]}モード / 追加 {seconds_label(mold_correction_sec)}',
+                    1,
+                    None,
+                    "補正",
+                    "補正",
+                    mold_correction_sec,
+                    "金型工程の係数は実績CAM時間から逆算済みのため、小径工具・びびり回避分の率だけを加算",
+                    "-",
+                    f'金型工程 {seconds_label(mold_sec)} x 小径工具 {int(float(profile["small_tool"]) * 100)}%',
+                    "工具選定ではなく、安全側の補正です。",
+                )
+            )
 
         reachability_issues = [
             {
@@ -4788,6 +4962,9 @@ def estimate(
         if reachability_issues:
             confidence -= min(0.18, 0.04 * len(reachability_issues))
         confidence = max(0.35, min(0.9, confidence))
+        if analysis.get("shape_mode") == "mold":
+            # 金型工程の係数は実績1件からの校正なので、信頼度を控えめにする
+            confidence = min(confidence, 0.6)
 
         tool_usage: dict[str, dict[str, Any]] = {}
         for feature in features:
@@ -5047,11 +5224,19 @@ def api_analyze() -> Response:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
     path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{safe_name}"
     upload.save(path)
+    shape_mode = request.form.get("shape_mode", "prismatic")
+    if shape_mode not in SHAPE_MODES:
+        raise InputError(f"形状タイプは {' / '.join(SHAPE_MODES.values())} から選択してください。")
+    mold_finish_passes = int(
+        input_number(request.form, "mold_finish_passes", "金型の仕上げ回数", default=2, minimum=1, maximum=5, integer=True)
+    )
     estimate_args = dict(
         use_manufacturer_conditions=use_manufacturer_conditions,
         estimate_mode=estimate_mode,
         edm_policy=edm_policy,
         excluded_keys=excluded_keys,
+        shape_mode=shape_mode,
+        mold_finish_passes=mold_finish_passes,
     )
     try:
         analyze_path = path

@@ -1464,8 +1464,22 @@ function renderResult(result) {
   const edmPolicyRow = edmPolicy.enabled
     ? `<dt>放電置き換え</dt><dd>幅≤${edmPolicy.max_width_mm}mm かつ 深さ≥${edmPolicy.min_depth_mm}mm / 深さ幅比≥${edmPolicy.min_aspect}${edmTaperLabel} / 候補 ${edmCandidates.length}件</dd>`
     : `<dt>放電置き換え</dt><dd>判定オフ</dd>`;
+  const mold = result.analysis.mold;
+  let moldRows = "";
+  if (mold && mold.error) {
+    moldRows = `<dt>形状タイプ</dt><dd>${esc(mold.error)}</dd>`;
+  } else if (mold) {
+    const ladder = (mold.tool_ladder || []).map((s) => `φ${s.diameter}`).join(" → ");
+    moldRows = `
+      <dt>形状タイプ</dt><dd>金型（表面形状・残り取り） / 仕上げ ${esc(mold.finish_passes)}回</dd>
+      <dt>工具段階</dt><dd>${esc(ladder)}</dd>
+      <dt>最小凹R</dt><dd>${mold.min_concave_radius ? `R${esc(mold.min_concave_radius)}` : "-"} / 加工面積 ${Math.round(mold.surface_area_mm2).toLocaleString()} mm2</dd>
+      <dt>金型係数</dt><dd>${esc(mold.calibration)}${(mold.notes || []).length ? ` / ${esc(mold.notes.join(" / "))}` : ""}</dd>
+    `;
+  }
   $("#analysisInfo").innerHTML = `
     <dt>ファイル</dt><dd>${esc(result.file_name || "-")}</dd>
+    ${moldRows}
     <dt>解析方式</dt><dd>${esc(result.analysis.parser)}</dd>
     <dt>条件ソース</dt><dd>${esc(result.condition_source || "-")}</dd>
     <dt>見積安全率</dt><dd>${esc(result.estimate_mode_label || "-")}</dd>
