@@ -5,8 +5,11 @@ const state = {
   previewView: { yaw: -0.68, pitch: -0.46, zoom: 1, dragging: false, lastX: 0, lastY: 0, preset: "iso" },
   cadPreview: {
     mode: "fallback", renderer: null, scene: null, camera: null, group: null, baseRadius: 1, occt: null,
-    displayMode: "shaded", toolpathGroup: null, showPaths: true, originalGroup: null, filledGroup: null,
-    fillBodiesGroup: null, modelView: "original", fillToken: null, box: null, renderQueued: false,
+    displayMode: "shaded", toolpathGroup: null, originalToolpathGroup: null, showPaths: true, originalGroup: null,
+    // 埋め後の表示は「元モデル＋埋めた部分（fillBodiesGroup）」で描く。modelView: original / filled / overlay / split
+    fillBodiesGroup: null, plugMaterial: null, modelView: "original", fillToken: null, box: null, renderQueued: false,
+    // 3D表示の準備ができたファイルの読込番号（解析結果が先に届いたとき、準備完了後に埋めモデルを読み込むため）
+    readyLoadId: 0, pendingFillToken: null,
     // 注視点・方位角・仰角・平行投影の半高さ（mm）。視点はカメラ側を動かし、モデルは動かさない
     cam: { target: null, azimuth: -Math.PI / 4, elevation: Math.atan(1 / Math.SQRT2), halfHeight: 100, radius: 100, preset: "iso" },
   },
@@ -97,7 +100,8 @@ function toast(message) {
   box.textContent = message;
   box.classList.remove("hidden");
   window.clearTimeout(toast.timer);
-  toast.timer = window.setTimeout(() => box.classList.add("hidden"), 3200);
+  // 長い説明は読み終わるまで出しておく
+  toast.timer = window.setTimeout(() => box.classList.add("hidden"), Math.min(12000, Math.max(3200, message.length * 90)));
 }
 
 async function jsonFetch(url, options = {}) {
@@ -114,6 +118,13 @@ async function jsonFetch(url, options = {}) {
     // HTMLのエラーページなどJSON以外が返った場合
   }
   if (!response.ok) {
+    if (!data?.error && [502, 503, 504].includes(response.status)) {
+      // 公開サーバー（無料プラン）はメモリ・処理時間の上限が小さく、大きなモデルで落ちることがある
+      throw new Error(
+        `サーバーが応答できませんでした（HTTP ${response.status}）。モデルが大きい・金型モード・形状の埋めなどで`
+        + "サーバーの処理上限を超えた可能性があります。少し待って再実行するか、社内サーバー（ローカル）で解析してください。",
+      );
+    }
     throw new Error(data?.error || `処理に失敗しました（HTTP ${response.status}）。`);
   }
   if (data === null) throw new Error("サーバーの応答を読み取れませんでした。");
@@ -459,9 +470,35 @@ function rotateCadView(dx, dy) {
   requestCadRender();
 }
 
+// 並べて比較では画面を2つの視野に分ける（横長は左右、縦長は上下）
+function isSplitView() {
+  const cp = state.cadPreview;
+  return cp.modelView === "split" && Boolean(cp.fillBodiesGroup);
+}
+
+function splitIsVertical(width, height) {
+  return width < 560 && height > width * 0.55;
+}
+
+// カーソル位置（またはキャンバス中央）の視野の矩形。並べて比較のときは片側の視野を返す
+function cadViewportRect(clientX, clientY) {
+  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  if (!isSplitView()) return rect;
+  const x = clientX ?? rect.left + rect.width / 2;
+  const y = clientY ?? rect.top + rect.height / 2;
+  if (splitIsVertical(rect.width, rect.height)) {
+    const half = rect.height / 2;
+    const top = y - rect.top < half ? rect.top : rect.top + half;
+    return { left: rect.left, top, width: rect.width, height: half };
+  }
+  const half = rect.width / 2;
+  const left = x - rect.left < half ? rect.left : rect.left + half;
+  return { left, top: rect.top, width: half, height: rect.height };
+}
+
 function panCadView(dx, dy) {
   const cp = state.cadPreview;
-  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  const rect = cadViewportRect();
   if (!cp.cam.target || rect.height <= 0) return;
   const worldPerPixel = (2 * cp.cam.halfHeight) / rect.height;
   const { right, up } = cameraAxes(cp.cam);
@@ -471,7 +508,7 @@ function panCadView(dx, dy) {
 
 function zoomCadViewAt(factor, clientX, clientY) {
   const cp = state.cadPreview;
-  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  const rect = cadViewportRect(clientX, clientY);
   if (!cp.cam.target || rect.width <= 0 || rect.height <= 0) return;
   const oldHalf = cp.cam.halfHeight;
   const newHalf = Math.max(cp.cam.radius * 0.002, Math.min(cp.cam.radius * 20, oldHalf / factor));
@@ -605,7 +642,11 @@ function resetResultForNewFile() {
   state.lastResult = null;
   state.lastSignature = null;
   state.highlightedKey = null;
+  state.resultFromHistory = false;
+  state.cadPreview.pendingFillToken = null;
   state.excluded.clear();
+  setFillViewNote("");
+  $("#splitLabels")?.classList.add("hidden");
   $("#resultPanel")?.classList.add("hidden");
   $("#jumpToResult")?.classList.add("hidden");
   const badge = $("#totalBadge");
@@ -730,7 +771,7 @@ function frameBox(center, half, margin, minHalfHeight = 0) {
       }
     }
   }
-  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  const rect = cadViewportRect();
   const aspect = rect.width > 0 && rect.height > 0 ? rect.width / rect.height : 1.6;
   cp.cam.target = center.clone();
   cp.cam.halfHeight = Math.max(halfH, halfW / aspect, cp.cam.radius * 0.02, minHalfHeight) * margin;
@@ -742,7 +783,7 @@ function frameHighlightedFeature() {
   if (!window.THREE || !cp.toolpathGroup || state.highlightedKey === null) return;
   const THREE = window.THREE;
   const box = new THREE.Box3();
-  cp.toolpathGroup.children.forEach((object) => {
+  [...cp.toolpathGroup.children, ...(cp.originalToolpathGroup?.children || [])].forEach((object) => {
     if (object.userData.featureKey === state.highlightedKey) box.expandByObject(object);
   });
   if (box.isEmpty()) return;
@@ -773,9 +814,9 @@ function applyCadDisplayMode(mode) {
       }
     });
   }
-  // 比較表示では元モデルを半透明にして、内側に埋めた部分（オレンジ）も見えるようにする
+  // 重ね表示では元モデルを半透明にして、内側に埋めた部分（オレンジ）も見えるようにする
   const cp = state.cadPreview;
-  if (cp.originalGroup && cp.modelView === "compare" && mode === "shaded") {
+  if (cp.originalGroup && cp.modelView === "overlay" && cp.fillBodiesGroup && mode === "shaded") {
     cp.originalGroup.traverse((object) => {
       if (!object.isMesh) return;
       object.material.transparent = true;
@@ -895,69 +936,152 @@ function readStepMeshes(buffer) {
   return result;
 }
 
-// 埋めたモデルと「埋めた部分」を読み込み、元モデルと同じ座標系で重ねる
+/// 3D表示が今のファイルで準備できているか（別ファイルの読込中・簡易表示のときは false）
+function cadPreviewReady() {
+  const cp = state.cadPreview;
+  return Boolean(cp.group && cp.occt && cp.mode === "cad" && cp.readyLoadId === state.previewLoadId);
+}
+
+// 埋めた部分（柱）の色。埋め後はモデルと同じ色、重ね・並べるでは目立つオレンジ
+const PLUG_COLORS = { highlight: 0xf08a24 };
+
+function removeFillModels() {
+  const cp = state.cadPreview;
+  if (cp.fillBodiesGroup) cp.group?.remove(cp.fillBodiesGroup);
+  cp.fillBodiesGroup = null;
+  cp.fillToken = null;
+  $("#modelViewButtons")?.classList.add("hidden");
+}
+
+// 埋めた部分（柱）だけを読み込み、元モデルに重ねる。埋め後モデル全体（数MBになる）は
+// ブラウザでメッシュ化せず、「元モデル＋埋めた部分」で埋め後の見た目を作る（スマホでも軽い）。
 async function loadFillModels(token) {
   const cp = state.cadPreview;
-  $("#modelViewButtons")?.classList.add("hidden");
-  if (cp.filledGroup) cp.group?.remove(cp.filledGroup);
-  if (cp.fillBodiesGroup) cp.group?.remove(cp.fillBodiesGroup);
-  cp.filledGroup = null;
-  cp.fillBodiesGroup = null;
-  cp.fillToken = token || null;
-  if (!token || !cp.group || !cp.occt || cp.mode !== "cad") {
+  removeFillModels();
+  cp.pendingFillToken = null;
+  if (!token) {
+    setModelView("original");
+    setFillViewNote("");
+    return;
+  }
+  if (!cadPreviewReady()) {
+    if (cp.failedLoadId === state.previewLoadId || !state.preview) {
+      setFillViewNote("3D表示が簡易表示のため、埋めたモデルを3Dで表示できません。「埋め後STEPをダウンロード」からCADで確認できます。", "warn");
+    } else {
+      // 3D表示の準備中。準備ができたら読み込む
+      cp.pendingFillToken = token;
+      setFillViewNote("3D表示の準備ができたら、埋めたモデルを表示します…");
+    }
     setModelView("original");
     return;
   }
-  const fetchBuffer = async (kind) => {
-    const response = await fetch(`/api/fill-models/${encodeURIComponent(token)}/${kind}`);
-    if (!response.ok) throw new Error("埋めたモデルを取得できませんでした（保存期間切れの可能性があります）。");
-    return response.arrayBuffer();
-  };
+  cp.fillToken = token;
   setViewerLoading("埋めたモデルを読み込んでいます…");
-  let filledBuffer;
-  let bodiesBuffer;
+  let buffer;
   try {
-    [filledBuffer, bodiesBuffer] = await Promise.all([fetchBuffer("filled"), fetchBuffer("bodies")]);
+    const response = await fetch(`/api/fill-models/${encodeURIComponent(token)}/bodies`);
+    if (!response.ok) {
+      throw new Error(response.status === 404
+        ? "埋めたモデルの保存期間が過ぎたため3D表示できません。再解析すると作り直します。"
+        : `埋めたモデルを取得できませんでした（HTTP ${response.status}）。`);
+    }
+    buffer = await response.arrayBuffer();
+  } catch (error) {
+    if (cp.fillToken === token) setFillViewNote(error.message, "warn");
+    throw error;
   } finally {
     setViewerLoading(null);
   }
-  if (cp.fillToken !== token) return; // 読み込み中に別の結果へ切り替わった
+  if (cp.fillToken !== token || !cadPreviewReady()) return; // 読み込み中に別の結果・別ファイルへ切り替わった
   const THREE = window.THREE;
-  const filledGroup = meshGroupFromOcct(readStepMeshes(filledBuffer));
-  const bodiesGroup = meshGroupFromOcct(readStepMeshes(bodiesBuffer));
+  let bodiesGroup;
+  try {
+    bodiesGroup = meshGroupFromOcct(readStepMeshes(buffer));
+  } catch (error) {
+    setFillViewNote(`埋めた部分を3D表示できませんでした: ${error.message}`, "warn");
+    throw error;
+  }
+  if (!cp.plugMaterial) {
+    cp.plugMaterial = new THREE.MeshStandardMaterial({
+      color: PLUG_COLORS.highlight, roughness: 0.45, metalness: 0.05, side: THREE.DoubleSide,
+      // 穴の壁と同一面になるため、手前に描いてちらつきを防ぐ
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+    });
+  }
   bodiesGroup.traverse((object) => {
     object.userData.overlay = true; // 表示モード（ワイヤ/透過）の切替対象外
-    if (object.isMesh) {
-      object.material = new THREE.MeshStandardMaterial({
-        color: 0xf08a24, roughness: 0.5, metalness: 0.05, transparent: true, opacity: 0.88, side: THREE.DoubleSide,
-        // 穴の壁と同一面になるため、手前に描いてちらつきを防ぐ
-        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
-      });
-    }
-    if (object.isLineSegments) object.material = new THREE.LineBasicMaterial({ color: 0x9a4a06, transparent: true, opacity: 0.7 });
+    if (object.isMesh) object.material = cp.plugMaterial;
+    if (object.isLineSegments) object.material = new THREE.LineBasicMaterial({ color: 0x9a4a06, transparent: true, opacity: 0.55 });
   });
-  cp.group.add(filledGroup);
   cp.group.add(bodiesGroup);
-  cp.filledGroup = filledGroup;
   cp.fillBodiesGroup = bodiesGroup;
-  applyCadDisplayMode(cp.displayMode);
   $("#modelViewButtons")?.classList.remove("hidden");
-  setModelView("compare");
+  setFillViewNote("");
+  // 並べて比較を既定にする（元と埋め後を同じ視点で並べる）。形状を比べやすいよう工具パスは消しておく
+  if (cp.showPaths) {
+    cp.showPaths = false;
+    $("[data-view-toggle='paths']")?.classList.remove("active");
+  }
+  setModelView("split");
+  fitPreview();
+}
+
+function setFillViewNote(message, tone = "") {
+  const note = $("#fillViewNote");
+  if (!note) return;
+  note.textContent = message || "";
+  note.className = `fill-view-note${tone ? ` ${tone}` : ""}`;
+  note.classList.toggle("hidden", !message);
+}
+
+// 表示中の視野（元 / 埋め後）に合わせて、埋めた部分・工具パスの表示を切り替える
+function applyModelVisibility(side) {
+  const cp = state.cadPreview;
+  const hasFill = Boolean(cp.fillBodiesGroup);
+  const showFill = hasFill && side !== "original";
+  if (cp.originalGroup) cp.originalGroup.visible = true;
+  if (cp.fillBodiesGroup) cp.fillBodiesGroup.visible = showFill;
+  if (cp.plugMaterial) {
+    // 埋め後だけを見るときはモデルと同じ色（buildCadMesh の既定色）にして、埋まった見た目にする
+    if (side === "filled" && cp.modelView === "filled") cp.plugMaterial.color.setRGB(0.64, 0.7, 0.72);
+    else cp.plugMaterial.color.setHex(PLUG_COLORS.highlight);
+  }
+  // 工具パス: 元の視野には元モデルの解析結果、埋め後の視野には埋め後の解析結果を描く
+  const hasOriginalPaths = Boolean(cp.originalToolpathGroup);
+  if (cp.toolpathGroup) cp.toolpathGroup.visible = cp.showPaths && (!hasFill || !hasOriginalPaths || side !== "original");
+  if (cp.originalToolpathGroup) cp.originalToolpathGroup.visible = cp.showPaths && hasFill && side === "original";
 }
 
 function setModelView(view) {
   const cp = state.cadPreview;
-  const hasFill = Boolean(cp.filledGroup && cp.fillBodiesGroup);
-  const next = hasFill ? view : "original";
+  const hasFill = Boolean(cp.fillBodiesGroup);
+  const next = hasFill && ["original", "filled", "overlay", "split"].includes(view) ? view : "original";
+  const wasSplit = isSplitView();
   cp.modelView = next;
-  if (cp.originalGroup) cp.originalGroup.visible = next !== "filled";
-  if (cp.filledGroup) cp.filledGroup.visible = next === "filled";
-  if (cp.fillBodiesGroup) cp.fillBodiesGroup.visible = next === "compare";
+  applyModelVisibility(next === "split" ? "filled" : next);
   $$("[data-model-view]").forEach((button) => button.classList.toggle("active", button.dataset.modelView === next));
+  updateSplitLabels();
   applyCadDisplayMode(cp.displayMode);
+  // 並べる／1画面を切り替えると視野の縦横比が変わるので、全体が収まるように合わせ直す
+  if (wasSplit !== isSplitView() && cp.mode === "cad" && cp.box) fitPreview();
 }
 
-async function loadDetailedCadPreview(buffer) {
+// 並べて比較の見出し（元モデル / 埋め後）と合計時間
+function updateSplitLabels() {
+  const labels = $("#splitLabels");
+  if (!labels) return;
+  const split = isSplitView();
+  labels.classList.toggle("hidden", !split);
+  if (!split) return;
+  const rect = $("#cadPreviewCanvas").getBoundingClientRect();
+  labels.classList.toggle("vertical", splitIsVertical(rect.width, rect.height));
+  const result = state.lastResult;
+  const original = result?.fill?.original;
+  $("#splitLabelOriginal").textContent = `元モデル${original ? `  ${original.time_label}` : ""}`;
+  $("#splitLabelFilled").textContent = `埋め後（MCのみ）${result ? `  ${result.time_label || secLabel(result.breakdown.total_sec)}` : ""}`;
+}
+
+async function loadDetailedCadPreview(buffer, loadId = state.previewLoadId) {
   if (!window.occtimportjs) throw new Error("OpenCascade WASMを読み込めませんでした。");
   initCadPreview();
 
@@ -984,11 +1108,12 @@ async function loadDetailedCadPreview(buffer) {
   const cp = state.cadPreview;
   cp.group = group;
   cp.originalGroup = originalGroup;
-  cp.filledGroup = null;
   cp.fillBodiesGroup = null;
   cp.fillToken = null;
   cp.toolpathGroup = null;
+  cp.originalToolpathGroup = null;
   cp.box = size;
+  cp.readyLoadId = loadId;
   // STEPテキストの座標点は配置用の点も含み外形が大きく出るため、メッシュの外形で表示し直す
   if (state.preview) {
     $("#previewStatus").textContent = `${(state.preview.fileSize / 1024).toFixed(0)} KB ／ 外形 ${numberLabel(size.x)} × ${numberLabel(size.y)} × ${numberLabel(size.z)} mm`;
@@ -1000,7 +1125,12 @@ async function loadDetailedCadPreview(buffer) {
   applyCadDisplayMode(cp.displayMode);
   setPreviewMode("cad");
   applyViewPreset(cp.cam.preset && cp.cam.preset !== "free" ? cp.cam.preset : "iso");
-  if (state.lastResult) renderToolpaths(state.lastResult);
+  if (state.lastResult) {
+    // 解析結果が3Dの準備より先に届いていた場合は、ここで工具パスと埋めたモデルを載せる
+    renderToolpaths(state.lastResult);
+    const token = cp.pendingFillToken || state.lastResult.fill?.token || null;
+    if (token) loadFillModels(token).catch((error) => toast(error.message));
+  }
 }
 
 function renderFillPanel(result) {
@@ -1012,17 +1142,27 @@ function renderFillPanel(result) {
   const rows = fill.items || [];
   const badge = $("#fillBadge");
   const summary = $("#fillSummary");
+  const notes = [];
+  if (fill.mode === "feature" && fill.message) notes.push({ text: fill.message, tone: "info" });
+  (fill.warnings || []).forEach((text) => notes.push({ text, tone: "warn" }));
+  $("#fillNotes").innerHTML = notes.map((note) => `<p class="fill-message ${note.tone}">${esc(note.text)}</p>`).join("");
+  const download = $("#fillDownload");
+  if (download) {
+    download.classList.toggle("hidden", !fill.token);
+    if (fill.token) download.href = `/api/fill-models/${encodeURIComponent(fill.token)}/filled`;
+  }
   if (fill.error || !rows.length) {
     badge.textContent = fill.error ? "埋め不可" : "対象なし";
     badge.className = "fill-badge warn";
-    summary.innerHTML = `<p class="fill-message">${esc(fill.error || fill.message || "")}</p>`;
+    summary.innerHTML = `<p class="fill-message warn">${esc(fill.error || fill.message || "")}</p>`;
+    $("#fillCompare").innerHTML = "";
     $("#processCards").innerHTML = "";
     $("#ncHoleSection").classList.add("hidden");
     $("#wireSection").classList.add("hidden");
     return;
   }
   badge.className = "fill-badge";
-  badge.textContent = `ドリル穴 ${fill.drill_count}箇所 / ワイヤ形状 ${fill.wire_count}箇所`;
+  badge.textContent = `ドリル穴 ${fill.drill_count}箇所 / ワイヤ形状 ${fill.wire_count}箇所${fill.mode === "feature" ? "（形状は埋めず除外）" : ""}`;
   const original = Number(fill.original_total_sec) || 0;
   const current = Number(result.breakdown.total_sec) || 0;
   const diff = current - original;
@@ -1033,7 +1173,122 @@ function renderFillPanel(result) {
     <div><span>差</span><strong class="${diff <= 0 ? "minus" : "plus"}">${diff <= 0 ? "-" : "+"}${secLabel(Math.abs(diff))}</strong></div>
     <div><span>ワイヤ切断面積 合計</span><strong>${Number(fill.wire_cut_area_mm2 || 0).toLocaleString()} mm²</strong></div>
   `;
+  renderFillCompare(result);
   renderProcessPlans(result, fill.processes || {});
+}
+
+function signedSecLabel(sec) {
+  const value = Number(sec) || 0;
+  if (Math.abs(value) < 0.5) return "±0";
+  return `${value < 0 ? "-" : "+"}${secLabel(Math.abs(value))}`;
+}
+
+// フィーチャを識別子ごとに合算する（同じ識別子の行が複数あっても1行で比べる）
+function featureTotals(features) {
+  const totals = new Map();
+  for (const feature of features || []) {
+    // 識別子の無い行（見積安全補正など）は寸法の文言が時間で変わるので、種別でまとめる
+    const key = feature.feature_key || `type:${feature.feature_type}`;
+    const entry = totals.get(key) || {
+      key, featureKey: feature.feature_key || null, type: feature.feature_type, dimensions: feature.dimensions,
+      quantity: 0, sec: 0,
+    };
+    entry.quantity += Number(feature.quantity) || 0;
+    entry.sec += Number(feature.machining_sec) || 0;
+    totals.set(key, entry);
+  }
+  return totals;
+}
+
+const FILL_DIFF_LABELS = { removed: "なくなった", decreased: "減った", increased: "増えた", added: "新たに出た", same: "変化なし" };
+
+// 元モデルと埋め後で、加工内容（フィーチャ）ごとの時間を比べる
+function fillFeatureDiff(originalFeatures, currentFeatures) {
+  const before = featureTotals(originalFeatures);
+  const after = featureTotals(currentFeatures);
+  const rows = [];
+  for (const [key, a] of before) {
+    const b = after.get(key);
+    const delta = (b ? b.sec : 0) - a.sec;
+    const status = !b ? "removed" : Math.abs(delta) < 1 && a.quantity === b.quantity ? "same" : delta < 0 ? "decreased" : "increased";
+    rows.push({ key, featureKey: a.featureKey, type: a.type, before: a, after: b || null, delta, status });
+  }
+  for (const [key, b] of after) {
+    if (!before.has(key)) rows.push({ key, featureKey: b.featureKey, type: b.type, before: null, after: b, delta: b.sec, status: "added" });
+  }
+  const order = { removed: 0, decreased: 1, increased: 2, added: 3, same: 4 };
+  return rows.sort((x, y) => order[x.status] - order[y.status] || Math.abs(y.delta) - Math.abs(x.delta));
+}
+
+function renderFillCompare(result) {
+  const box = $("#fillCompare");
+  const original = result.fill?.original;
+  if (!box) return;
+  if (!original) {
+    box.innerHTML = "";
+    return;
+  }
+  const a = original.breakdown || {};
+  const b = result.breakdown || {};
+  const breakdownRows = [
+    ["合計", "total_sec"],
+    ["段取り", "setup_sec"],
+    ["加工", "machining_sec"],
+    ["工具交換", "tool_change_sec"],
+    ["早送り", "rapid_sec"],
+    ["放電（参考・合計外）", "edm_reference_sec"],
+  ].map(([label, key]) => {
+    const delta = (Number(b[key]) || 0) - (Number(a[key]) || 0);
+    return `<tr class="${key === "total_sec" ? "total-row" : ""}">
+      <th>${label}</th><td>${secLabel(a[key])}</td><td>${secLabel(b[key])}</td>
+      <td class="${delta < -0.5 ? "minus" : delta > 0.5 ? "plus" : ""}">${signedSecLabel(delta)}</td>
+    </tr>`;
+  }).join("");
+  const diffRows = fillFeatureDiff(original.features, result.features);
+  const changed = diffRows.filter((row) => row.status !== "same");
+  const showAll = Boolean(state.fillCompareShowAll);
+  const visible = showAll ? diffRows : changed;
+  const cell = (entry) => entry
+    ? `<span class="qty">${esc(entry.quantity)}件</span> ${secLabel(entry.sec)}`
+    : `<span class="muted">-</span>`;
+  const featureRows = visible.map((row) => {
+    const dims = row.before && row.after && row.before.dimensions !== row.after.dimensions
+      ? `${esc(row.before.dimensions)}<br><span class="dim-after">→ ${esc(row.after.dimensions)}</span>`
+      : esc((row.after || row.before).dimensions);
+    return `<tr class="diff-${row.status}" ${row.featureKey ? `data-feature-key="${esc(row.featureKey)}"` : ""}>
+      <td><span class="diff-badge ${row.status}">${FILL_DIFF_LABELS[row.status]}</span></td>
+      <td>${esc(row.type)}</td>
+      <td class="dims-cell">${dims}</td>
+      <td>${cell(row.before)}</td>
+      <td>${cell(row.after)}</td>
+      <td class="${row.delta < -0.5 ? "minus" : row.delta > 0.5 ? "plus" : ""}">${signedSecLabel(row.delta)}</td>
+    </tr>`;
+  }).join("");
+  box.innerHTML = `
+    <div class="compare-grid">
+      <div class="compare-block">
+        <h4>時間の比較</h4>
+        <div class="table-wrap">
+          <table class="compare-table">
+            <thead><tr><th></th><th>元モデル</th><th>MCのみ</th><th>差</th></tr></thead>
+            <tbody>${breakdownRows}</tbody>
+          </table>
+        </div>
+      </div>
+      <div class="compare-block wide">
+        <h4>加工内容の変化 <span class="process-meta">変化 ${changed.length}件 / 全 ${diffRows.length}件</span>
+          <button type="button" class="link-btn" data-fill-compare-toggle>${showAll ? "変化した行だけ表示" : "変化なしも表示"}</button>
+        </h4>
+        <p class="edm-note">埋めたことで消えた・変わった加工です。行をクリックすると3Dで工具パスを強調します（なくなった加工は「元」の視野に表示）。埋めた穴と交わる溝などは、形状が変わるため一緒に変化することがあります。</p>
+        <div class="table-wrap">
+          <table class="compare-table features">
+            <thead><tr><th>変化</th><th>種別</th><th>寸法</th><th>元モデル</th><th>MCのみ</th><th>差</th></tr></thead>
+            <tbody>${featureRows || `<tr><td colspan="6" class="empty-row">加工内容の変化はありません。</td></tr>`}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function processTimeLabel(sec) {
@@ -1122,15 +1377,43 @@ function renderCadScene() {
   // 平行投影なので、注視点をずらしても形状が切れないよう奥行きを広めに取る
   camera.near = -reach * 2;
   camera.far = reach * 4;
-  const aspect = width / height;
-  camera.left = -cam.halfHeight * aspect;
-  camera.right = cam.halfHeight * aspect;
-  camera.top = cam.halfHeight;
-  camera.bottom = -cam.halfHeight;
-  camera.lookAt(cam.target);
-  camera.updateProjectionMatrix();
+  const setAspect = (aspect) => {
+    camera.left = -cam.halfHeight * aspect;
+    camera.right = cam.halfHeight * aspect;
+    camera.top = cam.halfHeight;
+    camera.bottom = -cam.halfHeight;
+    camera.lookAt(cam.target);
+    camera.updateProjectionMatrix();
+  };
   group.rotation.set(0, 0, 0);
-  renderer.render(scene, camera);
+  if (isSplitView()) {
+    // 並べて比較: 同じカメラで、元モデルと埋め後を別々の視野に描く（視点は常に連動）
+    const vertical = splitIsVertical(width, height);
+    const views = vertical
+      ? [
+          { side: "original", x: 0, y: Math.ceil(height / 2), w: width, h: Math.floor(height / 2) },
+          { side: "filled", x: 0, y: 0, w: width, h: Math.ceil(height / 2) },
+        ]
+      : [
+          { side: "original", x: 0, y: 0, w: Math.floor(width / 2), h: height },
+          { side: "filled", x: Math.floor(width / 2), y: 0, w: width - Math.floor(width / 2), h: height },
+        ];
+    renderer.setScissorTest(true);
+    for (const view of views) {
+      applyModelVisibility(view.side);
+      setAspect(view.w / Math.max(1, view.h));
+      renderer.setViewport(view.x, view.y, view.w, view.h);
+      renderer.setScissor(view.x, view.y, view.w, view.h);
+      renderer.render(scene, camera);
+    }
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, width, height);
+    applyModelVisibility("filled");
+    updateSplitLabels();
+  } else {
+    setAspect(width / height);
+    renderer.render(scene, camera);
+  }
   drawAxisTriad();
 }
 
@@ -1148,7 +1431,29 @@ const TOOLPATH_COLORS = {
 function clearToolpaths() {
   const cp = state.cadPreview;
   if (cp.toolpathGroup && cp.group) cp.group.remove(cp.toolpathGroup);
+  if (cp.originalToolpathGroup && cp.group) cp.group.remove(cp.originalToolpathGroup);
   cp.toolpathGroup = null;
+  cp.originalToolpathGroup = null;
+}
+
+// 解析結果の工具パス一式を three.js のグループにする
+function buildToolpathGroup(overlays, edmCandidates) {
+  const THREE = window.THREE;
+  const toolpathGroup = new THREE.Group();
+  toolpathGroup.userData.overlay = true;
+  const edmKeys = new Set((edmCandidates || []).map((c) => c.feature_key).filter(Boolean));
+  for (const o of overlays) {
+    const excluded = state.excluded.has(o.key);
+    const isEdm = edmKeys.has(o.key);
+    const color = excluded ? 0x9ca3af : isEdm ? 0xdc2626 : TOOLPATH_COLORS[o.kind] || 0x2563eb;
+    for (const object of buildOverlayObjects(o, color, isEdm && !excluded, excluded)) {
+      object.userData.featureKey = o.key;
+      object.userData.baseOpacity = object.material.opacity;
+      object.userData.baseColor = object.material.color.getHex();
+      toolpathGroup.add(object);
+    }
+  }
+  return toolpathGroup;
 }
 
 function toolpathLine(points, color, dashed) {
@@ -1265,41 +1570,37 @@ function renderToolpaths(result) {
   const legend = $("#pathLegend");
   const overlays = result?.analysis?.toolpath_overlays || [];
   if (legend) legend.classList.toggle("hidden", overlays.length === 0);
-  if (!window.THREE || !cp.group) return;
+  // 解析結果が別ファイルのもの（履歴表示・読込中）なら、今の3Dモデルには載せない
+  if (!window.THREE || !cp.group || !cadPreviewReady() || state.resultFromHistory) {
+    clearToolpaths();
+    return;
+  }
   clearToolpaths();
   if (!overlays.length) {
     renderCurrentPreview();
     return;
   }
-  const THREE = window.THREE;
-  const toolpathGroup = new THREE.Group();
-  toolpathGroup.userData.overlay = true;
-  const edmKeys = new Set((result.edm_candidates || []).map((c) => c.feature_key).filter(Boolean));
-  for (const o of overlays) {
-    const excluded = state.excluded.has(o.key);
-    const isEdm = edmKeys.has(o.key);
-    const color = excluded ? 0x9ca3af : isEdm ? 0xdc2626 : TOOLPATH_COLORS[o.kind] || 0x2563eb;
-    for (const object of buildOverlayObjects(o, color, isEdm && !excluded, excluded)) {
-      object.userData.featureKey = o.key;
-      object.userData.baseOpacity = object.material.opacity;
-      object.userData.baseColor = object.material.color.getHex();
-      toolpathGroup.add(object);
-    }
+  cp.toolpathGroup = buildToolpathGroup(overlays, result.edm_candidates);
+  cp.group.add(cp.toolpathGroup);
+  // 埋めて解析したときは、元モデルの工具パスも作っておき「元」の視野に描く
+  const original = result.fill?.original;
+  if (original?.toolpath_overlays?.length) {
+    cp.originalToolpathGroup = buildToolpathGroup(original.toolpath_overlays, original.edm_candidates);
+    cp.group.add(cp.originalToolpathGroup);
   }
-  cp.toolpathGroup = toolpathGroup;
-  toolpathGroup.visible = cp.showPaths;
-  cp.group.add(toolpathGroup);
+  applyModelVisibility(cp.modelView === "split" ? "filled" : cp.modelView);
   applyToolpathHighlight();
   renderCurrentPreview();
 }
 
 // 選択中フィーチャのパスだけを強調し、他は薄く表示する
 function applyToolpathHighlight() {
-  const group = state.cadPreview.toolpathGroup;
+  const cp = state.cadPreview;
   const key = state.highlightedKey;
-  if (!group) return false;
+  if (!cp.toolpathGroup) return false;
   let matched = false;
-  group.children.forEach((object) => {
+  const objects = [...cp.toolpathGroup.children, ...(cp.originalToolpathGroup?.children || [])];
+  objects.forEach((object) => {
     const isTarget = key !== null && object.userData.featureKey === key;
     if (isTarget) matched = true;
     const material = object.material;
@@ -1325,7 +1626,7 @@ function setHighlightedFeature(key) {
     } else {
       if (!state.cadPreview.showPaths) {
         state.cadPreview.showPaths = true;
-        state.cadPreview.toolpathGroup.visible = true;
+        applyModelVisibility(state.cadPreview.modelView === "split" ? "filled" : state.cadPreview.modelView);
         $("[data-view-toggle='paths']")?.classList.add("active");
       }
       frameHighlightedFeature();
@@ -1568,16 +1869,20 @@ async function previewFile(file) {
     if (loadId !== state.previewLoadId) return;
     renderStepPreview(parseStepPreview(text, file));
     try {
-      await loadDetailedCadPreview(buffer);
+      await loadDetailedCadPreview(buffer, loadId);
       if (loadId !== state.previewLoadId) return;
       $("#previewBadge").className = "preview-badge ready";
       $("#previewBadge").textContent = "3D表示";
     } catch (error) {
+      if (loadId !== state.previewLoadId) return;
+      state.cadPreview.failedLoadId = loadId;
       setPreviewMode("fallback");
       renderCurrentPreview();
       $("#previewBadge").className = "preview-badge warn";
       $("#previewBadge").textContent = "簡易表示";
       $("#previewStatus").textContent += ` ／ 詳細3Dに失敗したため簡易表示: ${error.message}`;
+      // 解析結果が先に届いていて埋めたモデルの表示を待っていた場合は、表示できない理由を出す
+      if (state.cadPreview.pendingFillToken) loadFillModels(state.cadPreview.pendingFillToken).catch(() => {});
     }
   } finally {
     if (loadId === state.previewLoadId) setViewerLoading(null);
@@ -1841,8 +2146,9 @@ function candidateComparison(candidates) {
   `;
 }
 
-function renderResult(result) {
+function renderResult(result, options = {}) {
   state.lastResult = result;
+  state.resultFromHistory = Boolean(options.fromHistory);
   state.highlightedKey = null;
   $("#resultPanel").classList.remove("hidden");
   $("#totalBadge").classList.remove("muted");
@@ -1967,9 +2273,24 @@ function renderResult(result) {
   renderToolpaths(result);
   renderFillPanel(result);
   refreshAnalyzeButton();
+  const cp = state.cadPreview;
+  if (state.resultFromHistory) {
+    // 履歴の結果は今の3Dモデルと別ファイルのことがあるので、埋めたモデルは重ねない
+    removeFillModels();
+    setModelView("original");
+    setFillViewNote(
+      result.fill?.token
+        ? "履歴の結果のため、3Dでの比較は表示していません。ファイルを読み込んで再解析すると、元と埋め後を並べて比較できます。"
+        : "",
+      "info",
+    );
+    return;
+  }
   const fillToken = result.fill?.token || null;
-  if (fillToken !== state.cadPreview.fillToken || !state.cadPreview.filledGroup) {
+  if (fillToken !== cp.fillToken || !cp.fillBodiesGroup) {
     loadFillModels(fillToken).catch((error) => toast(error.message));
+  } else {
+    updateSplitLabels();
   }
 }
 
@@ -1985,10 +2306,12 @@ async function reanalyzeWithExclusions() {
 
 async function openHistory(historyId) {
   const result = await jsonFetch(`/api/histories/${historyId}`);
-  // 履歴のファイルは手元に無いため、除外状態だけ復元し3Dは現在の表示のまま
-  state.excluded = new Set(result.excluded_keys || []);
+  // 履歴のファイルは手元に無いため、除外状態だけ復元し3Dは現在の表示のまま。
+  // B-Rep の無いファイルで「穴を除外して MC のみ」にした穴は、利用者の除外指定ではないので戻さない
+  const fillHoleKeys = new Set(result.fill?.excluded_hole_keys || []);
+  state.excluded = new Set((result.excluded_keys || []).filter((key) => !fillHoleKeys.has(key)));
   setTab("analyze");
-  renderResult(result);
+  renderResult(result, { fromHistory: true });
   $("#resultPanel").scrollIntoView({ behavior: "smooth", block: "start" });
   toast(`履歴 #${historyId}（${result.file_name}）の結果を表示しています。再解析するにはファイルを選択してください。`);
 }
@@ -2044,7 +2367,7 @@ function bindEvents() {
       if (button.dataset.viewToggle !== "paths") return;
       state.cadPreview.showPaths = !state.cadPreview.showPaths;
       button.classList.toggle("active", state.cadPreview.showPaths);
-      if (state.cadPreview.toolpathGroup) state.cadPreview.toolpathGroup.visible = state.cadPreview.showPaths;
+      applyModelVisibility(state.cadPreview.modelView === "split" ? "filled" : state.cadPreview.modelView);
       renderCurrentPreview();
     });
   });
@@ -2116,6 +2439,12 @@ function bindEvents() {
     refreshSettingsUi();
   });
 
+  document.body.addEventListener("click", (event) => {
+    if (!event.target.closest("[data-fill-compare-toggle]") || !state.lastResult) return;
+    state.fillCompareShowAll = !state.fillCompareShowAll;
+    renderFillCompare(state.lastResult);
+  });
+
   document.body.addEventListener("click", async (event) => {
     const excludeButton = event.target.closest("[data-exclude-key]");
     const restoreButton = event.target.closest("[data-restore-key]");
@@ -2158,7 +2487,13 @@ function bindEvents() {
       const data = await jsonFetch("/api/analyze", { method: "POST", body: formData });
       state.lastSignature = signature;
       renderResult(data);
-      toast(data.fill?.error ? `解析は完了しましたが、形状を埋められませんでした: ${data.fill.error}` : "解析が完了しました。");
+      toast(
+        data.fill?.error
+          ? `解析は完了しましたが、形状を埋められませんでした: ${data.fill.error}`
+          : data.fill?.mode === "feature"
+            ? "解析が完了しました（B-Rep の無いファイルのため、穴を加工対象外にして MC のみを算出）。"
+            : "解析が完了しました。",
+      );
     } catch (error) {
       toast(error.message);
       $("#totalBadge").textContent = state.lastResult ? state.lastResult.time_label || secLabel(state.lastResult.breakdown.total_sec) : "未解析";

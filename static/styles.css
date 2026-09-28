@@ -1548,3 +1548,154 @@ input.invalid {
     padding: 12px 16px;
   }
 }
+
+/* ---- 埋め前後の比較（2026-09-28） ---- */
+/* 並べて比較の見出し。キャンバスを左右（縦長の画面では上下）に分けた各視野の上に出す */
+.split-labels {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.split-labels::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  border-left: 2px solid rgba(255,255,255,.85);
+  box-shadow: 0 0 0 1px rgba(40,50,45,.18);
+}
+
+.split-label {
+  position: absolute;
+  bottom: 112px;
+  padding: 4px 10px;
+  background: rgba(255,255,255,.92);
+  border: 1px solid rgba(60,70,65,.22);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
+}
+
+.split-label.original { left: 12px; }
+.split-label.filled { left: calc(50% + 12px); border-color: #f08a24; color: #9a4a06; }
+
+.split-labels.vertical::after {
+  top: 50%;
+  bottom: auto;
+  left: 0;
+  right: 0;
+  border-left: 0;
+  border-top: 2px solid rgba(255,255,255,.85);
+}
+
+.split-labels.vertical .split-label.original { left: 12px; bottom: calc(50% + 10px); }
+.split-labels.vertical .split-label.filled { left: 12px; top: calc(50% + 10px); bottom: auto; }
+
+.model-view-group button[data-model-view="split"] { font-weight: 800; }
+
+.fill-view-note {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  background: #eef3f0;
+  color: var(--steel);
+  font-size: 13px;
+}
+
+.fill-view-note.warn,
+.fill-message.warn {
+  background: #fdecea;
+  color: var(--danger);
+}
+
+.fill-view-note.info,
+.fill-message.info {
+  background: #eef3f0;
+  color: var(--steel);
+}
+
+#fillNotes .fill-message {
+  margin: 0 0 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+#fillDownload { margin-left: 8px; }
+
+.fill-compare { margin: 6px 0 14px; }
+
+.compare-grid {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+
+.compare-block h4 {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: 14px;
+}
+
+.compare-block h4 .link-btn { margin-left: auto; }
+
+.compare-table th,
+.compare-table td {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.compare-table td.minus { color: var(--green); font-weight: 700; }
+.compare-table td.plus { color: var(--danger); font-weight: 700; }
+.compare-table .total-row th,
+.compare-table .total-row td { font-weight: 800; border-top: 2px solid var(--line); }
+.compare-table .qty { color: var(--sub); font-size: 12px; margin-right: 4px; }
+.compare-table .muted { color: var(--sub); }
+.compare-table.features .dims-cell { white-space: normal; min-width: 180px; }
+.compare-table .dim-after { color: #9a4a06; }
+.compare-table tr[data-feature-key] { cursor: pointer; }
+.compare-table tr.diff-same td { color: var(--sub); }
+
+.diff-badge {
+  display: inline-block;
+  padding: 1px 8px;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.diff-badge.removed { background: #fff1e3; color: #9a4a06; }
+.diff-badge.decreased { background: #e6f2ec; color: var(--green); }
+.diff-badge.increased,
+.diff-badge.added { background: #fdecea; color: var(--danger); }
+.diff-badge.same { background: #f1f3f1; color: var(--sub); }
+
+@media (max-width: 900px) {
+  .compare-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* 解析設定の欄が横にはみ出してスクロールバーが出ないようにする */
+.settings-scroll { overflow-x: hidden; }
+.settings-scroll > *,
+.setting-group,
+.sub-fields,
+.wire-params { min-width: 0; max-width: 100%; }
+.setting-group input,
+.setting-group select { width: 100%; box-sizing: border-box; min-width: 0; }
+
+/* 比較表は共通の table（最小幅 940px）より狭い欄に置くので、最小幅を小さくする */
+table.compare-table { min-width: 0; }
+table.compare-table.features { min-width: 560px; }
+.compare-table th,
+.compare-table td { padding: 7px 8px; }
+.compare-grid { grid-template-columns: minmax(240px, 300px) minmax(0, 1fr); }
+@media (max-width: 1200px) {
+  .compare-grid { grid-template-columns: minmax(0, 1fr); }
+  .compare-block:first-child { max-width: 420px; }
+}

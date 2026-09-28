@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>STP加工時間算出ツール</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=asset_version) }}">
 </head>
 <body>
   <div class="app-shell">
@@ -64,10 +64,11 @@
                 <div class="tool-group" role="group" aria-label="重ね表示">
                   <button type="button" data-view-toggle="paths" class="active" title="工具パスの表示切替">工具パス</button>
                 </div>
-                <div id="modelViewButtons" class="tool-group hidden" role="group" aria-label="元モデルと埋めたモデルの切替">
-                  <button type="button" data-model-view="original" title="元のモデル">元</button>
-                  <button type="button" data-model-view="filled" title="ドリル穴・ワイヤ形状を埋めたモデル">埋め後</button>
-                  <button type="button" data-model-view="compare" title="元モデルに埋めた部分をオレンジで重ねて表示">比較</button>
+                <div id="modelViewButtons" class="tool-group model-view-group hidden" role="group" aria-label="元モデルと埋めたモデルの切替">
+                  <button type="button" data-model-view="split" title="元モデルと埋め後を同じ視点で並べて比較（オレンジが埋めた部分）">並べて比較</button>
+                  <button type="button" data-model-view="original" title="元のモデル（元モデルの工具パス）">元</button>
+                  <button type="button" data-model-view="filled" title="ドリル穴・ワイヤ形状を埋めたモデル（埋め後の工具パス）">埋め後</button>
+                  <button type="button" data-model-view="overlay" title="元モデルを半透明にして、埋めた部分をオレンジで重ねて表示">重ね</button>
                 </div>
                 <div class="tool-group" role="group" aria-label="全体表示">
                   <button type="button" data-view-fit title="全体を画面に収める（ダブルクリックでも可）">全体表示</button>
@@ -85,6 +86,10 @@
                   <span>3Dで形状を確認してから「解析実行」で加工時間を算出します</span>
                   <button type="button" class="primary" data-pick-file>ファイルを選択</button>
                 </div>
+              </div>
+              <div id="splitLabels" class="split-labels hidden" aria-hidden="true">
+                <span id="splitLabelOriginal" class="split-label original">元モデル</span>
+                <span id="splitLabelFilled" class="split-label filled">埋め後（MCのみ）</span>
               </div>
               <div id="viewerDropHint" class="viewer-drop-hint hidden"><strong>ドロップして読み込む</strong></div>
               <div id="viewerLoading" class="viewer-loading hidden"><span class="spinner" aria-hidden="true"></span><span id="viewerLoadingText">3D形状を読み込んでいます…</span></div>
@@ -243,10 +248,14 @@
               <span id="fillBadge" class="fill-badge">-</span>
             </div>
             <div id="fillSummary" class="fill-summary"></div>
+            <p id="fillViewNote" class="fill-view-note hidden"></p>
+            <div id="fillNotes"></div>
             <p class="edm-note">
-              下の形状をモデル上で埋めてから解析し直し、MC加工時間から除外しています。
-              3Dプレビューの「元／埋め後／比較」で形状を確認できます（比較ではオレンジが埋めた部分）。
+              ドリル穴・ワイヤ形状をモデル上で埋めてから解析し直し、MC加工時間から除外しています。
+              3Dプレビューの「並べて比較／元／埋め後／重ね」で形状を確認できます（並べて比較・重ねではオレンジが埋めた部分）。
+              <a id="fillDownload" class="secondary-link compact hidden" href="#" download>埋め後STEPをダウンロード</a>
             </p>
+            <div id="fillCompare" class="fill-compare"></div>
             <div id="processCards" class="process-cards"></div>
             <div id="ncHoleSection" class="process-section hidden">
               <h4>NC穴加工（ドリル穴）<span id="ncHoleMeta" class="process-meta"></span></h4>
@@ -463,6 +472,6 @@
   <div id="toast" class="toast hidden"></div>
   <script src="https://cdn.jsdelivr.net/npm/three@0.138.3/build/three.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/occt-import-js@0.0.23/dist/occt-import-js.js"></script>
-  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v=asset_version) }}"></script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -25,8 +26,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.sqlite3")
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step"}
-APP_VERSION = "2026-09-26-mc430-spec"
+UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
+APP_VERSION = "2026-09-28-fill-compare"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -1629,14 +1630,46 @@ class _VerticalRay:
 
     SAMPLES = 24
     RING_OFFSET_MM = 0.3
+    INSIDE_GRID = 5  # 開口の内側を調べる格子（INSIDE_GRID x INSIDE_GRID）
 
-    def __init__(self, shape: Any) -> None:
+    def __init__(self, shape: Any, bounds: Any | None = None) -> None:
         from OCP.IntCurvesFace import IntCurvesFace_ShapeIntersector  # type: ignore
 
         self._intersector = IntCurvesFace_ShapeIntersector()
         self._intersector.Load(shape.wrapped, 1e-4)
-        bounds = shape.BoundingBox()
+        bounds = bounds if bounds is not None else shape.BoundingBox()
         self._span = float(bounds.zlen) + 2.0
+
+    def blocked_inside(self, face: Any, face_z: float, direction: float, limit_z: float) -> bool | None:
+        """開口の内側から鉛直に貫いて、途中に材料があれば True（＝貫通していない）。
+
+        重いブーリアン演算の前に、止まりポケットなど明らかに貫通しない開口を弾くための判定。
+        内側の点が取れない小さな開口は None を返し、ブーリアン演算での判定に任せる。
+        """
+        from OCP.BRepClass import BRepClass_FaceClassifier  # type: ignore
+        from OCP.gp import gp_Dir, gp_Lin, gp_Pnt  # type: ignore
+        from OCP.TopAbs import TopAbs_IN  # type: ignore
+
+        wire_bounds = face.BoundingBox()
+        length = abs(limit_z - face_z)
+        if length <= 0.1:
+            return None
+        points = []
+        for i in range(self.INSIDE_GRID):
+            for j in range(self.INSIDE_GRID):
+                x = wire_bounds.xmin + wire_bounds.xlen * (i + 0.5) / self.INSIDE_GRID
+                y = wire_bounds.ymin + wire_bounds.ylen * (j + 0.5) / self.INSIDE_GRID
+                if BRepClass_FaceClassifier(face.wrapped, gp_Pnt(x, y, face_z), 1e-6).State() == TopAbs_IN:
+                    points.append((x, y))
+        if not points:
+            return None
+        for x, y in points:
+            self._intersector.Perform(
+                gp_Lin(gp_Pnt(x, y, face_z), gp_Dir(0, 0, direction)), 0.02, length - 0.02
+            )
+            if self._intersector.NbPnt() > 0:
+                return True
+        return False
 
     def _ring(self, wire: Any) -> Any | None:
         # 内側輪郭の向きで offset2D の符号が変わるため、外側に広がった方を使う
@@ -1684,21 +1717,27 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
     - ワイヤカット形状: 水平な平面の内側輪郭を板厚方向（上向き面は下、下向き面は上）へ
       押し出し、材料と重ならない（＝貫通する）ものを柱で埋める。抜き窓・異形穴・溝・丸穴が対象。
       柱の長さは開口まわりの材料の厚みまでにして、上面が曲面の金型でも外へはみ出させない。
+    - 埋める柱は、接しているソリッドにだけ結合する。複数ソリッドのモデル（本体＋入れ子など）を
+      1つに合体させると、埋めていない場所の形状認識まで変わって比較が崩れるため。
+    - 1つの形状で失敗しても全体は止めず、warnings に理由を残して残りを埋める。
     返り値の filled_path / bodies_path は埋め後モデルと、埋めた部分だけのモデル。
     """
     import cadquery as cq  # type: ignore
 
     imported = cq.importers.importStep(str(path))
     shape = imported.val()
-    if not hasattr(shape, "Faces") or not hasattr(shape, "BoundingBox"):
+    if not hasattr(shape, "Faces") or not hasattr(shape, "BoundingBox") or not shape.Solids():
         raise InputError("B-Repソリッドとして読み込めないため、形状を埋められません（STEP風の簡易データなど）。")
-    bounds = shape.BoundingBox()
-    zmin = float(bounds.zmin)
     original_volume = float(shape.Volume())
 
-    tools: list[Any] = []
-    items: list[dict[str, Any]] = []
+    # entries: 埋める柱と、それに対応する一覧用の項目（円錐など付随する柱は item=None）
+    entries: list[dict[str, Any]] = []
+    warnings: list[str] = []
     filled_axes: list[tuple[Any, Any]] = []
+
+    def warn(message: str) -> None:
+        if message not in warnings and len(warnings) < 20:
+            warnings.append(message)
 
     if options.get("drill_holes"):
         # 円筒面は半周ずつに分割されていることが多いので、同一軸線・同一半径でまとめてから判定する
@@ -1706,17 +1745,22 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
         for face in shape.Faces():
             if face.geomType() != "CYLINDER":
                 continue
-            cylinder = face._geomAdaptor().Cylinder()
-            radius = float(cylinder.Radius())
-            if radius <= 0:
+            try:
+                cylinder = face._geomAdaptor().Cylinder()
+                radius = float(cylinder.Radius())
+                if radius <= 0:
+                    continue
+                direction = cylinder.Axis().Direction()
+                location = cylinder.Axis().Location()
+                origin, axis = _canonical_axis(
+                    cq.Vector(location.X(), location.Y(), location.Z()),
+                    cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized(),
+                )
+                t_min, t_max = _axis_extent(face, origin, axis)
+                area = float(face.Area())
+            except Exception:  # noqa: BLE001 - 読めない円筒面は飛ばす
+                warn("一部の円筒面を読み取れなかったため、穴の判定から外しました。")
                 continue
-            direction = cylinder.Axis().Direction()
-            location = cylinder.Axis().Location()
-            origin, axis = _canonical_axis(
-                cq.Vector(location.X(), location.Y(), location.Z()),
-                cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized(),
-            )
-            t_min, t_max = _axis_extent(face, origin, axis)
             group = next(
                 (
                     g
@@ -1730,12 +1774,12 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
             )
             if group is None:
                 cylinder_groups.append(
-                    {"radius": radius, "origin": origin, "axis": axis, "t_min": t_min, "t_max": t_max, "area": float(face.Area())}
+                    {"radius": radius, "origin": origin, "axis": axis, "t_min": t_min, "t_max": t_max, "area": area}
                 )
             else:
                 group["t_min"] = min(group["t_min"], t_min)
                 group["t_max"] = max(group["t_max"], t_max)
-                group["area"] += float(face.Area())
+                group["area"] += area
 
         holes: list[dict[str, Any]] = []
         for group in cylinder_groups:
@@ -1745,8 +1789,12 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
             if group["area"] / (2 * math.pi * group["radius"] * length) < FILL_MIN_HOLE_ARC_RATIO:
                 continue
             middle = group["origin"] + group["axis"] * ((group["t_min"] + group["t_max"]) / 2)
-            if shape.isInside(middle, 1e-4):
-                continue  # 材料側の円筒（ボス等）は対象外
+            try:
+                if shape.isInside(middle, 1e-4):
+                    continue  # 材料側の円筒（ボス等）は対象外
+            except Exception:  # noqa: BLE001
+                warn("穴の内外判定に失敗した円筒面があったため、埋めずに残しました。")
+                continue
             holes.append({**group, "length": length})
 
         max_diameter = float(options.get("drill_max_diameter_mm") or 0.0)
@@ -1764,148 +1812,305 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
                 continue
             hole["coaxial_smaller"] = bool(coaxial_smaller)
             start = hole["origin"] + hole["axis"] * hole["t_min"]
-            tools.append(cq.Solid.makeCylinder(hole["radius"], hole["length"], start, hole["axis"]))
+            try:
+                plug = cq.Solid.makeCylinder(hole["radius"], hole["length"], start, hole["axis"])
+            except Exception:  # noqa: BLE001
+                warn(f"φ{fmt_number(hole['radius'] * 2)} の穴を埋める円柱を作れませんでした。")
+                continue
             filled_axes.append((hole["origin"], hole["axis"]))
             diameter = hole["radius"] * 2
-            items.append(
+            entries.append(
                 {
-                    "category": "drill",
-                    "kind": _hole_label(diameter, hole["axis"], hole["coaxial_smaller"]),
-                    "diameter_mm": round(diameter, 3),
-                    "depth_mm": round(hole["length"], 2),
-                    "axis": axis_label((hole["axis"].x, hole["axis"].y, hole["axis"].z)),
-                    "volume_mm3": math.pi * hole["radius"] ** 2 * hole["length"],
-                    "center": [round(v, 2) for v in (start + hole["axis"] * (hole["length"] / 2)).toTuple()],
+                    "solid": plug,
+                    "item": {
+                        "category": "drill",
+                        "kind": _hole_label(diameter, hole["axis"], hole["coaxial_smaller"]),
+                        "diameter_mm": round(diameter, 3),
+                        "depth_mm": round(hole["length"], 2),
+                        "axis": axis_label((hole["axis"].x, hole["axis"].y, hole["axis"].z)),
+                        "volume_mm3": math.pi * hole["radius"] ** 2 * hole["length"],
+                        "center": [round(v, 2) for v in (start + hole["axis"] * (hole["length"] / 2)).toTuple()],
+                    },
                 }
             )
         # 埋めた穴と同軸の円錐面（皿もみ・ドリル先端）も埋める
         for face in shape.Faces():
             if face.geomType() != "CONE":
                 continue
-            cone = face._geomAdaptor().Cone()
-            direction = cone.Axis().Direction()
-            location = cone.Axis().Location()
-            axis = cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized()
-            origin = cq.Vector(location.X(), location.Y(), location.Z())
-            if not any(_same_axis_line(o, a, origin, axis) for o, a in filled_axes):
-                continue
-            t_min, t_max = _axis_extent(face, origin, axis)
-            if t_max - t_min < 0.01:
-                continue
+            try:
+                cone = face._geomAdaptor().Cone()
+                direction = cone.Axis().Direction()
+                location = cone.Axis().Location()
+                axis = cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized()
+                origin = cq.Vector(location.X(), location.Y(), location.Z())
+                if not any(_same_axis_line(o, a, origin, axis) for o, a in filled_axes):
+                    continue
+                t_min, t_max = _axis_extent(face, origin, axis)
+                if t_max - t_min < 0.01:
+                    continue
 
-            def radius_at(t: float) -> float:
-                radii = [
-                    ((cq.Vector(*v.toTuple()) - origin) - axis * (cq.Vector(*v.toTuple()) - origin).dot(axis)).Length
-                    for v in face.Vertices()
-                    if abs((cq.Vector(*v.toTuple()) - origin).dot(axis) - t) < 1e-3
-                ]
-                return max(radii) if radii else 0.0
+                def radius_at(t: float) -> float:
+                    radii = [
+                        ((cq.Vector(*v.toTuple()) - origin) - axis * (cq.Vector(*v.toTuple()) - origin).dot(axis)).Length
+                        for v in face.Vertices()
+                        if abs((cq.Vector(*v.toTuple()) - origin).dot(axis) - t) < 1e-3
+                    ]
+                    return max(radii) if radii else 0.0
 
-            r_start, r_end = radius_at(t_min), radius_at(t_max)
-            middle = origin + axis * ((t_min + t_max) / 2)
-            if shape.isInside(middle, 1e-4):
-                continue
-            tools.append(
-                cq.Solid.makeCone(r_start, r_end, t_max - t_min, origin + axis * t_min, axis)
-            )
+                r_start, r_end = radius_at(t_min), radius_at(t_max)
+                middle = origin + axis * ((t_min + t_max) / 2)
+                if shape.isInside(middle, 1e-4):
+                    continue
+                entries.append(
+                    {"solid": cq.Solid.makeCone(r_start, r_end, t_max - t_min, origin + axis * t_min, axis), "item": None}
+                )
+            except Exception:  # noqa: BLE001
+                warn("皿もみ・ドリル先端の円錐面の一部を埋められませんでした（穴自体は埋めています）。")
 
     if options.get("wire_shapes"):
-        zmax = float(bounds.zmax)
-        ray = _VerticalRay(shape)
         wire_boxes: list[tuple[float, float, float, float]] = []
-        for face in shape.Faces():
-            if face.geomType() != "PLANE" or abs(face.normalAt().z) < 0.99:
+        max_drill = float(options.get("drill_max_diameter_mm") or 0.0)
+        # 貫通の判定は、開口を持つソリッドだけで行う。金型では本体の抜き窓に入れ子（別ソリッド）が
+        # 収まっていることがあり、モデル全体で調べると入れ子に当たって貫通していないと誤判定するため。
+        face_solids = []
+        for solid in shape.Solids():
+            solid_bounds = solid.BoundingBox()
+            ray = _VerticalRay(solid, solid_bounds)
+            face_solids.extend(
+                (face, solid, ray, float(solid_bounds.zmin), float(solid_bounds.zmax)) for face in solid.Faces()
+            )
+        for face, owner, ray, zmin, zmax in face_solids:
+            if face.geomType() != "PLANE":
+                continue
+            try:
+                normal_z = float(face.normalAt().z)
+            except Exception:  # noqa: BLE001
+                continue
+            if abs(normal_z) < 0.99:
                 continue
             # 上向き面は下へ、下向き面（底面側から開いた開口）は上へ押し出して貫通を調べる。
             # 金型のように上面が曲面の部品は、開口が底面側の平面にしか輪郭を持たない。
-            direction = -1.0 if face.normalAt().z > 0 else 1.0
+            direction = -1.0 if normal_z > 0 else 1.0
             face_z = float(face.Center().z)
             limit_z = zmin if direction < 0 else zmax
             if abs(limit_z - face_z) < 0.05:
                 continue
             for wire in face.innerWires():
-                wire_bounds = wire.BoundingBox()
-                box = (float(wire_bounds.center.x), float(wire_bounds.center.y), float(wire_bounds.xlen), float(wire_bounds.ylen))
-                if any(all(abs(a - b) < 0.1 for a, b in zip(box, other)) for other in wire_boxes):
-                    continue  # 上下両面から見つかった同じ開口
-                full = cq.Solid.extrudeLinear(cq.Face.makeFromWires(wire), cq.Vector(0, 0, limit_z - face_z))
-                full_volume = abs(float(full.Volume()))
-                if full_volume <= 0:
+                try:
+                    wire_bounds = wire.BoundingBox()
+                    box = (float(wire_bounds.center.x), float(wire_bounds.center.y), float(wire_bounds.xlen), float(wire_bounds.ylen))
+                    if any(all(abs(a - b) < 0.1 for a, b in zip(box, other)) for other in wire_boxes):
+                        continue  # 上下両面から見つかった同じ開口
+                    opening = cq.Face.makeFromWires(wire)
+                    # 先に鉛直レイで、途中に材料がある（止まりポケット等の）開口を安く弾く
+                    if ray.blocked_inside(opening, face_z, direction, limit_z):
+                        continue
+                    full = cq.Solid.extrudeLinear(opening, cq.Vector(0, 0, limit_z - face_z))
+                    full_volume = abs(float(full.Volume()))
+                    if full_volume <= 0:
+                        continue
+                    if float(full.intersect(owner).Volume()) >= full_volume * FILL_THROUGH_TOLERANCE:
+                        continue  # 途中で材料に当たる＝貫通していない（止まりポケット等）
+                    # 開口まわりの材料の厚みを調べ、埋める柱が部品の外へはみ出さない長さにする
+                    ends = ray.material_ends(wire, face_z, direction)
+                    if ends:
+                        plug_end = max(ends) if direction < 0 else min(ends)
+                        thickness = max(abs(end - face_z) for end in ends)
+                    else:
+                        plug_end = limit_z
+                        thickness = abs(limit_z - face_z)
+                    if abs(plug_end - face_z) < 0.05:
+                        continue
+                    prism = cq.Solid.extrudeLinear(opening, cq.Vector(0, 0, plug_end - face_z))
+                    prism_volume = abs(float(prism.Volume()))
+                    kind, width, length = _wire_shape_label(wire)
+                    center = prism.Center()
+                    perimeter = sum(float(edge.Length()) for edge in wire.Edges())
+                except Exception:  # noqa: BLE001 - 1つの開口の失敗で全体を止めない
+                    warn("一部の開口は形状を読み取れなかったため、埋めずに残しました。")
                     continue
-                if float(full.intersect(shape).Volume()) >= full_volume * FILL_THROUGH_TOLERANCE:
-                    continue  # 途中で材料に当たる＝貫通していない（止まりポケット等）
-                # 開口まわりの材料の厚みを調べ、埋める柱が部品の外へはみ出さない長さにする
-                ends = ray.material_ends(wire, face_z, direction)
-                if ends:
-                    plug_end = max(ends) if direction < 0 else min(ends)
-                    thickness = max(abs(end - face_z) for end in ends)
-                else:
-                    plug_end = limit_z
-                    thickness = abs(limit_z - face_z)
-                if abs(plug_end - face_z) < 0.05:
-                    continue
-                prism = cq.Solid.extrudeLinear(cq.Face.makeFromWires(wire), cq.Vector(0, 0, plug_end - face_z))
-                prism_volume = abs(float(prism.Volume()))
-                height = thickness
-                kind, width, length = _wire_shape_label(wire)
-                center = prism.Center()
                 if kind == "丸穴" and any(
                     _same_axis_line(o, a, cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)) for o, a in filled_axes
                 ):
                     continue  # ドリル穴として埋め済み
-                max_drill = float(options.get("drill_max_diameter_mm") or 0.0)
                 if kind == "丸穴" and (max_drill <= 0 or width <= max_drill + 1e-6):
                     # 円筒面が横穴などで欠けて穴として拾えなかった小径の貫通丸穴はドリル穴として扱う
                     if not options.get("drill_holes"):
                         continue
                     wire_boxes.append(box)
-                    tools.append(prism)
                     filled_axes.append((cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)))
-                    items.append(
+                    entries.append(
                         {
-                            "category": "drill",
-                            "kind": "微細穴" if width < 3.0 else "穴",
-                            "diameter_mm": round(width, 3),
-                            "depth_mm": round(height, 2),
-                            "axis": "Z",
-                            "volume_mm3": prism_volume,
-                            "center": [round(v, 2) for v in center.toTuple()],
+                            "solid": prism,
+                            "item": {
+                                "category": "drill",
+                                "kind": "微細穴" if width < 3.0 else "穴",
+                                "diameter_mm": round(width, 3),
+                                "depth_mm": round(thickness, 2),
+                                "axis": "Z",
+                                "volume_mm3": prism_volume,
+                                "center": [round(v, 2) for v in center.toTuple()],
+                            },
                         }
                     )
                     continue
                 wire_boxes.append(box)
-                perimeter = sum(float(edge.Length()) for edge in wire.Edges())
-                tools.append(prism)
-                items.append(
+                entries.append(
                     {
-                        "category": "wire",
-                        "kind": kind,
-                        "width_mm": round(width, 2),
-                        "length_mm": round(length, 2),
-                        "diameter_mm": round(width, 3) if kind == "丸穴" else None,
-                        "thickness_mm": round(height, 2),
-                        "perimeter_mm": round(perimeter, 1),
-                        "cut_area_mm2": round(perimeter * height, 1),
-                        "volume_mm3": prism_volume,
-                        "center": [round(v, 2) for v in center.toTuple()],
+                        "solid": prism,
+                        "item": {
+                            "category": "wire",
+                            "kind": kind,
+                            "width_mm": round(width, 2),
+                            "length_mm": round(length, 2),
+                            "diameter_mm": round(width, 3) if kind == "丸穴" else None,
+                            "thickness_mm": round(thickness, 2),
+                            "perimeter_mm": round(perimeter, 1),
+                            "cut_area_mm2": round(perimeter * thickness, 1),
+                            "volume_mm3": prism_volume,
+                            "center": [round(v, 2) for v in center.toTuple()],
+                        },
                     }
                 )
 
-    if not tools:
-        return {"items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0}
+    if not entries:
+        return {"items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0, "warnings": warnings}
 
-    filled = shape.fuse(*tools).clean()
-    bodies = cq.Compound.makeCompound(tools)
+    filled, used = _fuse_plugs_per_solid(shape, [entry["solid"] for entry in entries], warn)
+    used_entries = [entry for entry, ok in zip(entries, used) if ok]
+    if not used_entries:
+        warn("埋める形状をモデルに結合できませんでした。")
+        return {"items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0, "warnings": warnings}
+    bodies = cq.Compound.makeCompound([entry["solid"] for entry in used_entries])
     filled_path = output_stem.with_name(output_stem.name + "__filled.step")
     bodies_path = output_stem.with_name(output_stem.name + "__fillbodies.step")
     cq.exporters.export(filled, str(filled_path), "STEP")
     cq.exporters.export(bodies, str(bodies_path), "STEP")
     return {
-        "items": items,
+        "items": [entry["item"] for entry in used_entries if entry["item"] is not None],
         "filled_path": filled_path,
         "bodies_path": bodies_path,
         "added_volume_mm3": max(0.0, float(filled.Volume()) - original_volume),
+        "warnings": warnings,
     }
+
+
+def _bbox_overlaps(a: Any, b: Any, margin: float) -> bool:
+    return (
+        a.xmin <= b.xmax + margin and a.xmax >= b.xmin - margin
+        and a.ymin <= b.ymax + margin and a.ymax >= b.ymin - margin
+        and a.zmin <= b.zmax + margin and a.zmax >= b.zmin - margin
+    )
+
+
+def _fuse_plugs_per_solid(shape: Any, plugs: list[Any], warn: Any) -> tuple[Any, list[bool]]:
+    """埋める柱を、接しているソリッドとだけ結合する。返り値は（埋め後の形状, 柱ごとの結合成否）。
+
+    柱が複数のソリッドに接している場合（本体の抜き窓と、そこに収まる入れ子など）はそれらをまとめて
+    1つにする。どの柱にも接していないソリッドは元のまま残し、埋めていない場所の形状認識を変えない。
+    """
+    import cadquery as cq  # type: ignore
+
+    solids = shape.Solids()
+    used = [False] * len(plugs)
+    if len(solids) <= 1:
+        base = solids[0] if solids else shape
+        return _fuse_safely(base, [], list(range(len(plugs))), plugs, used, warn), used
+
+    boxes = [solid.BoundingBox() for solid in solids]
+    parent = list(range(len(solids)))
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    plug_owner: dict[int, int] = {}
+    for plug_index, plug in enumerate(plugs):
+        plug_box = plug.BoundingBox()
+        touching = []
+        for solid_index, solid in enumerate(solids):
+            if not _bbox_overlaps(plug_box, boxes[solid_index], 0.05):
+                continue
+            try:
+                if float(solid.distance(plug)) <= 0.05:
+                    touching.append(solid_index)
+            except Exception:  # noqa: BLE001 - 距離が測れないソリッドは接していない扱い
+                continue
+        if not touching:
+            warn("どのソリッドにも接していない埋め形状があったため、埋めずに残しました。")
+            continue
+        for other in touching[1:]:
+            parent[root(other)] = root(touching[0])
+        plug_owner[plug_index] = touching[0]
+
+    groups: dict[int, dict[str, list[int]]] = {}
+    for solid_index in range(len(solids)):
+        groups.setdefault(root(solid_index), {"solids": [], "plugs": []})["solids"].append(solid_index)
+    for plug_index, owner in plug_owner.items():
+        groups[root(owner)]["plugs"].append(plug_index)
+
+    result = []
+    for group in groups.values():
+        members = [solids[i] for i in group["solids"]]
+        if not group["plugs"]:
+            result.extend(members)
+            continue
+        result.append(_fuse_safely(members[0], members[1:], group["plugs"], plugs, used, warn))
+    return cq.Compound.makeCompound(result), used
+
+
+def _fuse_safely(base: Any, partners: list[Any], indices: list[int], plugs: list[Any], used: list[bool], warn: Any) -> Any:
+    """base に partners（同じまとまりのソリッド）と柱を結合する。
+
+    まとめて結合し、失敗したら1本ずつ結合する（結合できない柱は飛ばす）。
+    partners と結合できなかったときは、partners を元のまま残す。
+    """
+    import cadquery as cq  # type: ignore
+
+    leftovers: list[Any] = []
+    if partners:
+        try:
+            base = base.fuse(*partners)
+        except Exception:  # noqa: BLE001 - 入れ子と結合できなくても本体への埋めは続ける
+            warn("入れ子などのソリッドを本体と結合できなかったため、本体だけを埋めました。")
+            leftovers = list(partners)
+
+    def finish(shape: Any) -> Any:
+        shape = _clean_safely(shape)
+        return cq.Compound.makeCompound([shape, *leftovers]) if leftovers else shape
+
+    if not indices:
+        return finish(base)
+    try:
+        fused = base.fuse(*[plugs[i] for i in indices])
+        if fused.isValid():
+            for i in indices:
+                used[i] = True
+            return finish(fused)
+    except Exception:  # noqa: BLE001 - 1本ずつに切り替える
+        pass
+    result = base
+    for i in indices:
+        try:
+            candidate = result.fuse(plugs[i])
+            if candidate.isValid():
+                result = candidate
+                used[i] = True
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        warn("モデルに結合できない埋め形状があったため、その形状は埋めずに算出しました。")
+    return finish(result)
+
+
+def _clean_safely(shape: Any) -> Any:
+    try:
+        cleaned = shape.clean()
+        return cleaned if cleaned.isValid() else shape
+    except Exception:  # noqa: BLE001 - 面の統合に失敗しても形状自体は使える
+        return shape
 
 
 def summarize_fill_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -5264,7 +5469,8 @@ def handle_unexpected_error(exc: Exception) -> Any:
 
 @app.get("/")
 def index() -> str:
-    return render_template("index.html")
+    # 静的ファイルに版を付け、更新後にブラウザが古い app.js / styles.css を使い続けないようにする
+    return render_template("index.html", asset_version=APP_VERSION)
 
 
 @app.get("/api/health")
@@ -5380,7 +5586,7 @@ def api_analyze() -> Response:
         fill_payload: dict[str, Any] | None = None
         if fill_options["drill_holes"] or fill_options["wire_shapes"]:
             fill_payload, filled_path, fill_items = prepare_filled_model(path, fill_options)
-            if filled_path is not None:
+            if filled_path is not None or fill_payload.get("brep_missing"):
                 # 比較用に元モデルの時間も算出する（履歴には保存しない）
                 original = estimate(
                     path, upload.filename, material_type, blank_allowance_mm, machine_id,
@@ -5389,7 +5595,12 @@ def api_analyze() -> Response:
                 fill_payload["original_total_sec"] = original["breakdown"]["total_sec"]
                 fill_payload["original_machining_sec"] = original["breakdown"]["machining_sec"]
                 fill_payload["original_time_label"] = seconds_label(original["breakdown"]["total_sec"])
-                analyze_path = filled_path
+                fill_payload["original"] = estimate_summary(original)
+                if filled_path is not None:
+                    analyze_path = filled_path
+                elif fill_options["drill_holes"]:
+                    # B-Rep が無いファイルは形状を埋められないので、穴フィーチャを加工対象外にして MC のみを出す
+                    fill_items = apply_feature_fill(fill_payload, original, fill_options, estimate_args)
             if fill_items:
                 fill_payload["processes"] = separate_process_plans(
                     fill_items, material_type, nc_machine_id, estimate_mode, wire_params
@@ -5412,15 +5623,74 @@ def api_analyze() -> Response:
         return jsonify({"error": f"解析に失敗しました: {exc}"}), 500
 
 
+# 埋めたモデルのキャッシュ。埋め方を変えたら上げて、古いキャッシュを使わないようにする
+FILL_CACHE_VERSION = "2"
+FILL_HOLE_FEATURE_PREFIXES = ("hole", "fine_hole", "side_hole", "counterbore", "countersink")
+
+
+def fill_cache_token(path: Path, fill_options: dict[str, Any]) -> str:
+    """ファイルの中身と埋め設定から決まる識別子。同じ組み合わせなら埋めたモデルを使い回す。"""
+    content = hashlib.sha1(path.read_bytes()).hexdigest()[:20]
+    options = json.dumps(fill_options, sort_keys=True, ensure_ascii=False)
+    option_digest = hashlib.sha1(f"{FILL_CACHE_VERSION}|{options}".encode("utf-8")).hexdigest()[:10]
+    return f"fill_{content}_{option_digest}"
+
+
+def load_or_build_filled_model(path: Path, fill_options: dict[str, Any]) -> dict[str, Any]:
+    """埋めたモデルを作る。同じファイル・同じ設定で作ったものが残っていればそれを使う（再解析を速くする）。"""
+    token = fill_cache_token(path, fill_options)
+    stem = UPLOAD_DIR / token
+    info_path = UPLOAD_DIR / f"{token}__fillinfo.json"
+    filled_path = UPLOAD_DIR / f"{token}{FILL_MODEL_KINDS['filled']}"
+    bodies_path = UPLOAD_DIR / f"{token}{FILL_MODEL_KINDS['bodies']}"
+    if info_path.is_file():
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+            has_model = bool(info.get("has_model"))
+            if not has_model or (filled_path.is_file() and bodies_path.is_file()):
+                now = time.time()
+                for cached in (info_path, filled_path, bodies_path):
+                    if cached.is_file():
+                        os.utime(cached, (now, now))  # 使ったキャッシュは保存期間を延ばす
+                return {
+                    "items": info.get("items") or [],
+                    "added_volume_mm3": float(info.get("added_volume_mm3") or 0.0),
+                    "warnings": info.get("warnings") or [],
+                    "filled_path": filled_path if has_model else None,
+                    "bodies_path": bodies_path if has_model else None,
+                    "token": token if has_model else None,
+                    "cached": True,
+                }
+        except (OSError, ValueError):
+            pass  # 壊れたキャッシュは作り直す
+    fill = build_filled_model(path, fill_options, stem)
+    has_model = fill["filled_path"] is not None
+    # STEP を書き終えてから目印の JSON を置く（JSON があればモデルもそろっている）
+    info_path.write_text(
+        json.dumps(
+            {
+                "items": fill["items"],
+                "added_volume_mm3": fill["added_volume_mm3"],
+                "warnings": fill.get("warnings") or [],
+                "has_model": has_model,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return {**fill, "token": token if has_model else None, "cached": False}
+
+
 def prepare_filled_model(
     path: Path, fill_options: dict[str, Any]
 ) -> tuple[dict[str, Any], Path | None, list[dict[str, Any]]]:
     """埋めたモデルを作成し、画面表示用のペイロードと解析対象パスを返す。失敗時は元モデルで続行する。"""
-    payload: dict[str, Any] = {"enabled": True, "options": fill_options}
+    payload: dict[str, Any] = {"enabled": True, "mode": "model", "options": fill_options}
     try:
-        fill = build_filled_model(path, fill_options, path.with_suffix(""))
+        fill = load_or_build_filled_model(path, fill_options)
     except InputError as exc:
         payload["error"] = str(exc)
+        payload["brep_missing"] = True
         return payload, None, []
     except Exception as exc:  # noqa: BLE001 - 埋めに失敗しても通常の見積もりは返す
         app.logger.exception("モデル埋めに失敗しました: %s", path.name)
@@ -5434,12 +5704,120 @@ def prepare_filled_model(
             "wire_count": sum(row["count"] for row in rows if row["category"] == "wire"),
             "wire_cut_area_mm2": round(sum(row["cut_area_mm2"] for row in rows if row["category"] == "wire"), 1),
             "added_volume_mm3": round(fill["added_volume_mm3"], 1),
-            "token": path.stem if fill["filled_path"] else None,
+            "token": fill["token"],
+            "cached": fill.get("cached", False),
+            "warnings": fill.get("warnings") or [],
         }
     )
     if not rows:
         payload["message"] = "埋める対象の形状が見つかりませんでした。元モデルのまま算出しています。"
     return payload, fill["filled_path"], fill["items"]
+
+
+def estimate_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """元モデルの見積もりのうち、埋め後との比較・3D表示に使う部分だけを残す。"""
+    return {
+        "breakdown": result["breakdown"],
+        "time_label": seconds_label(result["breakdown"]["total_sec"]),
+        "confidence": result.get("confidence"),
+        "features": [
+            {
+                key: feature.get(key)
+                for key in ("feature_key", "feature_type", "dimensions", "quantity", "machining_sec", "tool_name", "process_type")
+            }
+            for feature in result.get("features") or []
+        ],
+        "edm_candidates": [
+            {key: row.get(key) for key in ("feature_key", "feature_type", "edm_type", "dimensions", "count", "reference_sec")}
+            for row in result.get("edm_candidates") or []
+        ],
+        "toolpath_overlays": (result.get("analysis") or {}).get("toolpath_overlays") or [],
+    }
+
+
+def _hole_feature_diameter(feature_key: str) -> float | None:
+    parts = str(feature_key or "").split("|")
+    if len(parts) < 2 or parts[0] not in FILL_HOLE_FEATURE_PREFIXES:
+        return None
+    try:
+        return float(parts[1])
+    except ValueError:
+        return None
+
+
+def apply_feature_fill(
+    payload: dict[str, Any],
+    original: dict[str, Any],
+    fill_options: dict[str, Any],
+    estimate_args: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """B-Rep の無いファイル向け: 穴フィーチャを加工対象外にして MC のみを算出する（形状は埋めない）。
+
+    estimate_args の excluded_keys に穴のキーを足す。返り値は別工程（NC穴加工）の計算に使う項目。
+    """
+    max_diameter = float(fill_options.get("drill_max_diameter_mm") or 0.0)
+    hole_features = []
+    for feature in original.get("features") or []:
+        diameter = _hole_feature_diameter(feature.get("feature_key"))
+        if diameter is None or (max_diameter > 0 and diameter > max_diameter + 1e-6):
+            continue
+        hole_features.append((feature, diameter))
+    payload.pop("error", None)
+    payload["mode"] = "feature"
+    if not hole_features:
+        payload["message"] = "B-Rep（ソリッド）が無いファイルのため形状は埋めず、穴フィーチャの除外で算出しようとしましたが、対象の穴がありませんでした。"
+        return []
+    estimate_args["excluded_keys"] = set(estimate_args.get("excluded_keys") or set()) | {
+        str(feature["feature_key"]) for feature, _ in hole_features
+    }
+    items: list[dict[str, Any]] = []
+    rows = []
+    for feature, diameter in hole_features:
+        depth_match = re.search(r"深さ\s*([0-9.]+)", str(feature.get("dimensions") or ""))
+        depth = float(depth_match.group(1)) if depth_match else 0.0
+        count = int(feature.get("quantity") or 1)
+        kind = "座ぐり" if str(feature["feature_key"]).startswith("counterbore") else "穴"
+        rows.append(
+            {
+                "category": "drill",
+                "kind": kind,
+                "dimensions": str(feature.get("dimensions") or ""),
+                "count": count,
+                "volume_mm3": 0.0,
+                "cut_area_mm2": 0.0,
+                "centers": [],
+            }
+        )
+        if depth > 0:
+            items.extend(
+                {
+                    "category": "drill",
+                    "kind": kind,
+                    "diameter_mm": round(diameter, 3),
+                    "depth_mm": round(depth, 2),
+                    "axis": "Z",
+                    "volume_mm3": 0.0,
+                    "center": [0.0, 0.0, 0.0],
+                }
+                for _ in range(count)
+            )
+    payload.update(
+        {
+            "items": rows,
+            "drill_count": sum(row["count"] for row in rows),
+            "wire_count": 0,
+            "wire_cut_area_mm2": 0.0,
+            "added_volume_mm3": 0.0,
+            "token": None,
+            # 履歴から開き直したとき、利用者の除外指定と区別するため
+            "excluded_hole_keys": sorted(str(feature["feature_key"]) for feature, _ in hole_features),
+            "message": (
+                "B-Rep（ソリッド）が無いファイルのため、形状は埋めずに穴フィーチャを加工対象外にして MC のみを算出しました。"
+                "3Dでの埋め後表示はできません。NC穴加工の時間は穴位置が分からないため穴間の移動を含みません。"
+            ),
+        }
+    )
+    return items
 
 
 def separate_process_plans(
