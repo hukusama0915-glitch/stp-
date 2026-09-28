@@ -27,7 +27,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-09-28-fill-compare"
+APP_VERSION = "2026-09-28-fill-compare-ado"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -2218,6 +2218,43 @@ def drill_condition_for(diameter_mm: float, material_type: str) -> dict[str, Any
     }
 
 
+def official_drill_plan(
+    drill: sqlite3.Row | dict[str, Any],
+    diameter_mm: float,
+    depth_mm: float,
+    material_type: str,
+    max_tool_diameter_mm: float | None,
+    context: str,
+) -> dict[str, Any] | None:
+    """工具マスタにドリルが無いとき、MC の穴加工も OSG ADO 公式条件（φ2〜20・鉄/SUS）で算出する。
+
+    以前はエンドミルを「代替工具」にして 1.25 倍していたが、ドリルの公式条件は登録済みなのでそちらを使う。
+    表の範囲外・アルミ・機械の最大工具径を超える径は None（従来どおり代替工具で計算）。
+    """
+    if str(drill["tool_type"]) == "DRILL":
+        return None
+    if max_tool_diameter_mm and diameter_mm > float(max_tool_diameter_mm) + 1e-6:
+        return None
+    condition = drill_condition_for(float(diameter_mm), material_type)
+    if condition is None:
+        return None
+    depth_ratio = float(depth_mm) / max(float(diameter_mm), 0.1)
+    beyond = depth_ratio > float(condition["max_depth_ratio"])
+    return {
+        "feed_mm_min": max(1.0, float(condition["feed_mm_min"])),
+        "tool_name": f"OSG ADO φ{fmt_number(diameter_mm)}（公式ドリル条件）",
+        "condition_text": f'rpm {condition["rpm"]:,.0f} / F {condition["feed_mm_min"]:.0f} mm/min / {condition["source"]}',
+        "selection_reason": f"{context}: 工具マスタにドリルが無いため、OSG ADO の公式切削条件（φ{fmt_number(diameter_mm)}・{material_type}）で算出",
+        "reachability": (
+            f"{context}: L/D {depth_ratio:.1f} は ADO 条件表の範囲（{float(condition['max_depth_ratio']):g}D以下）外"
+            if beyond
+            else ""
+        ),
+        # 条件表より深い穴は、ステップ送りの戻りが増える分を少し重くする
+        "factor": 1.1 if beyond else 1.0,
+    }
+
+
 def _nearest_neighbour_length(points: list[list[float]]) -> float:
     """穴位置を近い順に巡回したときの移動距離（XY平面）。"""
     if len(points) < 2:
@@ -3990,6 +4027,10 @@ def estimate(
             drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "穴加工")
             depth = max(3.0, float(group.get("avg_depth", bbox["z"] * 0.75)))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
+            official = official_drill_plan(drill, diameter, depth, material_type, max_tool_diameter, "穴")
+            if official:
+                drill_feed = official["feed_mm_min"]
+                drill_selection_reason = official["selection_reason"]
             depth_ratio = float(group.get("depth_ratio", depth / max(diameter, 0.1)))
             deep_hole = depth_ratio >= 5.0 or depth >= 30.0
             peck_passes = max(1, math.ceil(depth / max(diameter * 3.0, 1.0)))
@@ -4002,7 +4043,9 @@ def estimate(
                 effective_length_mm=float(drill["max_depth_mm"]),
                 context="穴",
             )
-            if drill["tool_type"] != "DRILL":
+            if official:
+                drill_reachability, drill_reachability_factor = official["reachability"], official["factor"]
+            elif drill["tool_type"] != "DRILL":
                 drill_reachability = " / ".join(
                     item
                     for item in (
@@ -4025,8 +4068,8 @@ def estimate(
                     "穴加工（ドリル）",
                     f"φ{diameter:.1f} / 深さ {depth:.1f} mm / 軸 {group.get('axis', '-')}",
                     count,
-                    drill["tool_id"],
-                    drill["tool_name"],
+                    None if official else drill["tool_id"],
+                    official["tool_name"] if official else drill["tool_name"],
                     "穴",
                     hole_sec,
                     (
@@ -4036,7 +4079,7 @@ def estimate(
                         if analysis.get("brep_available")
                         else "円筒面から穴候補を抽出"
                     ),
-                    master_condition_summary(cond),
+                    official["condition_text"] if official else master_condition_summary(cond),
                     path_plan_summary(
                         drill_cutting_length,
                         peck_passes,
@@ -4059,6 +4102,10 @@ def estimate(
             drill_selection_reason = internal_tool_selection_reason(drill, diameter, max_tool_diameter, "横穴加工")
             depth = max(3.0, float(group.get("avg_depth", bbox["x"] * 0.5)))
             drill_feed, _drill_ap, _drill_ae = condition_params(cond)
+            official = official_drill_plan(drill, diameter, depth, material_type, max_tool_diameter, "横穴")
+            if official:
+                drill_feed = official["feed_mm_min"]
+                drill_selection_reason = official["selection_reason"]
             depth_ratio = float(group.get("depth_ratio", depth / max(diameter, 0.1)))
             deep_hole = depth_ratio >= 5.0 or depth >= 30.0
             peck_passes = max(1, math.ceil(depth / max(diameter * 3.0, 1.0)))
@@ -4071,7 +4118,9 @@ def estimate(
                 effective_length_mm=float(drill["max_depth_mm"]),
                 context="横穴",
             )
-            if drill["tool_type"] != "DRILL":
+            if official:
+                side_hole_reachability, side_hole_reachability_factor = official["reachability"], official["factor"]
+            elif drill["tool_type"] != "DRILL":
                 side_hole_reachability = " / ".join(
                     item
                     for item in (
@@ -4094,12 +4143,12 @@ def estimate(
                     "横穴加工（ドリル）",
                     f"φ{diameter:.1f} / 深さ {depth:.1f} mm / 軸 {group.get('axis', '-')}",
                     count,
-                    drill["tool_id"],
-                    drill["tool_name"],
+                    None if official else drill["tool_id"],
+                    official["tool_name"] if official else drill["tool_name"],
                     "穴",
                     side_hole_sec,
                     "B-Rep円筒面から横深穴候補を抽出し、ペック退避を重めに補正" if deep_hole else "B-Rep円筒面から側面穴候補を抽出",
-                    master_condition_summary(cond),
+                    official["condition_text"] if official else master_condition_summary(cond),
                     path_plan_summary(
                         side_hole_cutting_length,
                         peck_passes,
@@ -4138,6 +4187,14 @@ def estimate(
                 + internal_tool_selection_reason(counterbore_tool, counterbore_diameter, max_tool_diameter, "座ぐり加工")
             )
             drill_feed, _drill_ap, _drill_ae = condition_params(drill_cond)
+            official = official_drill_plan(drill, through_diameter, through_depth, material_type, max_tool_diameter, "座ぐり下穴")
+            if official:
+                drill_feed = official["feed_mm_min"]
+                counterbore_selection_reason = (
+                    official["selection_reason"]
+                    + " / "
+                    + internal_tool_selection_reason(counterbore_tool, counterbore_diameter, max_tool_diameter, "座ぐり加工")
+                )
             counterbore_feed, counterbore_ap, counterbore_ae = condition_params(counterbore_cond)
             counterbore_tool_diameter = float(counterbore_tool["diameter_mm"])
             counterbore_plan_ap = axial_depth_for_plan(counterbore_ap, counterbore_tool_diameter, counterbore_depth, ratio=0.7)
@@ -4158,7 +4215,9 @@ def estimate(
                 effective_length_mm=float(drill["max_depth_mm"]),
                 context="座ぐり下穴",
             )
-            if drill["tool_type"] != "DRILL":
+            if official:
+                drill_reachability, drill_reachability_factor = official["reachability"], official["factor"]
+            elif drill["tool_type"] != "DRILL":
                 drill_reachability = " / ".join(
                     item
                     for item in (
@@ -4201,11 +4260,12 @@ def estimate(
                     ),
                     count,
                     None,
-                    f'{drill["tool_name"]} + {counterbore_tool["tool_name"]}',
+                    f'{official["tool_name"] if official else drill["tool_name"]} + {counterbore_tool["tool_name"]}',
                     "穴",
                     drill_sec * drill_reachability_factor + counterbore_sec * counterbore_reachability_factor,
                     "B-Rep円筒面の同芯径違いから座ぐり候補を抽出",
-                    f"下穴: {master_condition_summary(drill_cond)} / 座ぐり: {master_condition_summary(counterbore_cond)}",
+                    f"下穴: {official['condition_text'] if official else master_condition_summary(drill_cond)}"
+                    f" / 座ぐり: {master_condition_summary(counterbore_cond)}",
                     path_plan_summary(
                         drill_cutting_length + counterbore_cutting_length,
                         drill_pecks + counterbore_passes,
