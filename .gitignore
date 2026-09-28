@@ -17,3 +17,4 @@ NEXT_CHAT_CONTEXT.md
 run.bat
 start_public_tunnel.bat
 stop_public_tunnel.bat
+dist/
