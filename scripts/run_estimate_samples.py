@@ -28,6 +28,11 @@ os.environ["STP_TOOL_DB_PATH"] = str(Path(_tmpdir) / "harness.sqlite3")
 
 import app as app_module  # noqa: E402
 
+# 埋めたモデルはファイル内容でキャッシュされるため、毎回まっさらな一時フォルダで作り直す
+# （uploads のキャッシュを使うと、埋め処理を直しても古い結果で比較してしまう）
+app_module.UPLOAD_DIR = Path(_tmpdir) / "uploads"
+app_module.UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
 # 基準値を機械マスタの変更に左右されないよう、検証専用の機械を登録して使う
 # （2026-09-26まで既定機だった「標準 3軸MC」と同じ仕様）
 BENCHMARK_MACHINE = ("検証用 3軸MC", 3, 15000, 8, 12000, 16, 30, "回帰ハーネス専用")
@@ -42,7 +47,7 @@ with app_module.db() as _conn:
     ).lastrowid
 
 # 形状を埋めて（MCのみで）算出するケースも回すサンプル
-FILL_SAMPLES = ("wire_cut_test_plate.stp", "mixed_feature_test_part.stp")
+FILL_SAMPLES = ("wire_cut_test_plate.stp", "mixed_feature_test_part.stp", "insert_plate_test.stp")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
