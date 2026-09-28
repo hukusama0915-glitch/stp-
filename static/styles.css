@@ -1675,6 +1675,7 @@ input.invalid {
 .diff-badge.increased,
 .diff-badge.added { background: #fdecea; color: var(--danger); }
 .diff-badge.same { background: #f1f3f1; color: var(--sub); }
+.diff-badge.resized { background: #eef1f8; color: #34508a; }
 
 @media (max-width: 900px) {
   .compare-grid { grid-template-columns: minmax(0, 1fr); }

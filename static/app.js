@@ -1200,7 +1200,14 @@ function featureTotals(features) {
   return totals;
 }
 
-const FILL_DIFF_LABELS = { removed: "なくなった", decreased: "減った", increased: "増えた", added: "新たに出た", same: "変化なし" };
+const FILL_DIFF_LABELS = {
+  removed: "なくなった", decreased: "減った", resized: "寸法が変わった", increased: "増えた", added: "新たに出た", same: "変化なし",
+};
+
+// 識別子の先頭（slot|1.6|23.6 → slot）。同じ種類の加工かどうかの判定に使う
+function featureFamily(entry) {
+  return entry.featureKey ? String(entry.featureKey).split("|")[0] : `type:${entry.type}`;
+}
 
 // 元モデルと埋め後で、加工内容（フィーチャ）ごとの時間を比べる
 function fillFeatureDiff(originalFeatures, currentFeatures) {
@@ -1214,9 +1221,23 @@ function fillFeatureDiff(originalFeatures, currentFeatures) {
     rows.push({ key, featureKey: a.featureKey, type: a.type, before: a, after: b || null, delta, status });
   }
   for (const [key, b] of after) {
-    if (!before.has(key)) rows.push({ key, featureKey: b.featureKey, type: b.type, before: null, after: b, delta: b.sec, status: "added" });
+    if (before.has(key)) continue;
+    // 同じ種類の加工が「なくなった」側にあれば、寸法が少し変わっただけとみなして1行にまとめる
+    // （例: 溝 幅1.6 x 23.6 → 幅1.5 x 19.4。埋めた穴と交わって形が変わった場合など）
+    const pair = rows
+      .filter((row) => row.status === "removed" && !row.paired && row.type === b.type && featureFamily(row.before) === featureFamily(b))
+      .sort((p, q) => Math.abs(p.before.sec - b.sec) - Math.abs(q.before.sec - b.sec))[0];
+    if (pair) {
+      pair.paired = true;
+      pair.after = b;
+      pair.featureKey = b.featureKey || pair.featureKey;
+      pair.delta = b.sec - pair.before.sec;
+      pair.status = "resized";
+      continue;
+    }
+    rows.push({ key, featureKey: b.featureKey, type: b.type, before: null, after: b, delta: b.sec, status: "added" });
   }
-  const order = { removed: 0, decreased: 1, increased: 2, added: 3, same: 4 };
+  const order = { removed: 0, decreased: 1, resized: 2, increased: 3, added: 4, same: 5 };
   return rows.sort((x, y) => order[x.status] - order[y.status] || Math.abs(y.delta) - Math.abs(x.delta));
 }
 
