@@ -16,6 +16,8 @@ const state = {
   lastSignature: null,
   previewLoadId: 0,
   excluded: new Set(),
+  // 「埋めない（MCで加工）」にした埋め形状の識別子（サーバーの fill_item_key）
+  fillSkip: new Set(),
   highlightedKey: null,
 };
 
@@ -645,6 +647,7 @@ function resetResultForNewFile() {
   state.resultFromHistory = false;
   state.cadPreview.pendingFillToken = null;
   state.excluded.clear();
+  state.fillSkip.clear();
   setFillViewNote("");
   $("#splitLabels")?.classList.add("hidden");
   $("#resultPanel")?.classList.add("hidden");
@@ -1151,6 +1154,7 @@ function renderFillPanel(result) {
     download.classList.toggle("hidden", !fill.token);
     if (fill.token) download.href = `/api/fill-models/${encodeURIComponent(fill.token)}/filled`;
   }
+  renderFillItems(fill);
   if (fill.error || !rows.length) {
     badge.textContent = fill.error ? "埋め不可" : "対象なし";
     badge.className = "fill-badge warn";
@@ -1162,7 +1166,10 @@ function renderFillPanel(result) {
     return;
   }
   badge.className = "fill-badge";
-  badge.textContent = `ドリル穴 ${fill.drill_count}箇所 / ワイヤ形状 ${fill.wire_count}箇所${fill.mode === "feature" ? "（形状は埋めず除外）" : ""}`;
+  const skippedCount = (fill.skipped || []).reduce((sum, item) => sum + Number(item.count || 0), 0);
+  badge.textContent = `ドリル穴 ${fill.drill_count}箇所 / ワイヤ形状 ${fill.wire_count}箇所`
+    + (skippedCount ? ` / 埋めない ${skippedCount}箇所` : "")
+    + (fill.mode === "feature" ? "（形状は埋めず除外）" : "");
   const original = Number(fill.original_total_sec) || 0;
   const current = Number(result.breakdown.total_sec) || 0;
   const diff = current - original;
@@ -1175,6 +1182,39 @@ function renderFillPanel(result) {
   `;
   renderFillCompare(result);
   renderProcessPlans(result, fill.processes || {});
+}
+
+// 埋めた形状と「埋めない（MCで加工）」にした形状の一覧。行ごとに切り替えて再解析できる
+function renderFillItems(fill) {
+  const box = $("#fillItems");
+  if (!box) return;
+  const filled = fill.mode === "model" ? fill.items || [] : [];
+  const skipped = fill.skipped || [];
+  if (!filled.length && !skipped.length) {
+    box.innerHTML = "";
+    return;
+  }
+  const row = (item, isSkipped) => `
+    <tr class="${isSkipped ? "fill-skipped" : ""}">
+      <td><span class="fill-kind ${item.category}">${item.category === "drill" ? "ドリル穴" : "ワイヤ"}</span></td>
+      <td>${esc(item.kind)}</td>
+      <td>${esc(item.dimensions)}</td>
+      <td>${esc(item.count)}</td>
+      <td>${isSkipped ? "MCで加工（埋めない）" : "埋めて別工程"}</td>
+      <td class="action-cell">${item.key
+        ? isSkipped
+          ? `<button type="button" class="secondary-button compact" data-fill-unskip="${esc(item.key)}">埋める</button>`
+          : `<button type="button" class="secondary-button compact" data-fill-skip="${esc(item.key)}" title="精度穴などMCで仕上げる形状は埋めずに残す">埋めない</button>`
+        : ""}</td>
+    </tr>`;
+  box.innerHTML = `
+    <h4>埋める形状 <span class="process-meta">精度穴などMCで加工する形状は「埋めない」にすると、元モデルのまま MC 時間に含めます</span></h4>
+    <div class="table-wrap">
+      <table class="compare-table fill-items">
+        <thead><tr><th>区分</th><th>種別</th><th>寸法</th><th>数量</th><th>扱い</th><th></th></tr></thead>
+        <tbody>${filled.map((item) => row(item, false)).join("")}${skipped.map((item) => row(item, true)).join("")}</tbody>
+      </table>
+    </div>`;
 }
 
 function signedSecLabel(sec) {
@@ -2331,6 +2371,7 @@ async function openHistory(historyId) {
   // B-Rep の無いファイルで「穴を除外して MC のみ」にした穴は、利用者の除外指定ではないので戻さない
   const fillHoleKeys = new Set(result.fill?.excluded_hole_keys || []);
   state.excluded = new Set((result.excluded_keys || []).filter((key) => !fillHoleKeys.has(key)));
+  state.fillSkip = new Set(result.fill?.options?.skip_keys || []);
   setTab("analyze");
   renderResult(result, { fromHistory: true });
   $("#resultPanel").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2460,6 +2501,15 @@ function bindEvents() {
     refreshSettingsUi();
   });
 
+  document.body.addEventListener("click", async (event) => {
+    const skip = event.target.closest("[data-fill-skip]");
+    const unskip = event.target.closest("[data-fill-unskip]");
+    if (!skip && !unskip) return;
+    if (skip) state.fillSkip.add(skip.dataset.fillSkip);
+    if (unskip) state.fillSkip.delete(unskip.dataset.fillUnskip);
+    await reanalyzeWithExclusions();
+  });
+
   document.body.addEventListener("click", (event) => {
     if (!event.target.closest("[data-fill-compare-toggle]") || !state.lastResult) return;
     state.fillCompareShowAll = !state.fillCompareShowAll;
@@ -2505,6 +2555,7 @@ function bindEvents() {
         if (!formData.has(name)) formData.set(name, "off");
       });
       formData.set("excluded_features", JSON.stringify(Array.from(state.excluded)));
+      formData.set("fill_skip_keys", JSON.stringify(Array.from(state.fillSkip)));
       const data = await jsonFetch("/api/analyze", { method: "POST", body: formData });
       state.lastSignature = signature;
       renderResult(data);

@@ -27,7 +27,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-09-28-fill-compare-ado"
+APP_VERSION = "2026-09-29-fill-skip"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -1573,7 +1573,30 @@ def fill_options_from_form(form: Any) -> dict[str, Any]:
                 maximum=200,
             )
         ),
+        # 利用者が「埋めない（MCで加工）」にした形状の識別子（fill_item_key）
+        "skip_keys": fill_skip_keys_from_form(form),
     }
+
+
+def fill_skip_keys_from_form(form: Any) -> list[str]:
+    raw = form.get("fill_skip_keys", "")
+    try:
+        keys = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(keys, list):
+        return []
+    return sorted({str(key)[:120] for key in keys if isinstance(key, (str, int, float))})[:200]
+
+
+def fill_item_key(item: dict[str, Any]) -> str:
+    """埋める形状の識別子。同じ寸法の形状は同じ識別子になり、一覧の1行・「埋めない」指定の単位になる。"""
+    if item["category"] == "drill":
+        return f'drill|{item["kind"]}|{fmt_number(item["diameter_mm"])}|{float(item["depth_mm"]):.2f}|{item["axis"]}'
+    return (
+        f'wire|{item["kind"]}|{float(item["width_mm"]):.2f}|{float(item["length_mm"]):.2f}'
+        f'|{float(item["thickness_mm"]):.2f}|{float(item["perimeter_mm"]):.1f}'
+    )
 
 
 def _axis_extent(face: Any, origin: Any, axis: Any) -> tuple[float, float]:
@@ -1734,6 +1757,10 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
     entries: list[dict[str, Any]] = []
     warnings: list[str] = []
     filled_axes: list[tuple[Any, Any]] = []
+    # 利用者が「埋めない（MCで加工）」にした形状。穴は軸線も覚えておき、ワイヤ側の丸穴として拾い直さない
+    skip_keys = set(options.get("skip_keys") or [])
+    skipped_items: list[dict[str, Any]] = []
+    skipped_axes: list[tuple[Any, Any]] = []
 
     def warn(message: str) -> None:
         if message not in warnings and len(warnings) < 20:
@@ -1812,27 +1839,27 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
                 continue
             hole["coaxial_smaller"] = bool(coaxial_smaller)
             start = hole["origin"] + hole["axis"] * hole["t_min"]
+            diameter = hole["radius"] * 2
+            item = {
+                "category": "drill",
+                "kind": _hole_label(diameter, hole["axis"], hole["coaxial_smaller"]),
+                "diameter_mm": round(diameter, 3),
+                "depth_mm": round(hole["length"], 2),
+                "axis": axis_label((hole["axis"].x, hole["axis"].y, hole["axis"].z)),
+                "volume_mm3": math.pi * hole["radius"] ** 2 * hole["length"],
+                "center": [round(v, 2) for v in (start + hole["axis"] * (hole["length"] / 2)).toTuple()],
+            }
+            if fill_item_key(item) in skip_keys:
+                skipped_items.append(item)
+                skipped_axes.append((hole["origin"], hole["axis"]))
+                continue
             try:
                 plug = cq.Solid.makeCylinder(hole["radius"], hole["length"], start, hole["axis"])
             except Exception:  # noqa: BLE001
-                warn(f"φ{fmt_number(hole['radius'] * 2)} の穴を埋める円柱を作れませんでした。")
+                warn(f"φ{fmt_number(diameter)} の穴を埋める円柱を作れませんでした。")
                 continue
             filled_axes.append((hole["origin"], hole["axis"]))
-            diameter = hole["radius"] * 2
-            entries.append(
-                {
-                    "solid": plug,
-                    "item": {
-                        "category": "drill",
-                        "kind": _hole_label(diameter, hole["axis"], hole["coaxial_smaller"]),
-                        "diameter_mm": round(diameter, 3),
-                        "depth_mm": round(hole["length"], 2),
-                        "axis": axis_label((hole["axis"].x, hole["axis"].y, hole["axis"].z)),
-                        "volume_mm3": math.pi * hole["radius"] ** 2 * hole["length"],
-                        "center": [round(v, 2) for v in (start + hole["axis"] * (hole["length"] / 2)).toTuple()],
-                    },
-                }
-            )
+            entries.append({"solid": plug, "item": item})
         # 埋めた穴と同軸の円錐面（皿もみ・ドリル先端）も埋める
         for face in shape.Faces():
             if face.geomType() != "CONE":
@@ -1930,57 +1957,60 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
                     warn("一部の開口は形状を読み取れなかったため、埋めずに残しました。")
                     continue
                 if kind == "丸穴" and any(
-                    _same_axis_line(o, a, cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)) for o, a in filled_axes
+                    _same_axis_line(o, a, cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1))
+                    for o, a in filled_axes + skipped_axes
                 ):
-                    continue  # ドリル穴として埋め済み
+                    continue  # ドリル穴として埋め済み（または利用者が埋めないと指定した穴）
                 if kind == "丸穴" and (max_drill <= 0 or width <= max_drill + 1e-6):
                     # 円筒面が横穴などで欠けて穴として拾えなかった小径の貫通丸穴はドリル穴として扱う
                     if not options.get("drill_holes"):
                         continue
                     wire_boxes.append(box)
+                    item = {
+                        "category": "drill",
+                        "kind": "微細穴" if width < 3.0 else "穴",
+                        "diameter_mm": round(width, 3),
+                        "depth_mm": round(thickness, 2),
+                        "axis": "Z",
+                        "volume_mm3": prism_volume,
+                        "center": [round(v, 2) for v in center.toTuple()],
+                    }
+                    if fill_item_key(item) in skip_keys:
+                        skipped_items.append(item)
+                        continue
                     filled_axes.append((cq.Vector(center.x, center.y, 0), cq.Vector(0, 0, 1)))
-                    entries.append(
-                        {
-                            "solid": prism,
-                            "item": {
-                                "category": "drill",
-                                "kind": "微細穴" if width < 3.0 else "穴",
-                                "diameter_mm": round(width, 3),
-                                "depth_mm": round(thickness, 2),
-                                "axis": "Z",
-                                "volume_mm3": prism_volume,
-                                "center": [round(v, 2) for v in center.toTuple()],
-                            },
-                        }
-                    )
+                    entries.append({"solid": prism, "item": item})
                     continue
                 wire_boxes.append(box)
-                entries.append(
-                    {
-                        "solid": prism,
-                        "item": {
-                            "category": "wire",
-                            "kind": kind,
-                            "width_mm": round(width, 2),
-                            "length_mm": round(length, 2),
-                            "diameter_mm": round(width, 3) if kind == "丸穴" else None,
-                            "thickness_mm": round(thickness, 2),
-                            "perimeter_mm": round(perimeter, 1),
-                            "cut_area_mm2": round(perimeter * thickness, 1),
-                            "volume_mm3": prism_volume,
-                            "center": [round(v, 2) for v in center.toTuple()],
-                        },
-                    }
-                )
+                item = {
+                    "category": "wire",
+                    "kind": kind,
+                    "width_mm": round(width, 2),
+                    "length_mm": round(length, 2),
+                    "diameter_mm": round(width, 3) if kind == "丸穴" else None,
+                    "thickness_mm": round(thickness, 2),
+                    "perimeter_mm": round(perimeter, 1),
+                    "cut_area_mm2": round(perimeter * thickness, 1),
+                    "volume_mm3": prism_volume,
+                    "center": [round(v, 2) for v in center.toTuple()],
+                }
+                if fill_item_key(item) in skip_keys:
+                    skipped_items.append(item)
+                    continue
+                entries.append({"solid": prism, "item": item})
 
+    empty = {
+        "items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0,
+        "warnings": warnings, "skipped_items": skipped_items,
+    }
     if not entries:
-        return {"items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0, "warnings": warnings}
+        return empty
 
     filled, used = _fuse_plugs_per_solid(shape, [entry["solid"] for entry in entries], warn)
     used_entries = [entry for entry, ok in zip(entries, used) if ok]
     if not used_entries:
         warn("埋める形状をモデルに結合できませんでした。")
-        return {"items": [], "filled_path": None, "bodies_path": None, "added_volume_mm3": 0.0, "warnings": warnings}
+        return empty
     bodies = cq.Compound.makeCompound([entry["solid"] for entry in used_entries])
     filled_path = output_stem.with_name(output_stem.name + "__filled.step")
     bodies_path = output_stem.with_name(output_stem.name + "__fillbodies.step")
@@ -1992,6 +2022,7 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
         "bodies_path": bodies_path,
         "added_volume_mm3": max(0.0, float(filled.Volume()) - original_volume),
         "warnings": warnings,
+        "skipped_items": skipped_items,
     }
 
 
@@ -2131,6 +2162,7 @@ def summarize_fill_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         group = groups.setdefault(
             key,
             {
+                "key": fill_item_key(item),
                 "category": item["category"],
                 "kind": item["kind"],
                 "dimensions": label,
@@ -5684,7 +5716,7 @@ def api_analyze() -> Response:
 
 
 # 埋めたモデルのキャッシュ。埋め方を変えたら上げて、古いキャッシュを使わないようにする
-FILL_CACHE_VERSION = "2"
+FILL_CACHE_VERSION = "3"
 FILL_HOLE_FEATURE_PREFIXES = ("hole", "fine_hole", "side_hole", "counterbore", "countersink")
 
 
@@ -5716,6 +5748,7 @@ def load_or_build_filled_model(path: Path, fill_options: dict[str, Any]) -> dict
                     "items": info.get("items") or [],
                     "added_volume_mm3": float(info.get("added_volume_mm3") or 0.0),
                     "warnings": info.get("warnings") or [],
+                    "skipped_items": info.get("skipped_items") or [],
                     "filled_path": filled_path if has_model else None,
                     "bodies_path": bodies_path if has_model else None,
                     "token": token if has_model else None,
@@ -5732,6 +5765,7 @@ def load_or_build_filled_model(path: Path, fill_options: dict[str, Any]) -> dict
                 "items": fill["items"],
                 "added_volume_mm3": fill["added_volume_mm3"],
                 "warnings": fill.get("warnings") or [],
+                "skipped_items": fill.get("skipped_items") or [],
                 "has_model": has_model,
             },
             ensure_ascii=False,
@@ -5767,10 +5801,16 @@ def prepare_filled_model(
             "token": fill["token"],
             "cached": fill.get("cached", False),
             "warnings": fill.get("warnings") or [],
+            # 利用者が「埋めない（MCで加工）」にした形状（画面で「埋める」に戻せるように返す）
+            "skipped": summarize_fill_items(fill.get("skipped_items") or []),
         }
     )
     if not rows:
-        payload["message"] = "埋める対象の形状が見つかりませんでした。元モデルのまま算出しています。"
+        payload["message"] = (
+            "埋める形状をすべて「埋めない（MCで加工）」にしたため、元モデルのまま算出しています。"
+            if payload["skipped"]
+            else "埋める対象の形状が見つかりませんでした。元モデルのまま算出しています。"
+        )
     return payload, fill["filled_path"], fill["items"]
 
 

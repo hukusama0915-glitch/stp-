@@ -1700,3 +1700,9 @@ table.compare-table.features { min-width: 560px; }
   .compare-grid { grid-template-columns: minmax(0, 1fr); }
   .compare-block:first-child { max-width: 420px; }
 }
+
+/* 埋める形状の一覧（行ごとに「埋めない」へ切り替え） */
+.fill-items-box h4 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin: 4px 0 6px; font-size: 14px; }
+.fill-items-box { margin-bottom: 12px; }
+table.compare-table.fill-items { min-width: 520px; }
+.compare-table tr.fill-skipped td { color: var(--sub); background: #f7f8f7; }
