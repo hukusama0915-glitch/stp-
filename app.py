@@ -27,7 +27,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-09-29-fill-skip"
+APP_VERSION = "2026-10-02-fill-robust"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -1554,6 +1554,8 @@ def parse_step_file(path: Path, blank_allowance_mm: float) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 FILL_MIN_HOLE_ARC_RATIO = 0.95  # 全周円筒（穴）とみなす円弧率
+# 円周方向に一周そろっていれば、交差穴で壁が欠けて面積の比率がここまで下がっても穴とみなす
+FILL_MIN_CROSSED_HOLE_AREA_RATIO = 0.5
 FILL_THROUGH_TOLERANCE = 0.01  # 押し出し柱と材料の重なりがこの比率未満なら貫通
 DEFAULT_FILL_DRILL_MAX_DIAMETER_MM = 13.0
 
@@ -1597,6 +1599,53 @@ def fill_item_key(item: dict[str, Any]) -> str:
         f'wire|{item["kind"]}|{float(item["width_mm"]):.2f}|{float(item["length_mm"]):.2f}'
         f'|{float(item["thickness_mm"]):.2f}|{float(item["perimeter_mm"]):.1f}'
     )
+
+
+def surface_adaptor(face: Any) -> Any:
+    """面の曲面（円筒・円錐・トーラスなど）を読むためのアダプタ。
+
+    STEP によっては曲面がトリム付き曲面（Geom_RectangularTrimmedSurface）で保存されていて、
+    cadquery の _geomAdaptor() では .Cylinder() などが使えない。BRepAdaptor_Surface はどちらでも読める。
+    """
+    from OCP.BRepAdaptor import BRepAdaptor_Surface  # type: ignore
+
+    return BRepAdaptor_Surface(face.wrapped)
+
+
+def _cylinder_face_arc(adaptor: Any, cylinder: Any, axis: Any) -> tuple[float, float]:
+    """円筒面が軸まわりに占める角度の範囲（開始角, 角度幅）[度]。
+
+    角度は軸だけから決まる基準方向で測るので、同じ穴の分割された面どうしで比べられる。
+    """
+    import cadquery as cq  # type: ignore
+
+    helper = cq.Vector(0, 0, 1) if abs(axis.z) < 0.9 else cq.Vector(1, 0, 0)
+    ref_x = axis.cross(helper).normalized()
+    ref_y = axis.cross(ref_x)
+    x_dir = cylinder.XAxis().Direction()
+    y_dir = cylinder.YAxis().Direction()
+    x_vec = cq.Vector(x_dir.X(), x_dir.Y(), x_dir.Z())
+    y_vec = cq.Vector(y_dir.X(), y_dir.Y(), y_dir.Z())
+    offset = math.atan2(x_vec.dot(ref_y), x_vec.dot(ref_x))
+    u_first, u_last = float(adaptor.FirstUParameter()), float(adaptor.LastUParameter())
+    span = max(0.0, min(2 * math.pi, u_last - u_first))
+    if x_vec.cross(y_vec).dot(axis) >= 0:
+        start = offset + u_first
+    else:  # 円筒の向きが軸と逆なら角度の進む向きも逆
+        start = offset - u_last
+    return math.degrees(start) % 360.0, math.degrees(span)
+
+
+def _arc_coverage(arcs: list[tuple[float, float]]) -> float:
+    """角度の範囲を重ねたときに一周（360°）のうちどれだけを覆うか（0〜1）。"""
+    covered = [False] * 360
+    for start, span in arcs:
+        if span >= 359.5:
+            return 1.0
+        first = int(math.floor(start + 0.5))
+        for step in range(int(math.floor(span + 0.5))):
+            covered[(first + step) % 360] = True
+    return sum(covered) / 360.0
 
 
 def _axis_extent(face: Any, origin: Any, axis: Any) -> tuple[float, float]:
@@ -1646,6 +1695,27 @@ def _wire_shape_label(wire: Any) -> tuple[str, float, float]:
     if width > 0 and length / width >= 3.0:
         return "溝", width, length
     return "抜き窓・異形穴", width, length
+
+
+class _PointClassifier:
+    """点が材料の内側かを調べる（cadquery の isInside と同じ判定）。
+
+    isInside は呼ぶたびに判定器を作り直し、面の多いモデルでは穴の数だけ重い準備を繰り返すため、
+    判定器を1つ作って使い回す。
+    """
+
+    def __init__(self, shape: Any, tolerance: float = 1e-4) -> None:
+        from OCP.BRepClass3d import BRepClass3d_SolidClassifier  # type: ignore
+
+        self._classifier = BRepClass3d_SolidClassifier(shape.wrapped)
+        self._tolerance = tolerance
+
+    def __call__(self, point: Any) -> bool:
+        from OCP.gp import gp_Pnt  # type: ignore
+        from OCP.TopAbs import TopAbs_IN  # type: ignore
+
+        self._classifier.Perform(gp_Pnt(point.x, point.y, point.z), self._tolerance)
+        return self._classifier.State() == TopAbs_IN or self._classifier.IsOnAFace()
 
 
 class _VerticalRay:
@@ -1767,13 +1837,15 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
             warnings.append(message)
 
     if options.get("drill_holes"):
+        is_material = _PointClassifier(shape)
         # 円筒面は半周ずつに分割されていることが多いので、同一軸線・同一半径でまとめてから判定する
         cylinder_groups: list[dict[str, Any]] = []
         for face in shape.Faces():
             if face.geomType() != "CYLINDER":
                 continue
             try:
-                cylinder = face._geomAdaptor().Cylinder()
+                adaptor = surface_adaptor(face)
+                cylinder = adaptor.Cylinder()
                 radius = float(cylinder.Radius())
                 if radius <= 0:
                     continue
@@ -1785,6 +1857,7 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
                 )
                 t_min, t_max = _axis_extent(face, origin, axis)
                 area = float(face.Area())
+                arc = _cylinder_face_arc(adaptor, cylinder, axis)
             except Exception:  # noqa: BLE001 - 読めない円筒面は飛ばす
                 warn("一部の円筒面を読み取れなかったため、穴の判定から外しました。")
                 continue
@@ -1801,23 +1874,33 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
             )
             if group is None:
                 cylinder_groups.append(
-                    {"radius": radius, "origin": origin, "axis": axis, "t_min": t_min, "t_max": t_max, "area": area}
+                    {
+                        "radius": radius, "origin": origin, "axis": axis, "t_min": t_min, "t_max": t_max,
+                        "area": area, "arcs": [arc],
+                    }
                 )
             else:
                 group["t_min"] = min(group["t_min"], t_min)
                 group["t_max"] = max(group["t_max"], t_max)
                 group["area"] += area
+                group["arcs"].append(arc)
 
         holes: list[dict[str, Any]] = []
         for group in cylinder_groups:
             length = group["t_max"] - group["t_min"]
             if length < 0.05:
                 continue
-            if group["area"] / (2 * math.pi * group["radius"] * length) < FILL_MIN_HOLE_ARC_RATIO:
+            # 全周そろった円筒を穴とみなす。交差する横穴などで壁に穴が開いていると面積の比率は下がるが、
+            # 円周方向にはぐるりと一周しているので、角度の範囲でも判定する（隅Rなどは 90°程度しかない）。
+            area_ratio = group["area"] / (2 * math.pi * group["radius"] * length)
+            if area_ratio < FILL_MIN_HOLE_ARC_RATIO and not (
+                area_ratio >= FILL_MIN_CROSSED_HOLE_AREA_RATIO
+                and _arc_coverage(group["arcs"]) >= FILL_MIN_HOLE_ARC_RATIO
+            ):
                 continue
             middle = group["origin"] + group["axis"] * ((group["t_min"] + group["t_max"]) / 2)
             try:
-                if shape.isInside(middle, 1e-4):
+                if is_material(middle):
                     continue  # 材料側の円筒（ボス等）は対象外
             except Exception:  # noqa: BLE001
                 warn("穴の内外判定に失敗した円筒面があったため、埋めずに残しました。")
@@ -1865,7 +1948,7 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
             if face.geomType() != "CONE":
                 continue
             try:
-                cone = face._geomAdaptor().Cone()
+                cone = surface_adaptor(face).Cone()
                 direction = cone.Axis().Direction()
                 location = cone.Axis().Location()
                 axis = cq.Vector(direction.X(), direction.Y(), direction.Z()).normalized()
@@ -1876,6 +1959,8 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
                 if t_max - t_min < 0.01:
                     continue
 
+                # 半径は頂点から拾う。円錐の式から正確に求めたり材料側へ太らせたりすると、
+                # 結合後の面の整理（clean）が終わらなくなるモデルがあった（301 光学箱）。
                 def radius_at(t: float) -> float:
                     radii = [
                         ((cq.Vector(*v.toTuple()) - origin) - axis * (cq.Vector(*v.toTuple()) - origin).dot(axis)).Length
@@ -1886,7 +1971,7 @@ def build_filled_model(path: Path, options: dict[str, bool], output_stem: Path) 
 
                 r_start, r_end = radius_at(t_min), radius_at(t_max)
                 middle = origin + axis * ((t_min + t_max) / 2)
-                if shape.isInside(middle, 1e-4):
+                if is_material(middle):
                     continue
                 entries.append(
                     {"solid": cq.Solid.makeCone(r_start, r_end, t_max - t_min, origin + axis * t_min, axis), "item": None}
@@ -2095,7 +2180,8 @@ def _fuse_plugs_per_solid(shape: Any, plugs: list[Any], warn: Any) -> tuple[Any,
 def _fuse_safely(base: Any, partners: list[Any], indices: list[int], plugs: list[Any], used: list[bool], warn: Any) -> Any:
     """base に partners（同じまとまりのソリッド）と柱を結合する。
 
-    まとめて結合し、失敗したら1本ずつ結合する（結合できない柱は飛ばす）。
+    接し合う柱（段付き穴の下穴・ドリル先端・面取り、交差する通路など）を先に柱どうしで1つにまとめ、
+    まとまりごとに結合する。結合できないまとまりは柱1本ずつに戻して結合し直し、それでも結合できない柱は飛ばす。
     partners と結合できなかったときは、partners を元のまま残す。
     """
     import cadquery as cq  # type: ignore
@@ -2114,32 +2200,114 @@ def _fuse_safely(base: Any, partners: list[Any], indices: list[int], plugs: list
 
     if not indices:
         return finish(base)
-    try:
-        fused = base.fuse(*[plugs[i] for i in indices])
-        if fused.isValid():
-            for i in indices:
-                used[i] = True
-            return finish(fused)
-    except Exception:  # noqa: BLE001 - 1本ずつに切り替える
-        pass
-    result = base
-    for i in indices:
+
+    solid_count = len(base.Solids())
+    # 結合の単位: (形状, 含まれる柱の番号)
+    units = _merge_touching_plugs(indices, plugs)
+
+    def try_fuse(target: Any, subset: list[tuple[Any, list[int]]]) -> Any | None:
         try:
-            candidate = result.fuse(plugs[i])
-            if candidate.isValid():
-                result = candidate
-                used[i] = True
-                continue
+            fused = target.fuse(*[unit for unit, _ in subset])
+            current_volume = float(target.Volume())
+            added_max = sum(abs(float(unit.Volume())) for unit, _ in subset)
         except Exception:  # noqa: BLE001
-            pass
+            return None
+        return fused if _fused_plausible(fused, solid_count, current_volume, added_max) else None
+
+    # まとめて結合し、失敗したら半分ずつに分けて結合できた分を積み上げる（結合できない単位だけ外れる）。
+    # 1本ずつ結合すると柱の数だけ大きな形状のブーリアン演算を繰り返し、数分かかるため。
+    failed: list[tuple[Any, list[int]]] = []
+
+    def add(target: Any, subset: list[tuple[Any, list[int]]]) -> Any:
+        fused = try_fuse(target, subset)
+        if fused is not None:
+            for _, members in subset:
+                for i in members:
+                    used[i] = True
+            return fused
+        if len(subset) == 1:
+            failed.append(subset[0])
+            return target
+        middle = len(subset) // 2
+        return add(add(target, subset[:middle]), subset[middle:])
+
+    result = add(base, units)
+    # まとめた単位で結合できなかったものは、柱1本ずつに戻してもう一度
+    retry = [(plugs[i], [i]) for _, members in failed if len(members) > 1 for i in members]
+    if retry:
+        result = add(result, retry)
+    if not all(used[i] for i in indices):
         warn("モデルに結合できない埋め形状があったため、その形状は埋めずに算出しました。")
     return finish(result)
+
+
+def _merge_touching_plugs(indices: list[int], plugs: list[Any]) -> list[tuple[Any, list[int]]]:
+    """接し合う柱を柱どうしで1つの形状にまとめる。返り値は（形状, 含まれる柱の番号）の一覧。
+
+    段付き穴の下穴と上の段のように面がぴったり重なる柱を、本体と別々に結合すると結合が壊れやすい。
+    柱どうしの結合は小さな形状どうしで速いので、先にまとめておく。まとめられなかったものは柱のまま返す。
+    """
+    boxes = {i: plugs[i].BoundingBox() for i in indices}
+    parent = {i: i for i in indices}
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    for position, i in enumerate(indices):
+        for j in indices[position + 1:]:
+            if root(i) == root(j) or not _bbox_overlaps(boxes[i], boxes[j], 0.01):
+                continue
+            try:
+                if float(plugs[i].distance(plugs[j])) <= 0.01:
+                    parent[root(j)] = root(i)
+            except Exception:  # noqa: BLE001 - 距離が測れない柱はまとめない
+                continue
+    clusters: dict[int, list[int]] = {}
+    for i in indices:
+        clusters.setdefault(root(i), []).append(i)
+
+    units: list[tuple[Any, list[int]]] = []
+    for members in clusters.values():
+        if len(members) > 1:
+            try:
+                merged = _clean_safely(plugs[members[0]].fuse(*[plugs[i] for i in members[1:]]))
+                solids = merged.Solids()
+                if merged.isValid() and len(solids) == 1 and float(solids[0].Volume()) > 0:
+                    units.append((solids[0], members))
+                    continue
+            except Exception:  # noqa: BLE001 - まとめられなければ柱のまま結合する
+                pass
+        units.extend((plugs[i], [i]) for i in members)
+    return units
+
+
+def _fused_plausible(shape: Any, solid_count: int, base_volume: float, added_max: float) -> bool:
+    """結合結果が形として妥当か。
+
+    isValid() は通っても、ソリッドが細切れになり体積がマイナスになる壊れ方をすることがある
+    （301 光学箱で、交差するφ10の通路と座ぐりをまとめて埋めたとき）。ソリッドが増えておらず、
+    体積が「元以上・元＋柱の合計以下」に収まっているかも確かめる。
+    """
+    try:
+        if not shape.isValid() or len(shape.Solids()) > solid_count:
+            return False
+        volume = float(shape.Volume())
+    except Exception:  # noqa: BLE001
+        return False
+    tolerance = max(1.0, abs(base_volume) * 1e-4)
+    return base_volume - tolerance <= volume <= base_volume + added_max + tolerance
 
 
 def _clean_safely(shape: Any) -> Any:
     try:
         cleaned = shape.clean()
-        return cleaned if cleaned.isValid() else shape
+        volume = float(shape.Volume())
+        if _fused_plausible(cleaned, len(shape.Solids()), volume, 0.0):
+            return cleaned
+        return shape
     except Exception:  # noqa: BLE001 - 面の統合に失敗しても形状自体は使える
         return shape
 
@@ -2519,7 +2687,7 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
             face_type_counts[geom_type] = face_type_counts.get(geom_type, 0) + 1
             if geom_type == "CYLINDER":
                 try:
-                    cylinder = face._geomAdaptor().Cylinder()
+                    cylinder = surface_adaptor(face).Cylinder()
                     radius = float(cylinder.Radius())
                     direction = cylinder.Axis().Direction()
                     axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
@@ -2587,7 +2755,7 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
                     )
             elif geom_type == "CONE":
                 try:
-                    cone = face._geomAdaptor().Cone()
+                    cone = surface_adaptor(face).Cone()
                     direction = cone.Axis().Direction()
                     axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
                     center = tuple(float(value) for value in face.Center().toTuple())
@@ -2619,7 +2787,7 @@ def parse_step_brep(path: Path, blank_allowance_mm: float) -> dict[str, Any] | N
                 )
             elif geom_type == "TORUS":
                 try:
-                    torus = face._geomAdaptor().Torus()
+                    torus = surface_adaptor(face).Torus()
                     direction = torus.Axis().Direction()
                     axis = (float(direction.X()), float(direction.Y()), float(direction.Z()))
                     center = tuple(float(value) for value in face.Center().toTuple())
@@ -5716,7 +5884,7 @@ def api_analyze() -> Response:
 
 
 # 埋めたモデルのキャッシュ。埋め方を変えたら上げて、古いキャッシュを使わないようにする
-FILL_CACHE_VERSION = "3"
+FILL_CACHE_VERSION = "4"
 FILL_HOLE_FEATURE_PREFIXES = ("hole", "fine_hole", "side_hole", "counterbore", "countersink")
 
 

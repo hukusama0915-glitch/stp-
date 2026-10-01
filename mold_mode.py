@@ -188,6 +188,7 @@ def local_top(heights: np.ndarray, res: float, radius: float) -> np.ndarray:
 def concave_curved_faces(shape: Any) -> list[dict[str, float]]:
     """凹の円筒・球・トーラス面（隅R・フィレット）の半径と範囲。工具径の下限と小径工具の範囲に使う。"""
     import cadquery as cq  # type: ignore
+    from OCP.BRepAdaptor import BRepAdaptor_Surface  # type: ignore
 
     faces: list[dict[str, float]] = []
     for face in shape.Faces():
@@ -197,7 +198,8 @@ def concave_curved_faces(shape: Any) -> list[dict[str, float]]:
                 continue
             center = face.Center()
             normal = face.normalAt(center)
-            adaptor = face._geomAdaptor()
+            # トリム付き曲面で保存された面も読めるよう BRepAdaptor_Surface を使う
+            adaptor = BRepAdaptor_Surface(face.wrapped)
             if geom_type == "CYLINDER":
                 surface = adaptor.Cylinder()
                 radius = float(surface.Radius())
