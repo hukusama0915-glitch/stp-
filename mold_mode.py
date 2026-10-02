@@ -61,6 +61,9 @@ class MoldStage:
     finish_steep_area: float = 0.0
     finish_flat_area: float = 0.0
     finish_reason: str = ""
+    # 加工範囲・仕上げ範囲の高さの幅 mm（等高線の段数＝アプローチ回数の見積もりに使う）
+    region_z_range: float = 0.0
+    finish_z_range: float = 0.0
 
 
 @dataclass
@@ -454,6 +457,9 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
                 stage.finish_steep_area = float(cell_area[finish_region & steep].sum())
                 stage.finish_flat_area = float(cell_area[finish_region & ~steep].sum())
             # 必要な首下長: 工具が働く面の、周囲（工具首の逃げ）の上端からの深さ
+            stage.region_z_range = _z_range(work, region & (cell_area > 0))
+            if stage.finish_role != "none":
+                stage.finish_z_range = _z_range(work, finish_region & (cell_area > 0))
             tops = local_top(work, res, diameter / 2 + NECK_CLEARANCE_MM)
             np.subtract(tops, work, out=tops)
             depth = tops[region & (cell_area > 0)]
@@ -478,21 +484,99 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
     )
 
 
+def _z_range(work: np.ndarray, mask: np.ndarray) -> float:
+    values = work[mask]
+    return float(values.max() - values.min()) if values.size else 0.0
+
+
 # ---------------------------------------------------------------- 工程と時間
+
+# ---- 切削以外の時間（301 スキャナカバーの実績NCを工具交換ごとに分解して求めた値） ----
+# 実績NC（指令送りで計算）: 切削 87.1h / アプローチ 26.6h（87,848回）/ Z上昇 2.1h / 早送り 3.7h /
+# 暖機ドウェル 1.0h（G04 X60 x 62本）/ 工具測定 G65 x 124回 / 工具交換 62回。CAMシートの合計は 140.2h。
+# アプローチ: 切込み点の 3mm 上まで早送り → 3mm を F500 → 最後の 1mm を F80（CAM-TOOL の設定）
+APPROACH_IDLE_MM = 3.0
+APPROACH_IDLE_FEED = 500.0
+APPROACH_PLUNGE_MM = 1.0
+APPROACH_PLUNGE_FEED = 80.0
+# アプローチ1回あたりの Z上昇・早送り（実績 (2.1h + 3.7h) / 87,848回）
+RETRACT_RAPID_SEC_PER_APPROACH = 0.24
+# 見積もり上の等高線1段あたりのアプローチ回数（島・ポケットごとに入り直す分を含む）。
+# 実績の段数あたり回数は 1.7〜4.8 だが、見積もりのZピッチは実績より粗く段数が少ないので、
+# 下の上限（切削距離から決まる回数）と組み合わせて、301 のアプローチ総数が実績（87,848回）に合うよう校正した値
+# （見積もり 86,899回 / 32.5h、実績 アプローチ＋Z上昇・早送り 32.4h）
+APPROACHES_PER_LEVEL = 12.5
+# 1回のアプローチで最低限削る距離 = 係数 x 工具径（小さな範囲で段数ばかり多い工程の回数を抑える上限）。
+# 実績の工具ブロックごとの「切削距離/アプローチ回数」の小さい側は工具径の 2〜13倍
+APPROACH_MIN_CUT_PER_DIAMETER = 5.0
+# 工具1本ごとの固定時間 秒: 主軸の暖機ドウェル（実績 G04 X60）＋工具測定・折損検知（G65 P9623/P9624 の2回。
+# 1回の所要時間はNCから分からないため 20秒ずつの仮値）
+TOOL_WARMUP_SEC = 60.0
+TOOL_MEASURE_SEC = 40.0
+# 切削の実効率（指令送りに対する実送り。加減速で落ちる分）。切削以外を別に数えるようにしたので、
+# 301 の切削時間が実績NCの切削（指令送りで 87.1h）に近くなるよう校正した値（見積もり 84.5h）。
+# この校正で 301 の慎重モード合計は 139:05（実績 CAM 140.2h）
+CUTTING_EFFICIENCY = 0.95
+
+
+def default_approach() -> dict[str, float]:
+    """アプローチ条件の既定値（301 の CAM-TOOL 設定）。画面で変えると、その条件で時間を出す。"""
+    return {
+        "idle_mm": APPROACH_IDLE_MM,
+        "idle_feed": APPROACH_IDLE_FEED,
+        "plunge_mm": APPROACH_PLUNGE_MM,
+        "plunge_feed": APPROACH_PLUNGE_FEED,
+    }
+
+
+def approach_seconds(approach: dict[str, float] | None = None) -> float:
+    """アプローチ1回の時間（空走＋切込み＋Z上昇・早送り）。"""
+    a = {**default_approach(), **(approach or {})}
+    return (
+        a["idle_mm"] / max(1.0, a["idle_feed"]) * 60.0
+        + a["plunge_mm"] / max(1.0, a["plunge_feed"]) * 60.0
+        + RETRACT_RAPID_SEC_PER_APPROACH
+    )
+
+
+def approach_count(z_range: float, z_step: float, passes: int, length_mm: float, diameter: float) -> int:
+    """等高線の段数 x 1段あたりの回数 x 回数（仕上げ回数）。ただし切削距離から決まる上限を超えない。"""
+    levels = max(1, math.ceil(max(0.0, z_range) / max(0.001, z_step)))
+    by_levels = levels * APPROACHES_PER_LEVEL * max(1, passes)
+    by_length = max(0.0, length_mm) / max(0.01, APPROACH_MIN_CUT_PER_DIAMETER * diameter)
+    return max(1, int(round(min(by_levels, by_length))))
 
 # 金型の等高荒取りでは、形状に沿って段を刻むため1段の切込みは工具径の10%程度に抑える
 ROUGH_AP_PER_DIAMETER = 0.1
 ROUGH_AE_PER_DIAMETER = 0.5
 
 
-def _cutting_minutes(length_mm: float, feed_mm_min: float, efficiency: float) -> float:
+def _cutting_minutes(length_mm: float, feed_mm_min: float, efficiency: float = CUTTING_EFFICIENCY) -> float:
     return length_mm / max(1.0, feed_mm_min) / max(0.1, efficiency)
+
+
+def _operation_minutes(
+    length_mm: float, feed_mm_min: float, approaches: int, approach_sec: float
+) -> dict[str, float]:
+    """工程の時間 = 切削 + アプローチ（空走・切込み・Z上昇・早送り）+ 工具1本の固定時間（暖機・測定）。"""
+    cut = _cutting_minutes(length_mm, feed_mm_min)
+    approach = approaches * approach_sec / 60.0
+    fixed = (TOOL_WARMUP_SEC + TOOL_MEASURE_SEC) / 60.0
+    return {"minutes": cut + approach + fixed, "cut_minutes": cut, "approach_minutes": approach, "fixed_minutes": fixed}
+
+
+def _time_label(op_time: dict[str, float], approaches: int) -> str:
+    return (
+        f"切削 {op_time['cut_minutes']:.0f}分 + アプローチ {approaches:,}回 {op_time['approach_minutes']:.0f}分"
+        f" + 暖機・測定 {op_time['fixed_minutes']:.1f}分"
+    )
 
 
 def build_mold_operations(
     plan: MoldPlan,
     select_condition: Any,
     finish_passes: int = 2,
+    approach: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """工具段階ごとに 荒取り／残り取り／仕上げ の工程と切削距離・時間を返す。
 
@@ -502,6 +586,7 @@ def build_mold_operations(
     """
     operations: list[dict[str, Any]] = []
     finish_passes = max(1, int(finish_passes))
+    approach_sec = approach_seconds(approach)
     for index, stage in enumerate(plan.stages):
         cond = select_condition(stage.diameter, stage.required_depth, stage.tool_shape)
         feed = float(cond["feed"])
@@ -525,17 +610,20 @@ def build_mold_operations(
             ae = min(float(cond["ae"]), ROUGH_AE_PER_DIAMETER * stage.diameter)
             length = stage.rest_volume / max(0.01, ap * ae)
             levels = max(1, math.ceil((plan.bounds["zmax"] - plan.machined_floor_z) / max(0.01, ap)))
+            approaches = approach_count(plan.bounds["zmax"] - plan.machined_floor_z, ap, 1, length, stage.diameter)
+            op_time = _operation_minutes(length, feed, approaches, approach_sec)
             operations.append(
                 {
                     "feature_type": "金型 荒取り（等高）",
                     "dimensions": f"除去体積 {stage.rest_volume:.0f} mm3 / {region_label}",
                     "stage": stage,
                     "cond": cond,
-                    "minutes": _cutting_minutes(length, feed, 0.75),
+                    **op_time,
+                    "approach_count": approaches,
                     "length": length,
                     "passes": levels,
                     "method": "等高荒取り",
-                    "extra": f"Z {levels}段 / ap {ap:.2f} x ae {ae:.2f} mm",
+                    "extra": f"Z {levels}段 / ap {ap:.2f} x ae {ae:.2f} mm / {_time_label(op_time, approaches)}",
                     "note": f"φ{stage.diameter:g} {tool_label}で全面を等高荒取り（段の切込みは工具径の{ROUGH_AP_PER_DIAMETER:.0%}まで）",
                     "reachability": reach_note,
                     "feature_key": f"{key_base}_rough",
@@ -547,17 +635,20 @@ def build_mold_operations(
             ap = float(cond["ap"])
             ae = float(cond["ae"])
             rest_length += stage.rest_volume / max(0.0005, ap * ae)
+            approaches = approach_count(stage.region_z_range, rest_pitch, 1, rest_length, stage.diameter)
+            op_time = _operation_minutes(rest_length, feed, approaches, approach_sec)
             operations.append(
                 {
                     "feature_type": "金型 残り取り（等高）",
                     "dimensions": f"{region_label} / {area_label} / 残り {stage.rest_volume:.0f} mm3",
                     "stage": stage,
                     "cond": cond,
-                    "minutes": _cutting_minutes(rest_length, feed, 0.7),
+                    **op_time,
+                    "approach_count": approaches,
                     "length": rest_length,
                     "passes": 1,
                     "method": "等高残り取り",
-                    "extra": f"ピッチ {rest_pitch:.3f} mm",
+                    "extra": f"ピッチ {rest_pitch:.3f} mm / {_time_label(op_time, approaches)}",
                     "note": f"φ{stage.diameter:g} {tool_label}: {stage.reason}",
                     "reachability": reach_note,
                     "feature_key": f"{key_base}_rest",
@@ -572,6 +663,8 @@ def build_mold_operations(
             else f"範囲 {len(stage.finish_rects)}か所 {stage.finish_projected_area:.0f} mm2"
         )
         finish_length = (stage.finish_steep_area / z_pitch + stage.finish_flat_area / flat_pitch) * passes
+        approaches = approach_count(stage.finish_z_range, z_pitch, passes, finish_length, stage.diameter)
+        op_time = _operation_minutes(finish_length, feed, approaches, approach_sec)
         operations.append(
             {
                 "feature_type": "金型 仕上げ（等高線＋走査）" if stage.finish_role == "final" else "金型 中仕上げ（等高線＋走査）",
@@ -580,11 +673,12 @@ def build_mold_operations(
                 ),
                 "stage": stage,
                 "cond": cond,
-                "minutes": _cutting_minutes(finish_length, feed, 0.7),
+                **op_time,
+                "approach_count": approaches,
                 "length": finish_length,
                 "passes": passes,
                 "method": "等高線仕上げ",
-                "extra": f"Zピッチ {z_pitch:.3f} / 床ピッチ {flat_pitch:.3f} mm x {passes}回",
+                "extra": f"Zピッチ {z_pitch:.3f} / 床ピッチ {flat_pitch:.3f} mm x {passes}回 / {_time_label(op_time, approaches)}",
                 "note": (
                     f"φ{stage.diameter:g} {tool_label}: "
                     f"{stage.finish_reason or ('全面' if stage.whole_surface else '')}"

@@ -145,6 +145,22 @@
                 <label class="span-2" data-show-when-mold>金型の仕上げ回数（中仕上げを除く）
                   <input type="number" name="mold_finish_passes" value="2" min="1" max="5" step="1" inputmode="numeric" data-persist="mold_finish_passes">
                 </label>
+                <fieldset class="span-2 approach-fields" data-show-when-mold>
+                  <legend>アプローチ（CAMの設定。1回ごとに下降して切り込む動き）</legend>
+                  <label>空走 mm
+                    <input type="number" name="mold_approach_idle_mm" value="3" min="0" max="50" step="any" inputmode="decimal" data-persist="mold_approach_idle_mm">
+                  </label>
+                  <label>空走送り mm/分
+                    <input type="number" name="mold_approach_idle_feed" value="500" min="1" max="50000" step="any" inputmode="decimal" data-persist="mold_approach_idle_feed">
+                  </label>
+                  <label>切込み mm
+                    <input type="number" name="mold_approach_plunge_mm" value="1" min="0" max="20" step="any" inputmode="decimal" data-persist="mold_approach_plunge_mm">
+                  </label>
+                  <label>切込み送り mm/分
+                    <input type="number" name="mold_approach_plunge_feed" value="80" min="1" max="50000" step="any" inputmode="decimal" data-persist="mold_approach_plunge_feed">
+                  </label>
+                  <p class="setting-note">既定値は 301 の実績NC（3mm を F500 → 1mm を F80、1回 約1.1秒）。金型では回数が数万回になり、合計時間に大きく効きます。</p>
+                </fieldset>
               </div>
 
               <details class="setting-group" id="fillSettings">

@@ -28,7 +28,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-10-03-mold-memory"
+APP_VERSION = "2026-10-03-mold-approach"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -3909,6 +3909,7 @@ def mold_mode_features(
     max_tool_diameter: float | None,
     use_manufacturer_conditions: bool,
     finish_passes: int,
+    approach: dict[str, float] | None = None,
 ) -> tuple[list[Feature], dict[str, Any]]:
     """金型モード: 高さマップから工具段階（荒取り→残り取り→仕上げ）の工程を作る。"""
     plan = mold_mode.plan_mold_machining(mold_mode.load_step_shape(path), max_tool_diameter)
@@ -3963,7 +3964,8 @@ def mold_mode_features(
         }
 
     features: list[Feature] = []
-    for op in mold_mode.build_mold_operations(plan, select_condition, finish_passes=finish_passes):
+    approach = {**mold_mode.default_approach(), **(approach or {})}
+    for op in mold_mode.build_mold_operations(plan, select_condition, finish_passes=finish_passes, approach=approach):
         cond = op["cond"]
         features.append(
             Feature(
@@ -3976,7 +3978,7 @@ def mold_mode_features(
                 op["minutes"] * 60,
                 op["note"],
                 cond["condition_text"],
-                path_plan_summary(op["length"], op["passes"], op["passes"] * 2, method=op["method"], extra=op["extra"]),
+                path_plan_summary(op["length"], op["passes"], op["approach_count"], method=op["method"], extra=op["extra"]),
                 cond["selection_reason"],
                 op["reachability"],
                 feature_key=op["feature_key"],
@@ -3992,6 +3994,8 @@ def mold_mode_features(
         "min_concave_radius": round(plan.min_concave_radius, 3) if plan.min_concave_radius else None,
         "concave_radius_counts": plan.concave_radius_counts,
         "finish_passes": finish_passes,
+        "approach": approach,
+        "approach_sec": round(mold_mode.approach_seconds(approach), 2),
         "tool_ladder": [
             {
                 "diameter": stage.diameter,
@@ -4024,6 +4028,7 @@ def estimate(
     extra_payload: dict[str, Any] | None = None,
     shape_mode: str = "prismatic",
     mold_finish_passes: int = 2,
+    mold_approach: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     analysis = parse_step_file(path, blank_allowance_mm)
     bbox = analysis["bbox"]
@@ -5463,6 +5468,7 @@ def estimate(
                     max_tool_diameter,
                     use_manufacturer_conditions,
                     mold_finish_passes,
+                    mold_approach,
                 )
             except Exception as exc:  # noqa: BLE001 - 金型解析に失敗しても角物の見積もりは返す
                 app.logger.exception("金型モードの解析に失敗しました: %s", path.name)
@@ -5829,6 +5835,16 @@ def api_analyze() -> Response:
     mold_finish_passes = int(
         input_number(request.form, "mold_finish_passes", "金型の仕上げ回数", default=2, minimum=1, maximum=5, integer=True)
     )
+    approach_defaults = mold_mode.default_approach()
+    mold_approach = {
+        key: float(input_number(request.form, f"mold_approach_{key}", label, default=approach_defaults[key], minimum=low, maximum=high))
+        for key, label, low, high in (
+            ("idle_mm", "アプローチの空走距離", 0, 50),
+            ("idle_feed", "アプローチの空走送り", 1, 50000),
+            ("plunge_mm", "アプローチの切込み距離", 0, 20),
+            ("plunge_feed", "アプローチの切込み送り", 1, 50000),
+        )
+    }
 
     cleanup_old_uploads()
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
@@ -5841,6 +5857,7 @@ def api_analyze() -> Response:
         excluded_keys=excluded_keys,
         shape_mode=shape_mode,
         mold_finish_passes=mold_finish_passes,
+        mold_approach=mold_approach,
     )
     try:
         analyze_path = path

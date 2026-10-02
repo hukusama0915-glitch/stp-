@@ -2312,6 +2312,7 @@ function renderResult(result, options = {}) {
       <dt>形状タイプ</dt><dd>金型（表面形状・残り取り） / 仕上げ ${esc(mold.finish_passes)}回</dd>
       <dt>工具段階</dt><dd>${esc(ladder)}</dd>
       <dt>最小凹R</dt><dd>${mold.min_concave_radius ? `R${esc(mold.min_concave_radius)}` : "-"} / 加工面積 ${Math.round(mold.surface_area_mm2).toLocaleString()} mm2</dd>
+      <dt>アプローチ</dt><dd>${mold.approach ? `空走 ${esc(mold.approach.idle_mm)}mm@F${esc(mold.approach.idle_feed)} → 切込み ${esc(mold.approach.plunge_mm)}mm@F${esc(mold.approach.plunge_feed)}（1回 ${esc(mold.approach_sec)}秒、Z上昇・早送り込み）` : "-"}</dd>
       <dt>金型係数</dt><dd>${esc(mold.calibration)}${(mold.notes || []).length ? ` / ${esc(mold.notes.join(" / "))}` : ""}</dd>
     `;
   }

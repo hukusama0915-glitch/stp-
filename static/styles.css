@@ -1706,3 +1706,8 @@ table.compare-table.features { min-width: 560px; }
 .fill-items-box { margin-bottom: 12px; }
 table.compare-table.fill-items { min-width: 520px; }
 .compare-table tr.fill-skipped td { color: var(--sub); background: #f7f8f7; }
+
+/* 金型モードのアプローチ条件 */
+.approach-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0; padding: 8px 10px; border: 1px solid var(--line); min-width: 0; }
+.approach-fields legend { font-size: 12px; color: var(--sub); padding: 0 4px; }
+.approach-fields .setting-note { grid-column: 1 / -1; margin: 0; }
