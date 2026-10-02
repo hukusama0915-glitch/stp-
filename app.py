@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import hashlib
 import io
 import json
@@ -27,7 +28,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-10-02-fill-robust"
+APP_VERSION = "2026-10-03-mold-memory"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -5846,6 +5847,9 @@ def api_analyze() -> Response:
         fill_payload: dict[str, Any] | None = None
         if fill_options["drill_holes"] or fill_options["wire_shapes"]:
             fill_payload, filled_path, fill_items = prepare_filled_model(path, fill_options)
+            # 埋め処理・元モデルの解析で作った形状（OCC）を次の解析の前に手放し、最大メモリを抑える
+            # （Render 無料プランは 512MB。金型モードでは解析を2回するため効く）
+            gc.collect()
             if filled_path is not None or fill_payload.get("brep_missing"):
                 # 比較用に元モデルの時間も算出する（履歴には保存しない）
                 original = estimate(
@@ -5861,6 +5865,8 @@ def api_analyze() -> Response:
                 elif fill_options["drill_holes"]:
                     # B-Rep が無いファイルは形状を埋められないので、穴フィーチャを加工対象外にして MC のみを出す
                     fill_items = apply_feature_fill(fill_payload, original, fill_options, estimate_args)
+                del original
+                gc.collect()
             if fill_items:
                 fill_payload["processes"] = separate_process_plans(
                     fill_items, material_type, nc_machine_id, estimate_mode, wire_params

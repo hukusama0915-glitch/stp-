@@ -37,6 +37,8 @@ REGION_LINK_MM = 20.0
 NECK_CLEARANCE_MM = 2.0
 # 高さマップのセル数上限（Render無料プランのメモリを考慮）
 MAX_HEIGHTMAP_CELLS = 2_600_000
+# 大きな三角形を高さマップへ描くときに一度に計算する行数（一時配列の大きさを抑える）
+HEIGHTMAP_BAND_ROWS = 128
 
 
 @dataclass
@@ -103,16 +105,21 @@ def build_heightmap(shape: Any) -> tuple[np.ndarray, float, float, float]:
         det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
         if abs(det) < 1e-12:
             continue  # 垂直な三角形は上から見えない
-        gi, gj = np.meshgrid(np.arange(i0, i1 + 1), np.arange(j0, j1 + 1))
-        l1 = ((by - cy) * (gi - cx) + (cx - bx) * (gj - cy)) / det
-        l2 = ((cy - ay) * (gi - cx) + (ax - cx) * (gj - cy)) / det
-        l3 = 1.0 - l1 - l2
-        inside = (l1 >= -1e-6) & (l2 >= -1e-6) & (l3 >= -1e-6)
-        if not inside.any():
-            continue
-        z = l1 * tri[0, 2] + l2 * tri[1, 2] + l3 * tri[2, 2]
-        view = heights[j0 : j1 + 1, i0 : i1 + 1]
-        np.maximum(view, np.where(inside, z, -np.inf).astype(np.float32), out=view)
+        # 平らな上面のように格子全体にかかる三角形でも一時配列が大きくならないよう、行の帯に分けて計算する
+        # （以前は全格子分の配列を一度に作り、301 で一時的に約150MB増えていた）。計算式と精度は従来どおり
+        gi = np.arange(i0, i1 + 1, dtype=np.float64)[None, :]
+        for band in range(j0, j1 + 1, HEIGHTMAP_BAND_ROWS):
+            band_end = min(j1, band + HEIGHTMAP_BAND_ROWS - 1)
+            gj = np.arange(band, band_end + 1, dtype=np.float64)[:, None]
+            l1 = ((by - cy) * (gi - cx) + (cx - bx) * (gj - cy)) / det
+            l2 = ((cy - ay) * (gi - cx) + (ax - cx) * (gj - cy)) / det
+            l3 = 1.0 - l1 - l2
+            inside = (l1 >= -1e-6) & (l2 >= -1e-6) & (l3 >= -1e-6)
+            if not inside.any():
+                continue
+            z = l1 * tri[0, 2] + l2 * tri[1, 2] + l3 * tri[2, 2]
+            view = heights[band : band_end + 1, i0 : i1 + 1]
+            np.maximum(view, np.where(inside, z, -np.inf).astype(np.float32), out=view)
     heights[~np.isfinite(heights)] = float(bb.zmin)
     return heights, res, x0, y0
 
@@ -159,11 +166,17 @@ def machined_surface(heights: np.ndarray, res: float, diameter: float, corner_ra
     tip = np.full(coarse.shape, -1e9, dtype=np.float32)
     for j, i, lift in kernel:
         np.maximum(tip, padded[reach + j : reach + j + ny, reach + i : reach + i + nx] - lift, out=tip)
+    del padded
     padded_tip = np.pad(tip, reach, constant_values=1e9)
+    del tip
     surface = np.full(coarse.shape, 1e9, dtype=np.float32)
+    shifted = np.empty(coarse.shape, dtype=np.float32)
     for j, i, lift in kernel:
-        np.minimum(surface, padded_tip[reach - j : reach - j + ny, reach - i : reach - i + nx] + lift, out=surface)
-    return _upsample(np.maximum(surface, coarse), factor, heights.shape)
+        np.add(padded_tip[reach - j : reach - j + ny, reach - i : reach - i + nx], lift, out=shifted)
+        np.minimum(surface, shifted, out=surface)
+    del padded_tip, shifted
+    np.maximum(surface, coarse, out=surface)
+    return _upsample(surface, factor, heights.shape)
 
 
 def local_top(heights: np.ndarray, res: float, radius: float) -> np.ndarray:
@@ -349,11 +362,14 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
         notes.append(f"底まで抜けた範囲 {through_area:.0f} mm2 は切削対象外（ワイヤ・放電を想定）")
     work = np.where(through, floor_z, heights).astype(np.float32)
 
+    del heights  # 以降は work（抜けた所を床の高さで埋めた高さマップ）だけを使う
     grad_y, grad_x = np.gradient(work, res)
     slope = np.hypot(grad_x, grad_y)
+    del grad_x, grad_y
     cell_area = (res * res * np.sqrt(1.0 + slope * slope)).astype(np.float32)
     cell_area[through] = 0.0
     steep = slope >= 1.0  # 45°以上を壁（等高線）とみなす
+    del slope
     surface_area = float(cell_area.sum())
 
     concave = [face for face in concave_curved_faces(shape) if face["zmax"] > floor_z - 1e-6]
@@ -397,8 +413,10 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
 
     for index, diameter in enumerate(ladder):
         corner, tool_shape = tool_corner_radius(diameter)
-        surface = np.minimum(machined_surface(work, res, diameter, corner, outside_z), previous_surface)
-        removed = np.maximum(0.0, previous_surface - surface)
+        surface = machined_surface(work, res, diameter, corner, outside_z)
+        np.minimum(surface, previous_surface, out=surface)
+        removed = np.subtract(previous_surface, surface)
+        np.maximum(removed, 0.0, out=removed)
         removed[through] = 0.0
         whole = diameter >= WHOLE_SURFACE_MIN_DIAMETER
         stage = MoldStage(diameter=diameter, corner_radius=corner, tool_shape=tool_shape, whole_surface=whole)
@@ -437,9 +455,12 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
                 stage.finish_flat_area = float(cell_area[finish_region & ~steep].sum())
             # 必要な首下長: 工具が働く面の、周囲（工具首の逃げ）の上端からの深さ
             tops = local_top(work, res, diameter / 2 + NECK_CLEARANCE_MM)
-            depth = (tops - work)[region & (cell_area > 0)]
+            np.subtract(tops, work, out=tops)
+            depth = tops[region & (cell_area > 0)]
+            del tops
             stage.required_depth = float(np.percentile(depth, 98)) if depth.size else 0.0
             stages.append(stage)
+        del removed
         previous_surface = surface
         previous_diameter = diameter
 

@@ -48,6 +48,8 @@ with app_module.db() as _conn:
 
 # 形状を埋めて（MCのみで）算出するケースも回すサンプル
 FILL_SAMPLES = ("wire_cut_test_plate.stp", "mixed_feature_test_part.stp", "insert_plate_test.stp")
+# 金型モード（高さマップ＋工具段階の残り取り）でも回すサンプル。B-Rep のある実形状だけ
+MOLD_SAMPLES = ("realistic_machining_bracket.stp", "fine_feature_test_block.stp")
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -132,6 +134,20 @@ def main() -> int:
             except Exception as exc:  # noqa: BLE001
                 report[key] = {"error": str(exc)}
             print(f"{key}: {report[key].get('time_label', report[key].get('error'))}")
+
+    # 金型モードの見積もり（mold_mode.py の高さマップ・opening を変えたときの確認用）
+    for name in MOLD_SAMPLES:
+        sample = BASE_DIR / "samples" / name
+        key = f"{name}|鉄|金型"
+        try:
+            result = app_module.estimate(
+                sample, name, "鉄", 5.0, BENCHMARK_MACHINE_ID,
+                use_manufacturer_conditions=True, estimate_mode="cautious", shape_mode="mold",
+            )
+            report[key] = summarize(result)
+        except Exception as exc:  # noqa: BLE001
+            report[key] = {"error": str(exc)}
+        print(f"{key}: {report[key].get('time_label', report[key].get('error'))}")
 
     # ドリル穴・ワイヤ形状を埋めたモデル（MCのみ）の見積もり
     fill_options = {"drill_holes": True, "wire_shapes": True, "drill_max_diameter_mm": 13.0}
