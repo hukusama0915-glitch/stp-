@@ -11,6 +11,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -28,9 +29,68 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-10-03-inhouse-feeds"
+APP_VERSION = "2026-10-04-steel-grades"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
+
+# 鋼の材質（グレード）。計算上の材質区分（material_type）は「鉄」のまま、メーカー条件・ドリル条件の
+# どの欄（炭素鋼 / プリハードン鋼 / 焼入れ鋼）を使うかだけを変える。硬さの出典:
+#   NAK80: メーカー条件の NAK80 欄（NS TOOL「NAK55/NAK80/HPM1 ～43HRC」、OSG「NAK80 40HRC」）
+#   STAVAX ESR プリハードン 33HRC・熱処理後 50～55HRC: フタバ 製品ページ
+#     https://www.futaba.co.jp/product/precision/plate/index/ppl/product_plate/stavaxb
+MATERIAL_GRADES: dict[str, dict[str, Any]] = {
+    "S50C": {
+        "label": "S50C（炭素鋼）", "short": "S50C", "material_type": "鉄", "hardness": "約210HB",
+        "condition_class": "carbon", "drill_key": "鉄",
+    },
+    "NAK80": {
+        "label": "NAK80（プリハードン 約40HRC）", "short": "NAK80", "material_type": "鉄", "hardness": "約40HRC",
+        "condition_class": "prehardened", "drill_key": "プリハードン",
+    },
+    "STAVAX_PH": {
+        "label": "STAVAX ESR プリハードン（33HRC）", "short": "STAVAX プリハードン", "material_type": "鉄",
+        "hardness": "33HRC", "condition_class": "prehardened", "drill_key": "プリハードン",
+    },
+    "STAVAX_HT": {
+        "label": "STAVAX ESR 熱処理後（50～55HRC）", "short": "STAVAX 熱処理後", "material_type": "鉄",
+        "hardness": "50～55HRC", "condition_class": "hardened", "drill_key": None,
+    },
+}
+DEFAULT_MATERIAL_GRADE = "S50C"
+# メーカー条件の硬さがこの値（HRC）以上なら焼入れ鋼向けとみなす
+HARDENED_MIN_HRC = 46.0
+_current_grade: ContextVar[str] = ContextVar("material_grade", default=DEFAULT_MATERIAL_GRADE)
+
+
+def resolve_material(value: str | None) -> tuple[str, str | None]:
+    """画面の材質の値を（材質区分, 鋼のグレード）にする。従来の「鉄」は S50C として扱う。"""
+    value = (value or "鉄").strip()
+    if value in MATERIAL_GRADES:
+        return MATERIAL_GRADES[value]["material_type"], value
+    if value in {"鉄", "鋼"}:
+        return "鉄", DEFAULT_MATERIAL_GRADE
+    return value, None
+
+
+def current_grade() -> dict[str, Any]:
+    return MATERIAL_GRADES.get(_current_grade.get(), MATERIAL_GRADES[DEFAULT_MATERIAL_GRADE])
+
+
+def material_display(material_type: str) -> str:
+    """結果・履歴に出す材質名。鋼はグレード名にする。"""
+    return current_grade()["short"] if material_type in {"鉄", "鋼"} else material_type
+
+
+def row_hardness_hrc(row: Any) -> float | None:
+    """メーカー条件の硬さ欄（例「～55HRC」「55~62HRC」）から HRC の最大値を取り出す。"""
+    try:
+        text = str(row["hardness"] or "")
+    except (KeyError, IndexError):
+        return None
+    if "HRC" not in text.upper():
+        return None
+    numbers = [float(v) for v in re.findall(r"\d+(?:\.\d+)?", text)]
+    return max(numbers) if numbers else None
 
 
 app = Flask(__name__)
@@ -2390,8 +2450,14 @@ def load_drill_conditions() -> list[dict[str, Any]]:
 
 def drill_condition_for(diameter_mm: float, material_type: str) -> dict[str, Any] | None:
     """径の前後の表の行から回転数・送り量を線形補間する。表の範囲外・材質なしは None。"""
+    if material_type in {"鉄", "鋼"}:
+        # 鋼はグレードの欄（炭素鋼 / プリハードン鋼）。熱処理後（焼入れ鋼）のドリル公式条件は無い
+        drill_key = current_grade()["drill_key"]
+        if not drill_key:
+            return None
+        material_type = drill_key
     rows = sorted(
-        (row for row in load_drill_conditions() if row["app_material"] and row["app_material"] in material_type),
+        (row for row in load_drill_conditions() if row["app_material"] and row["app_material"] == material_type),
         key=lambda row: row["drill_diameter_mm"],
     )
     if not rows:
@@ -2510,7 +2576,7 @@ def nc_hole_plan(
             elif float(diameter) > 20.0:
                 row["note"] = "φ20超はドリルの公式条件が未登録のため時間未算出"
             else:
-                row["note"] = f"{material_type}のドリル公式条件が未登録のため時間未算出"
+                row["note"] = f"{material_display(material_type)}のドリル公式条件が未登録のため時間未算出"
             rows.append(row)
             continue
         feed = max(1.0, condition["feed_mm_min"])
@@ -3627,6 +3693,11 @@ def material_keywords(material_type: str) -> list[str]:
         return ["A5052", "A7075", "ALUMINUM", "ALUMINIUM", "ALLOYS", "アルミ"]
     if "銅" in material_type or "COPPER" in text:
         return ["COPPER", "C1100", "銅"]
+    grade_class = current_grade()["condition_class"]
+    if grade_class == "prehardened":
+        return ["NAK80", "NAK55", "NAK", "HPM1", "PXA30", "PREHARDENED"]
+    if grade_class == "hardened":
+        return ["STAVAX", "HPM38", "SKD61", "SKD11", "HARDENED"]
     return ["S50C", "S45C", "SCM", "SS400", "CARBON STEEL", "ALLOY STEEL", "鋼", "FC"]
 
 
@@ -3792,12 +3863,26 @@ def score_manufacturer_condition(
     process_text = process_hint.upper()
     components: list[tuple[str, float]] = []
 
-    if any(keyword.upper() in searchable for keyword in keywords):
-        components.append(("材質一致", 1000))
-    if material_type in {"鉄", "鋼"} and any(
-        word in searchable for word in ("HARDENED", "HRC", "SKD", "STAVAX", "NAK", "HAP")
-    ):
-        components.append(("焼入れ鋼向け条件", -420))
+    grade_class = current_grade()["condition_class"] if material_type in {"鉄", "鋼"} else "carbon"
+    keyword_hit = any(keyword.upper() in searchable for keyword in keywords)
+    if grade_class == "carbon":
+        if keyword_hit:
+            components.append(("材質一致", 1000))
+        if material_type in {"鉄", "鋼"} and any(
+            word in searchable for word in ("HARDENED", "HRC", "SKD", "STAVAX", "NAK", "HAP")
+        ):
+            components.append(("焼入れ鋼向け条件", -420))
+    else:
+        # プリハードン鋼は ～43HRC 程度の欄、焼入れ鋼は 46HRC 以上の欄を「材質一致」とする
+        hrc = row_hardness_hrc(row)
+        hard_row = hrc is not None and hrc >= HARDENED_MIN_HRC
+        fits = hard_row if grade_class == "hardened" else not hard_row
+        if keyword_hit and fits:
+            components.append(("材質一致", 1000))
+        elif keyword_hit:
+            components.append(("硬さが合わない条件", -300))
+        if grade_class == "prehardened" and hrc is not None and hrc > 60:
+            components.append(("高硬度鋼向け条件", -420))
     if material_type in {"鉄", "鋼"} and "STAINLESS" in searchable:
         components.append(("ステンレス向け条件", -520))
     if "ポケット" in process_hint or "POCKET" in process_text:
@@ -3927,7 +4012,8 @@ def inhouse_mold_feed(diameter: float, group: str, material_type: str) -> dict[s
     """工具径・荒取り/仕上げに合う社内実績の送り。同じ径でもう一方の区分しか無ければそれを使う。"""
     rows = [
         row for row in load_inhouse_mold_feeds()
-        if abs(row["diameter_mm"] - diameter) < 0.01 and row.get("app_material") == material_type
+        if abs(row["diameter_mm"] - diameter) < 0.01
+        and row.get("app_material") in {material_type, _current_grade.get()}
     ]
     if not rows:
         return None
@@ -4043,7 +4129,10 @@ def mold_mode_features(
         "finish_passes": finish_passes,
         "approach": approach,
         "approach_sec": round(mold_mode.approach_seconds(approach), 2),
-        "inhouse_feeds": bool(use_inhouse_feeds and any(row.get("app_material") == material_type for row in load_inhouse_mold_feeds())),
+        "inhouse_feeds": bool(
+            use_inhouse_feeds
+            and any(row.get("app_material") in {material_type, _current_grade.get()} for row in load_inhouse_mold_feeds())
+        ),
         "tool_ladder": [
             {
                 "diameter": stage.diameter,
@@ -4057,12 +4146,21 @@ def mold_mode_features(
             for stage in plan.stages
         ],
         "notes": plan.notes,
-        "calibration": "係数は 301_DJ30-RC6-2701（スキャナカバー）の実績NC・CAMシート（140.2h）から逆算",
+        "calibration": "係数は 301_DJ30-RC6-2701（スキャナカバー・NAK80・V77）の実績NC・CAMシート（140.2h）から逆算",
     }
     return features, summary
 
 
-def estimate(
+def estimate(*args: Any, material_grade: str | None = None, **kwargs: Any) -> dict[str, Any]:
+    """見積もり。鋼のグレード（material_grade）を、条件選定の間だけ有効にする。"""
+    token = _current_grade.set(material_grade if material_grade in MATERIAL_GRADES else DEFAULT_MATERIAL_GRADE)
+    try:
+        return _estimate(*args, **kwargs)
+    finally:
+        _current_grade.reset(token)
+
+
+def _estimate(
     path: Path,
     file_name: str,
     material_type: str,
@@ -5702,6 +5800,10 @@ def estimate(
         result = {
             "file_name": file_name,
             "material_type": material_type,
+            "material_grade": _current_grade.get() if material_type in {"鉄", "鋼"} else None,
+            "material_label": (
+                f'{current_grade()["label"]}' if material_type in {"鉄", "鋼"} else material_type
+            ),
             "machine": dict(machine),
             "blank_allowance_mm": blank_allowance_mm,
             "analysis": analysis,
@@ -5739,7 +5841,7 @@ def estimate(
             (
                 result["created_at"],
                 file_name,
-                material_type,
+                material_display(material_type),
                 blank_allowance_mm,
                 machine["machine_name"],
                 total_sec,
@@ -5858,9 +5960,10 @@ def api_analyze() -> Response:
     if suffix not in {".stp", ".step"}:
         return jsonify({"error": "拡張子 .stp または .step のファイルを指定してください。"}), 400
 
-    material_type = request.form.get("material_type", "鉄")
+    material_type, material_grade = resolve_material(request.form.get("material_type", "鉄"))
     if material_type not in MATERIAL_TYPES:
-        raise InputError(f"材質は {' / '.join(MATERIAL_TYPES)} から選択してください。")
+        choices = [grade["short"] for grade in MATERIAL_GRADES.values()] + ["アルミ", "SUS"]
+        raise InputError(f"材質は {' / '.join(choices)} から選択してください。")
     blank_allowance_mm = float(
         input_number(request.form, "blank_allowance_mm", "ブランク代", default=5.0, minimum=0, maximum=100)
     )
@@ -5900,7 +6003,10 @@ def api_analyze() -> Response:
     safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", upload.filename)
     path = UPLOAD_DIR / f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{safe_name}"
     upload.save(path)
+    # 別工程（NC穴加工）のドリル条件など、見積もりの外で材質を見る処理にもグレードを効かせる
+    _current_grade.set(material_grade or DEFAULT_MATERIAL_GRADE)
     estimate_args = dict(
+        material_grade=material_grade,
         use_manufacturer_conditions=use_manufacturer_conditions,
         estimate_mode=estimate_mode,
         edm_policy=edm_policy,
@@ -6240,7 +6346,7 @@ def api_history_csv(history_id: int) -> Response:
     out = io.StringIO()
     writer = csv.writer(out, lineterminator="\n")
     writer.writerow(["ファイル名", payload["file_name"]])
-    writer.writerow(["材質", payload["material_type"]])
+    writer.writerow(["材質", payload.get("material_label") or payload["material_type"]])
     writer.writerow(["機械", payload["machine"]["machine_name"]])
     writer.writerow(["見積安全率", payload.get("estimate_mode_label", "-")])
     writer.writerow(["合計時間", seconds_label(payload["breakdown"]["total_sec"])])

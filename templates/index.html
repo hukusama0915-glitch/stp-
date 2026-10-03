@@ -117,10 +117,15 @@
               </div>
               <div class="settings-grid">
                 <label>材質
-                  <select name="material_type" data-persist="material_type">
-                    <option>鉄</option>
-                    <option>アルミ</option>
-                    <option>SUS</option>
+                  <select name="material_type" data-persist="material_grade">
+                    <optgroup label="鋼">
+                      <option value="S50C">S50C（炭素鋼）</option>
+                      <option value="NAK80">NAK80（プリハードン 約40HRC）</option>
+                      <option value="STAVAX_PH">STAVAX プリハードン（33HRC）</option>
+                      <option value="STAVAX_HT">STAVAX 熱処理後（50～55HRC）</option>
+                    </optgroup>
+                    <option value="アルミ">アルミ</option>
+                    <option value="SUS">SUS</option>
                   </select>
                 </label>
                 <label>ブランク代 mm
@@ -147,7 +152,7 @@
                 </label>
                 <label class="span-2 checkbox-line" data-show-when-mold>
                   <input type="checkbox" name="mold_inhouse_feeds" data-persist="mold_inhouse_feeds">
-                  <span>社内実績の送りを使う（金型・鉄・試験的）<small>301 スキャナカバー（V77・NAK80）の実績NCの工具径別平均。工具ごとの切削距離の見積もりがまだ粗いため、合計は実績から離れることがあります</small></span>
+                  <span>社内実績の送りを使う（金型・NAK80・試験的）<small>301 スキャナカバー（V77・NAK80）の実績NCの工具径別平均。工具ごとの切削距離の見積もりがまだ粗いため、合計は実績から離れることがあります</small></span>
                 </label>
                 <fieldset class="span-2 approach-fields" data-show-when-mold>
                   <legend>アプローチ（CAMの設定。1回ごとに下降して切り込む動き）</legend>

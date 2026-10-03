@@ -2319,6 +2319,7 @@ function renderResult(result, options = {}) {
   }
   $("#analysisInfo").innerHTML = `
     <dt>ファイル</dt><dd>${esc(result.file_name || "-")}</dd>
+    <dt>材質</dt><dd>${esc(result.material_label || result.material_type || "-")}</dd>
     ${moldRows}
     <dt>解析方式</dt><dd>${esc(result.analysis.parser)}</dd>
     <dt>条件ソース</dt><dd>${esc(result.condition_source || "-")}</dd>

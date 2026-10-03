@@ -514,9 +514,12 @@ APPROACH_MIN_CUT_PER_DIAMETER = 5.0
 TOOL_WARMUP_SEC = 60.0
 TOOL_MEASURE_SEC = 40.0
 # 切削の実効率（指令送りに対する実送り。加減速で落ちる分）。切削以外を別に数えるようにしたので、
-# 301 の切削時間が実績NCの切削（指令送りで 87.1h）に近くなるよう校正した値（見積もり 84.5h）。
-# この校正で 301 の慎重モード合計は 139:05（実績 CAM 140.2h）
+# （指令送りに対する実送り。実績合わせは下の CUTTING_CALIBRATION で行う）
 CUTTING_EFFICIENCY = 0.95
+# 実績合わせの校正係数（切削時間に掛ける）。301 は NAK80（プリハードン）で、NAK80 のメーカー条件で見積もると
+# 切削が 117.6h（実績 87.1h）になる。工具径ごとの経路長・送りの誤差をまとめてここで吸収する。
+# 実績1件（301 スキャナカバー）からの値なので、実績が増えたら見直す（2026-10-04）
+CUTTING_CALIBRATION = 0.74
 
 
 def default_approach() -> dict[str, float]:
@@ -552,7 +555,7 @@ ROUGH_AE_PER_DIAMETER = 0.5
 
 
 def _cutting_minutes(length_mm: float, feed_mm_min: float, efficiency: float = CUTTING_EFFICIENCY) -> float:
-    return length_mm / max(1.0, feed_mm_min) / max(0.1, efficiency)
+    return length_mm / max(1.0, feed_mm_min) / max(0.1, efficiency) * CUTTING_CALIBRATION
 
 
 def _operation_minutes(
