@@ -577,6 +577,7 @@ def build_mold_operations(
     select_condition: Any,
     finish_passes: int = 2,
     approach: dict[str, float] | None = None,
+    feed_override: Any = None,
 ) -> list[dict[str, Any]]:
     """工具段階ごとに 荒取り／残り取り／仕上げ の工程と切削距離・時間を返す。
 
@@ -587,8 +588,16 @@ def build_mold_operations(
     operations: list[dict[str, Any]] = []
     finish_passes = max(1, int(finish_passes))
     approach_sec = approach_seconds(approach)
+
+    def with_feed(cond: dict[str, Any], diameter: float, group: str) -> dict[str, Any]:
+        """社内実績の送りがあれば、その送りと説明に差し替える（group: rough=荒取り・残り取り / finish=仕上げ）。"""
+        hit = feed_override(diameter, group) if feed_override else None
+        if not hit:
+            return cond
+        return {**cond, "feed": float(hit["feed"]), "condition_text": hit["text"]}
     for index, stage in enumerate(plan.stages):
-        cond = select_condition(stage.diameter, stage.required_depth, stage.tool_shape)
+        base_cond = select_condition(stage.diameter, stage.required_depth, stage.tool_shape)
+        cond = with_feed(base_cond, stage.diameter, "rough")
         feed = float(cond["feed"])
         z_pitch = finish_z_pitch(stage.diameter, stage.corner_radius, stage.tool_shape)
         flat_pitch = finish_flat_pitch(stage.diameter, stage.corner_radius, stage.tool_shape)
@@ -657,6 +666,8 @@ def build_mold_operations(
         if stage.finish_role == "none":
             continue
         passes = finish_passes if stage.finish_role == "final" else 1
+        cond = with_feed(base_cond, stage.diameter, "finish")
+        feed = float(cond["feed"])
         finish_label = (
             f"全面 {stage.finish_projected_area:.0f} mm2"
             if stage.whole_surface

@@ -356,7 +356,7 @@ function settingsSignature() {
   if (!form) return "";
   const data = new FormData(form);
   data.delete("stp_file");
-  ["edm_enabled", "fill_drill_holes", "fill_wire_shapes"].forEach((name) => data.set(name, form.elements[name].checked ? "on" : "off"));
+  ["edm_enabled", "fill_drill_holes", "fill_wire_shapes", "mold_inhouse_feeds"].forEach((name) => data.set(name, form.elements[name].checked ? "on" : "off"));
   return JSON.stringify(Array.from(data.entries()));
 }
 
@@ -2312,6 +2312,7 @@ function renderResult(result, options = {}) {
       <dt>形状タイプ</dt><dd>金型（表面形状・残り取り） / 仕上げ ${esc(mold.finish_passes)}回</dd>
       <dt>工具段階</dt><dd>${esc(ladder)}</dd>
       <dt>最小凹R</dt><dd>${mold.min_concave_radius ? `R${esc(mold.min_concave_radius)}` : "-"} / 加工面積 ${Math.round(mold.surface_area_mm2).toLocaleString()} mm2</dd>
+      <dt>送り</dt><dd>${mold.inhouse_feeds ? "社内実績の送り（実績NCの工具径別平均）。実績の無い径はメーカー条件" : "メーカー条件"}</dd>
       <dt>アプローチ</dt><dd>${mold.approach ? `空走 ${esc(mold.approach.idle_mm)}mm@F${esc(mold.approach.idle_feed)} → 切込み ${esc(mold.approach.plunge_mm)}mm@F${esc(mold.approach.plunge_feed)}（1回 ${esc(mold.approach_sec)}秒、Z上昇・早送り込み）` : "-"}</dd>
       <dt>金型係数</dt><dd>${esc(mold.calibration)}${(mold.notes || []).length ? ` / ${esc(mold.notes.join(" / "))}` : ""}</dd>
     `;
@@ -2552,7 +2553,7 @@ function bindEvents() {
     try {
       const formData = new FormData(form);
       // チェックボックスは未チェック時に送信されないため、明示的にoffを送る
-      ["edm_enabled", "fill_drill_holes", "fill_wire_shapes"].forEach((name) => {
+      ["edm_enabled", "fill_drill_holes", "fill_wire_shapes", "mold_inhouse_feeds"].forEach((name) => {
         if (!formData.has(name)) formData.set(name, "off");
       });
       formData.set("excluded_features", JSON.stringify(Array.from(state.excluded)));

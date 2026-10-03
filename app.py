@@ -28,7 +28,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-10-03-mold-approach"
+APP_VERSION = "2026-10-03-inhouse-feeds"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -3902,6 +3902,49 @@ MOLD_REPLACED_FEATURE_PREFIXES = (
 )
 
 
+INHOUSE_MOLD_FEEDS_PATH = BASE_DIR / "data" / "inhouse_mold_feeds.csv"
+_inhouse_mold_feed_cache: dict[str, Any] = {}
+
+
+def load_inhouse_mold_feeds() -> list[dict[str, Any]]:
+    """社内実績の送り（実績NCを工具径・荒取り/仕上げ別に平均したもの）。ファイルが変わったら読み直す。"""
+    try:
+        stamp = INHOUSE_MOLD_FEEDS_PATH.stat().st_mtime
+    except OSError:
+        return []
+    if _inhouse_mold_feed_cache.get("stamp") != stamp:
+        with INHOUSE_MOLD_FEEDS_PATH.open(encoding="utf-8-sig", newline="") as fh:
+            rows = [
+                {**row, "diameter_mm": float(row["diameter_mm"]), "feed_mm_min": float(row["feed_mm_min"])}
+                for row in csv.DictReader(fh)
+                if row.get("diameter_mm") and row.get("feed_mm_min")
+            ]
+        _inhouse_mold_feed_cache.update({"stamp": stamp, "rows": rows})
+    return _inhouse_mold_feed_cache["rows"]
+
+
+def inhouse_mold_feed(diameter: float, group: str, material_type: str) -> dict[str, Any] | None:
+    """工具径・荒取り/仕上げに合う社内実績の送り。同じ径でもう一方の区分しか無ければそれを使う。"""
+    rows = [
+        row for row in load_inhouse_mold_feeds()
+        if abs(row["diameter_mm"] - diameter) < 0.01 and row.get("app_material") == material_type
+    ]
+    if not rows:
+        return None
+    exact = [row for row in rows if row["group"] == group]
+    row = (exact or rows)[0]
+    group_label = {"rough": "荒取り・残り取り", "finish": "中仕上げ・仕上げ"}
+    borrowed = "" if exact else f"（{group_label.get(group, group)}の実績が無いため{group_label.get(row['group'], row['group'])}の値）"
+    return {
+        "feed": row["feed_mm_min"],
+        "text": (
+            f'社内実績 F{row["feed_mm_min"]:.0f} / S{float(row["spindle_rpm"]):.0f}'
+            f' / {row["machine"]} {row["work_material"]} φ{fmt_number(diameter)} {group_label.get(row["group"], row["group"])}'
+            f' の平均（工具{row["tool_count"]}本・{row["cut_length_m"]}m）{borrowed} / 出典 {row["source"]}'
+        ),
+    }
+
+
 def mold_mode_features(
     conn: sqlite3.Connection,
     path: Path,
@@ -3910,6 +3953,7 @@ def mold_mode_features(
     use_manufacturer_conditions: bool,
     finish_passes: int,
     approach: dict[str, float] | None = None,
+    use_inhouse_feeds: bool = False,
 ) -> tuple[list[Feature], dict[str, Any]]:
     """金型モード: 高さマップから工具段階（荒取り→残り取り→仕上げ）の工程を作る。"""
     plan = mold_mode.plan_mold_machining(mold_mode.load_step_shape(path), max_tool_diameter)
@@ -3965,7 +4009,10 @@ def mold_mode_features(
 
     features: list[Feature] = []
     approach = {**mold_mode.default_approach(), **(approach or {})}
-    for op in mold_mode.build_mold_operations(plan, select_condition, finish_passes=finish_passes, approach=approach):
+    feed_override = (lambda diameter, group: inhouse_mold_feed(diameter, group, material_type)) if use_inhouse_feeds else None
+    for op in mold_mode.build_mold_operations(
+        plan, select_condition, finish_passes=finish_passes, approach=approach, feed_override=feed_override
+    ):
         cond = op["cond"]
         features.append(
             Feature(
@@ -3996,6 +4043,7 @@ def mold_mode_features(
         "finish_passes": finish_passes,
         "approach": approach,
         "approach_sec": round(mold_mode.approach_seconds(approach), 2),
+        "inhouse_feeds": bool(use_inhouse_feeds and any(row.get("app_material") == material_type for row in load_inhouse_mold_feeds())),
         "tool_ladder": [
             {
                 "diameter": stage.diameter,
@@ -4029,6 +4077,7 @@ def estimate(
     shape_mode: str = "prismatic",
     mold_finish_passes: int = 2,
     mold_approach: dict[str, float] | None = None,
+    mold_inhouse_feeds: bool = False,
 ) -> dict[str, Any]:
     analysis = parse_step_file(path, blank_allowance_mm)
     bbox = analysis["bbox"]
@@ -5469,6 +5518,7 @@ def estimate(
                     use_manufacturer_conditions,
                     mold_finish_passes,
                     mold_approach,
+                    mold_inhouse_feeds,
                 )
             except Exception as exc:  # noqa: BLE001 - 金型解析に失敗しても角物の見積もりは返す
                 app.logger.exception("金型モードの解析に失敗しました: %s", path.name)
@@ -5858,6 +5908,9 @@ def api_analyze() -> Response:
         shape_mode=shape_mode,
         mold_finish_passes=mold_finish_passes,
         mold_approach=mold_approach,
+        # 既定は使わない: 実績1件の時点では、工具ごとの切削距離のずれが大きく、送りだけ実績にしても
+        # 合計が実績から離れる（301: メーカー条件 139:05 / 社内実績の送り 121:52 / 実績 140.2h）
+        mold_inhouse_feeds=request.form.get("mold_inhouse_feeds", "off") == "on",
     )
     try:
         analyze_path = path

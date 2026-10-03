@@ -145,6 +145,10 @@
                 <label class="span-2" data-show-when-mold>金型の仕上げ回数（中仕上げを除く）
                   <input type="number" name="mold_finish_passes" value="2" min="1" max="5" step="1" inputmode="numeric" data-persist="mold_finish_passes">
                 </label>
+                <label class="span-2 checkbox-line" data-show-when-mold>
+                  <input type="checkbox" name="mold_inhouse_feeds" data-persist="mold_inhouse_feeds">
+                  <span>社内実績の送りを使う（金型・鉄・試験的）<small>301 スキャナカバー（V77・NAK80）の実績NCの工具径別平均。工具ごとの切削距離の見積もりがまだ粗いため、合計は実績から離れることがあります</small></span>
+                </label>
                 <fieldset class="span-2 approach-fields" data-show-when-mold>
                   <legend>アプローチ（CAMの設定。1回ごとに下降して切り込む動き）</legend>
                   <label>空走 mm
