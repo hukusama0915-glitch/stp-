@@ -372,7 +372,6 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
     cell_area = (res * res * np.sqrt(1.0 + slope * slope)).astype(np.float32)
     cell_area[through] = 0.0
     steep = slope >= 1.0  # 45°以上を壁（等高線）とみなす
-    del slope
     surface_area = float(cell_area.sum())
 
     concave = [face for face in concave_curved_faces(shape) if face["zmax"] > floor_z - 1e-6]
@@ -400,14 +399,45 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
     whole_diameters = [d for d in ladder if d >= WHOLE_SURFACE_MIN_DIAMETER]
     last_whole = min(whole_diameters) if len(whole_diameters) > 1 else None
 
-    def face_region(faces: list[dict[str, float]], margin: float) -> tuple[np.ndarray, list[tuple[float, ...]]]:
+    def face_region(
+        faces: list[dict[str, float]], margin: float
+    ) -> tuple[np.ndarray, list[tuple[float, ...]], np.ndarray | None]:
+        """小径工具が働く範囲。各凹R面の外接矩形を工具径ぶん広げた帯だけにする。
+
+        以前は近い凹R面を束ねた外接矩形の中を全部加工する扱いで、小さなフィレットが部品全体に散らばる
+        金型（光学箱など）では、ほぼ全面の壁を小径工具で仕上げる計算になり、時間が1,000h を超えていた。
+        返り値の3つ目は、壁を数える高さの上限 mm（凹R面の高さ＋余裕）。束ねた矩形は「◯か所」の表示用。
+        """
         need = _rects_mask([(f["xmin"], f["xmax"], f["ymin"], f["ymax"]) for f in faces], work.shape, res, x0, y0)
         need &= ~through
         if not need.any():
-            return need, []
+            return need, [], None
         coarse_need = _max_pool(need.astype(np.float32), coarse_factor) > 0
         rects = _cluster_rects(coarse_need, res * coarse_factor, x0, y0, link_cells=link_cells, margin=margin)
-        return _rects_mask(rects, work.shape, res, x0, y0) & ~through, [tuple(round(float(v), 1) for v in r) for r in rects]
+        band = np.zeros(work.shape, dtype=bool)
+        height_limit = np.zeros(work.shape, dtype=np.float32)
+        for f in faces:
+            i0 = max(0, int(math.floor((f["xmin"] - margin - x0) / res)))
+            i1 = min(work.shape[1], int(math.ceil((f["xmax"] + margin - x0) / res)) + 1)
+            j0 = max(0, int(math.floor((f["ymin"] - margin - y0) / res)))
+            j1 = min(work.shape[0], int(math.ceil((f["ymax"] + margin - y0) / res)) + 1)
+            if i1 <= i0 or j1 <= j0:
+                continue
+            band[j0:j1, i0:i1] = True
+            view = height_limit[j0:j1, i0:i1]
+            np.maximum(view, float(f["zmax"] - f["zmin"]) + 2.0 * margin, out=view)
+        band &= ~through
+        return band, [tuple(round(float(v), 1) for v in r) for r in rects], height_limit
+
+    def limited_areas(mask: np.ndarray, height_limit: np.ndarray | None) -> tuple[float, float]:
+        """壁（45°以上）と床の面積。壁は 1セルあたり height_limit の高さまでしか数えない。"""
+        if height_limit is None:
+            return float(cell_area[mask & steep].sum()), float(cell_area[mask & ~steep].sum())
+        cell_slope = np.minimum(slope[mask], height_limit[mask] / res)
+        area = (res * res * np.sqrt(1.0 + cell_slope * cell_slope)).astype(np.float32)
+        area[through[mask]] = 0.0
+        is_steep = steep[mask]
+        return float(area[is_steep].sum()), float(area[~is_steep].sum())
 
     def radii_label(faces: list[dict[str, float]]) -> str:
         radii = sorted({round(face["radius"], 2) for face in faces})
@@ -423,6 +453,7 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
         removed[through] = 0.0
         whole = diameter >= WHOLE_SURFACE_MIN_DIAMETER
         stage = MoldStage(diameter=diameter, corner_radius=corner, tool_shape=tool_shape, whole_surface=whole)
+        region_limit = finish_limit = None
         if index == 0:
             # 最初の工具は荒取り専用
             roughing_volume = float(removed.sum()) * res * res
@@ -439,23 +470,21 @@ def plan_mold_machining(shape: Any, max_tool_diameter: float | None = None) -> M
             # 削り残しマップは格子の粗さによる誤差が大きいので範囲決めには使わない
             limit = previous_diameter / 2 - 1e-3
             needing = [face for face in concave if face["radius"] < limit]
-            region, stage.region_rects = face_region(needing, margin=max(1.0, previous_diameter))
+            region, stage.region_rects, region_limit = face_region(needing, margin=max(1.0, previous_diameter))
             stage.reason = f"φ{previous_diameter:g}で入らない凹R {radii_label(needing)}の範囲"
             # 仕上げ: この工具が仕上げを受け持つ凹R（この工具の半径以上、前の工具の半径未満）
             finishing = [face for face in needing if face["radius"] >= diameter / 2 - 0.01]
-            finish_region, stage.finish_rects = face_region(finishing, margin=max(1.0, diameter))
+            finish_region, stage.finish_rects, finish_limit = face_region(finishing, margin=max(1.0, diameter))
             stage.finish_role = "final" if finish_region.any() else "none"
             if finishing:
                 stage.finish_reason = f"凹R {radii_label(finishing)}を仕上げる範囲"
         if region.any():
             stage.region_projected_area = float(region.sum()) * res * res
-            stage.steep_area = float(cell_area[region & steep].sum())
-            stage.flat_area = float(cell_area[region & ~steep].sum())
+            stage.steep_area, stage.flat_area = limited_areas(region, region_limit)
             stage.rest_volume = float(removed[region].sum()) * res * res
             if stage.finish_role != "none":
                 stage.finish_projected_area = float(finish_region.sum()) * res * res
-                stage.finish_steep_area = float(cell_area[finish_region & steep].sum())
-                stage.finish_flat_area = float(cell_area[finish_region & ~steep].sum())
+                stage.finish_steep_area, stage.finish_flat_area = limited_areas(finish_region, finish_limit)
             # 必要な首下長: 工具が働く面の、周囲（工具首の逃げ）の上端からの深さ
             stage.region_z_range = _z_range(work, region & (cell_area > 0))
             if stage.finish_role != "none":
@@ -505,7 +534,7 @@ RETRACT_RAPID_SEC_PER_APPROACH = 0.24
 # 実績の段数あたり回数は 1.7〜4.8 だが、見積もりのZピッチは実績より粗く段数が少ないので、
 # 下の上限（切削距離から決まる回数）と組み合わせて、301 のアプローチ総数が実績（87,848回）に合うよう校正した値
 # （見積もり 86,899回 / 32.5h、実績 アプローチ＋Z上昇・早送り 32.4h）
-APPROACHES_PER_LEVEL = 12.5
+APPROACHES_PER_LEVEL = 14.1
 # 1回のアプローチで最低限削る距離 = 係数 x 工具径（小さな範囲で段数ばかり多い工程の回数を抑える上限）。
 # 実績の工具ブロックごとの「切削距離/アプローチ回数」の小さい側は工具径の 2〜13倍
 APPROACH_MIN_CUT_PER_DIAMETER = 5.0
@@ -516,10 +545,13 @@ TOOL_MEASURE_SEC = 40.0
 # 切削の実効率（指令送りに対する実送り。加減速で落ちる分）。切削以外を別に数えるようにしたので、
 # （指令送りに対する実送り。実績合わせは下の CUTTING_CALIBRATION で行う）
 CUTTING_EFFICIENCY = 0.95
-# 実績合わせの校正係数（切削時間に掛ける）。301 は NAK80（プリハードン）で、NAK80 のメーカー条件で見積もると
-# 切削が 117.6h（実績 87.1h）になる。工具径ごとの経路長・送りの誤差をまとめてここで吸収する。
-# 実績1件（301 スキャナカバー）からの値なので、実績が増えたら見直す（2026-10-04）
-CUTTING_CALIBRATION = 0.74
+# 実績合わせの校正係数（切削時間に掛ける）。大径（φ6以上・全面）と小径（凹R面の周り）で分ける。
+# 301 スキャナカバー（NAK80）を NAK80 のメーカー条件で見積もった切削（校正なし）が
+# 大径 31.8h（実績 φ16〜φ6 19.6h）、小径 31.1h（実績 φ3〜φ0.6 65.2h、穴径仕上げを除く）だったので、その比。
+# 小径が2倍あるのは、スキャナカバーでは小径工具が凹R面の周りより広く（製品面の細部全体を）仕上げているため。
+# 実績1件からの値なので、実績が増えたら見直す（2026-10-04）
+CUTTING_CALIBRATION = 0.616
+SMALL_TOOL_CALIBRATION = 2.09
 
 
 def default_approach() -> dict[str, float]:
@@ -554,15 +586,18 @@ ROUGH_AP_PER_DIAMETER = 0.1
 ROUGH_AE_PER_DIAMETER = 0.5
 
 
-def _cutting_minutes(length_mm: float, feed_mm_min: float, efficiency: float = CUTTING_EFFICIENCY) -> float:
-    return length_mm / max(1.0, feed_mm_min) / max(0.1, efficiency) * CUTTING_CALIBRATION
+def _cutting_minutes(
+    length_mm: float, feed_mm_min: float, diameter: float, efficiency: float = CUTTING_EFFICIENCY
+) -> float:
+    calibration = CUTTING_CALIBRATION if diameter >= WHOLE_SURFACE_MIN_DIAMETER else SMALL_TOOL_CALIBRATION
+    return length_mm / max(1.0, feed_mm_min) / max(0.1, efficiency) * calibration
 
 
 def _operation_minutes(
-    length_mm: float, feed_mm_min: float, approaches: int, approach_sec: float
+    length_mm: float, feed_mm_min: float, approaches: int, approach_sec: float, diameter: float
 ) -> dict[str, float]:
     """工程の時間 = 切削 + アプローチ（空走・切込み・Z上昇・早送り）+ 工具1本の固定時間（暖機・測定）。"""
-    cut = _cutting_minutes(length_mm, feed_mm_min)
+    cut = _cutting_minutes(length_mm, feed_mm_min, diameter)
     approach = approaches * approach_sec / 60.0
     fixed = (TOOL_WARMUP_SEC + TOOL_MEASURE_SEC) / 60.0
     return {"minutes": cut + approach + fixed, "cut_minutes": cut, "approach_minutes": approach, "fixed_minutes": fixed}
@@ -584,7 +619,7 @@ def build_mold_operations(
 ) -> list[dict[str, Any]]:
     """工具段階ごとに 荒取り／残り取り／仕上げ の工程と切削距離・時間を返す。
 
-    select_condition(diameter, required_depth, tool_shape) は
+    select_condition(diameter, required_depth, tool_shape, role) は
     {"tool_name", "feed", "ap", "ae", "condition_text", "selection_reason", "candidates", "tool_id",
      "effective_length"} を返す。
     """
@@ -599,8 +634,8 @@ def build_mold_operations(
             return cond
         return {**cond, "feed": float(hit["feed"]), "condition_text": hit["text"]}
     for index, stage in enumerate(plan.stages):
-        base_cond = select_condition(stage.diameter, stage.required_depth, stage.tool_shape)
-        cond = with_feed(base_cond, stage.diameter, "rough")
+        # role: rough=荒取り・残り取り / finish=中仕上げ・仕上げ（熱処理後の材質では使う条件の欄が変わる）
+        cond = with_feed(select_condition(stage.diameter, stage.required_depth, stage.tool_shape, "rough"), stage.diameter, "rough")
         feed = float(cond["feed"])
         z_pitch = finish_z_pitch(stage.diameter, stage.corner_radius, stage.tool_shape)
         flat_pitch = finish_flat_pitch(stage.diameter, stage.corner_radius, stage.tool_shape)
@@ -623,7 +658,7 @@ def build_mold_operations(
             length = stage.rest_volume / max(0.01, ap * ae)
             levels = max(1, math.ceil((plan.bounds["zmax"] - plan.machined_floor_z) / max(0.01, ap)))
             approaches = approach_count(plan.bounds["zmax"] - plan.machined_floor_z, ap, 1, length, stage.diameter)
-            op_time = _operation_minutes(length, feed, approaches, approach_sec)
+            op_time = _operation_minutes(length, feed, approaches, approach_sec, stage.diameter)
             operations.append(
                 {
                     "feature_type": "金型 荒取り（等高）",
@@ -648,7 +683,7 @@ def build_mold_operations(
             ae = float(cond["ae"])
             rest_length += stage.rest_volume / max(0.0005, ap * ae)
             approaches = approach_count(stage.region_z_range, rest_pitch, 1, rest_length, stage.diameter)
-            op_time = _operation_minutes(rest_length, feed, approaches, approach_sec)
+            op_time = _operation_minutes(rest_length, feed, approaches, approach_sec, stage.diameter)
             operations.append(
                 {
                     "feature_type": "金型 残り取り（等高）",
@@ -669,7 +704,7 @@ def build_mold_operations(
         if stage.finish_role == "none":
             continue
         passes = finish_passes if stage.finish_role == "final" else 1
-        cond = with_feed(base_cond, stage.diameter, "finish")
+        cond = with_feed(select_condition(stage.diameter, stage.required_depth, stage.tool_shape, "finish"), stage.diameter, "finish")
         feed = float(cond["feed"])
         finish_label = (
             f"全面 {stage.finish_projected_area:.0f} mm2"
@@ -678,7 +713,7 @@ def build_mold_operations(
         )
         finish_length = (stage.finish_steep_area / z_pitch + stage.finish_flat_area / flat_pitch) * passes
         approaches = approach_count(stage.finish_z_range, z_pitch, passes, finish_length, stage.diameter)
-        op_time = _operation_minutes(finish_length, feed, approaches, approach_sec)
+        op_time = _operation_minutes(finish_length, feed, approaches, approach_sec, stage.diameter)
         operations.append(
             {
                 "feature_type": "金型 仕上げ（等高線＋走査）" if stage.finish_role == "final" else "金型 中仕上げ（等高線＋走査）",

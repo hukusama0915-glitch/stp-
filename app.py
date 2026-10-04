@@ -29,7 +29,7 @@ DB_PATH = Path(os.environ.get("STP_TOOL_DB_PATH") or BASE_DIR / "stp_time_tool.s
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 UPLOAD_CLEANUP_EXTENSIONS = {".stp", ".step", ".json"}
-APP_VERSION = "2026-10-04-steel-grades"
+APP_VERSION = "2026-10-04-mold-small-tools"
 MAX_UPLOAD_MB = 80
 MATERIAL_TYPES = ("鉄", "アルミ", "SUS")
 
@@ -54,6 +54,8 @@ MATERIAL_GRADES: dict[str, dict[str, Any]] = {
     "STAVAX_HT": {
         "label": "STAVAX ESR 熱処理後（50～55HRC）", "short": "STAVAX 熱処理後", "material_type": "鉄",
         "hardness": "50～55HRC", "condition_class": "hardened", "drill_key": None,
+        # 荒取りは熱処理前（プリハードン 33HRC）に行い、熱処理後は仕上げだけを行う（金型モード）
+        "rough_grade": "STAVAX_PH",
     },
 }
 DEFAULT_MATERIAL_GRADE = "S50C"
@@ -3711,6 +3713,7 @@ def auto_manufacturer_condition_for(
     max_fit_diameter_mm: float | None = None,
     require_depth_fit: bool = False,
     candidates_out: list[dict[str, Any]] | None = None,
+    min_fit_diameter_mm: float | None = None,
     exclude_long_neck: bool = False,
     exclude_deep_flank: bool = False,
 ) -> sqlite3.Row | None:
@@ -3728,6 +3731,10 @@ def auto_manufacturer_condition_for(
         fit_rows = [row for row in rows if float(row["outside_diameter_mm"]) <= max_fit_diameter_mm]
         if fit_rows:
             rows = fit_rows
+    if min_fit_diameter_mm is not None and min_fit_diameter_mm > 0:
+        thick_rows = [row for row in rows if float(row["outside_diameter_mm"]) >= min_fit_diameter_mm - 1e-6]
+        if thick_rows:
+            rows = thick_rows
     if require_depth_fit and required_depth > 0:
         # 微細形状など、リーチが必須制約になる場合のみ有効長で絞り込む
         depth_rows = [row for row in rows if float(row["effective_length_mm"]) >= required_depth]
@@ -3987,6 +3994,8 @@ MOLD_REPLACED_FEATURE_PREFIXES = (
 )
 
 
+# 金型の工具段階で選ぶ工具の最小径（段階の径に対する比）。φ16 の段階なら φ9.6 以上
+MOLD_MIN_TOOL_RATIO = 0.6
 INHOUSE_MOLD_FEEDS_PATH = BASE_DIR / "data" / "inhouse_mold_feeds.csv"
 _inhouse_mold_feed_cache: dict[str, Any] = {}
 
@@ -4044,21 +4053,36 @@ def mold_mode_features(
     """金型モード: 高さマップから工具段階（荒取り→残り取り→仕上げ）の工程を作る。"""
     plan = mold_mode.plan_mold_machining(mold_mode.load_step_shape(path), max_tool_diameter)
 
-    def select_condition(diameter: float, required_depth: float, tool_shape: str) -> dict[str, Any]:
+    def select_condition(diameter: float, required_depth: float, tool_shape: str, role: str = "rough") -> dict[str, Any]:
         candidates: list[dict[str, Any]] = []
         row = None
-        if use_manufacturer_conditions:
-            row = auto_manufacturer_condition_for(
-                conn,
-                material_type,
-                diameter,
-                required_depth,
-                "等高線",
-                max_tool_diameter,
-                max_fit_diameter_mm=diameter + 1e-6,
-                require_depth_fit=True,
-                candidates_out=candidates,
-            )
+        # 熱処理後の材質は、荒取り・残り取りを熱処理前の状態で行う（その欄の条件を使う）
+        grade = current_grade()
+        stage_grade = grade.get("rough_grade") if role == "rough" and material_type in {"鉄", "鋼"} else None
+        token = _current_grade.set(stage_grade) if stage_grade else None
+        try:
+            if use_manufacturer_conditions:
+                row = auto_manufacturer_condition_for(
+                    conn,
+                    material_type,
+                    diameter,
+                    required_depth,
+                    "等高線",
+                    max_tool_diameter,
+                    max_fit_diameter_mm=diameter + 1e-6,
+                    # 工具段階の径より極端に細い工具（φ16 の段階に φ6 など）は選ばない
+                    min_fit_diameter_mm=diameter * MOLD_MIN_TOOL_RATIO,
+                    require_depth_fit=True,
+                    candidates_out=candidates,
+                )
+        finally:
+            if token is not None:
+                _current_grade.reset(token)
+        state_note = (
+            f"{MATERIAL_GRADES[stage_grade]['short']}（熱処理前）の条件 / "
+            if stage_grade
+            else f"{grade['short']}の条件 / " if grade.get("rough_grade") and material_type in {"鉄", "鋼"} else ""
+        )
         shape_label = "ボール相当" if tool_shape == "ball" else "ラジアス相当"
         if row is not None:
             feed, ap, ae = condition_params(row, catalog=True)
@@ -4072,7 +4096,7 @@ def mold_mode_features(
                 "ap": ap,
                 "ae": ae,
                 "effective_length": float(row["effective_length_mm"]),
-                "condition_text": catalog_condition_summary(row),
+                "condition_text": state_note + catalog_condition_summary(row),
                 "selection_reason": catalog_tool_selection_reason(
                     row, diameter, required_depth, max_tool_diameter, f"金型 φ{diameter:g}（{shape_label}）"
                 ),
